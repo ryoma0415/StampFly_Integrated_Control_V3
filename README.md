@@ -279,7 +279,11 @@ MAC・チャネルの変更は**機体を選び直すか再接続したとき**�
    `use_multicast`)を環境に合わせる。
 5. **座標系**: 座標変換は `control.json` の `coordinate_transform` が正
    (既定: 制御 x ← Motive z、制御 y ← −Motive x、制御 z ← Motive y。
-   すなわち **Motive は Y-up 前提**)。Motive 側の Up Axis を変えた場合はここを直す。
+   すなわち **Motive は Y-up 前提**)。Motive 側の Up Axis を変えた場合や
+   キャリブレーションで軸が変わった場合は、UI の **Settings(設定)タブ**で
+   位置マッピング(軸・符号)とヨー(前方軸・符号・オフセット・フリップ補正)を
+   ライブプレビューを見ながら調整して適用できる(地上限定。control.json へ
+   自動保存され、飛行ログには適用中マッピングが `*.meta.json` として残る)。
 6. **受信確認**: pc_server を起動し UI の Position タブで MoCap インジケータが
    「受信中」(緑)になり、座標表示と XY プロットが機体の移動に追従することを確認。
 

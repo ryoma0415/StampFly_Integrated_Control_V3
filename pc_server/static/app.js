@@ -39,6 +39,7 @@ const UI = {
   FF_POLL_MS: 5000,             // /api/ffprofile の定期ポーリング間隔
   EXP_FRESH_S: 0.5,             // TLM_EXP 表示の鮮度しきい値(UI表示用)
   RB_POLL_MS: 500,              // リジッドボディ確認(/api/mocap/bodies)のポーリング間隔
+  MAP_POLL_MS: 500,             // 設定タブのマッピング・プレビューのポーリング間隔
   MULTI_YAW_LIMIT_DEG: 30,      // 複数機のヨー目標上限(server.json multi.max_yaw_ctrl_deg と同値。
                                 //  XY 位置ループが制御座標系固定のため大ヨー保持は位置保持を劣化させる)
 };
@@ -167,6 +168,17 @@ const els = {
   ffModeSelect: $("ffModeSelect"), ffEstSelect: $("ffEstSelect"),
   btnFfApply: $("btnFfApply"), btnFfMode: $("btnFfMode"), btnFfAnchor: $("btnFfAnchor"),
   ffAppliedExp: $("ffAppliedExp"), ffApplyMsg: $("ffApplyMsg"),
+  // 設定タブ(UI専用: MoCap マッピング)
+  tabSettings: $("tabSettings"), panelSettings: $("panelSettings"),
+  mapAxisSel: { x: $("mapXAxis"), y: $("mapYAxis"), z: $("mapZAxis") },
+  mapSignSel: { x: $("mapXSign"), y: $("mapYSign"), z: $("mapZSign") },
+  mapFwdAxis: $("mapFwdAxis"), mapUpAxis: $("mapUpAxis"),
+  mapYawSign: $("mapYawSign"), mapYawOffset: $("mapYawOffset"),
+  btnYawZeroAlign: $("btnYawZeroAlign"), btnYawTlmAlign: $("btnYawTlmAlign"),
+  mapFlipCorr: $("mapFlipCorr"), mapFlipGate: $("mapFlipGate"),
+  btnMapPreview: $("btnMapPreview"), mapPreviewBox: $("mapPreviewBox"),
+  btnMapApply: $("btnMapApply"), btnMapReload: $("btnMapReload"),
+  mapMsg: $("mapMsg"),
 };
 
 /* ===================== 状態 ===================== */
@@ -184,6 +196,13 @@ let lastMocap = null;              // 直近の mocap オブジェクト
 let airframes = [];                // /api/airframes の配列
 const lastEventKeys = new Map();   // TLM_EVENT 2Hz再送のコンソール重複抑制(機体別)
 const trail = [];                  // XYプロット軌跡 [{x,y}]
+
+// 設定タブ(UI専用: サーバの session モードとは独立)
+let settingsOpen = false;          // 設定タブ表示中(モードecho同期から除外)
+let mapPollTimer = null;           // マッピング・プレビューのポーリングタイマ
+let mapBodies = null;              // 直近の /api/mocap/bodies(ゼロ合わせ用)
+let mapPrimaryRbId = null;         // 単機 Position の primary RB ID(GET mapping 由来)
+let appliedMapping = null;         // サーバ適用済みマッピング(ゼロ合わせの前提検査用)
 
 // v2: Experiment / FF 関連の REST 状態キャッシュ
 let selectedDuty = UI.DUTY_DEFAULT;
@@ -307,6 +326,20 @@ async function apiPost(path, body) {
   try {
     const res = await fetch(path, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    return await res.json();
+  } catch {
+    appendConsole("ui", `${path} との通信に失敗しました`);
+    return null;
+  }
+}
+
+async function apiPut(path, body) {
+  try {
+    const res = await fetch(path, {
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body || {}),
     });
@@ -640,6 +673,7 @@ function renderConnectivityLost() {
   els.postureNote.textContent = "スライダはシリアル接続後に操作できます";
   els.postureNote.classList.remove("hidden");
   stopRbCheck();                // WS 断で RB 確認ポーリングも停止
+  stopMapPreview();             // 設定タブのマッピング・プレビューも停止
   updateExperimentControls();   // wsOpen=false で実験操作系も安全側へ
 }
 
@@ -815,12 +849,18 @@ function renderYawMonitor() {
     els.yawGyroInt.textContent = fmtNum(gyroInt, 1);
   }
 
-  // MoCap ヨーは Position タブのみ表示(契約 §3.6)
-  const showMocap = uiMode === "position" && lastMocap
-    && typeof lastMocap.yaw_deg === "number";
+  // MoCap ヨーは Position タブのみ表示(契約 §3.6)。
+  // 正解Yaw(yaw_true_deg: 符号/オフセット/フリップ補正済み)を優先し、
+  // 旧サーバ互換で yaw_deg(オイラー分解・Y-up では機首方位でない)へ
+  // フォールバックする
+  const mocapYaw = lastMocap
+    ? ((typeof lastMocap.yaw_true_deg === "number") ? lastMocap.yaw_true_deg
+       : (typeof lastMocap.yaw_deg === "number") ? lastMocap.yaw_deg : null)
+    : null;
+  const showMocap = uiMode === "position" && mocapYaw !== null;
   els.yawMocapLabel.classList.toggle("hidden", !showMocap);
   els.yawMocap.classList.toggle("hidden", !showMocap);
-  if (showMocap) els.yawMocap.textContent = lastMocap.yaw_deg.toFixed(1);
+  if (showMocap) els.yawMocap.textContent = mocapYaw.toFixed(1);
 
   // 適用中ヨー目標(機体エコー)。ヨー制御 OFF 時は "--"
   const yawCtrlOn = !!(lastSession && lastSession.yaw_ctrl_on);
@@ -1460,6 +1500,262 @@ function toggleRbCheck() {
   rbPollTimer = setInterval(pollRbBodies, UI.RB_POLL_MS);
 }
 
+/* ===================== 設定タブ: MoCap マッピング =====================
+ * UI 専用タブ(サーバ session モードではない): set_mode を送らず、
+ * renderSession のモードecho同期からも除外される(syncSettingsVisual)。
+ * 編集フォームはサーバ echo に上書きされない(マッピングは本タブの
+ * PUT でのみ変わる)ため、エコー抑制は不要。 */
+
+const MAP_AXES = ["x", "y", "z"];
+const RAD2DEG = 180 / Math.PI;
+
+function setMapMsg(text, isErr) {
+  els.mapMsg.textContent = text;
+  els.mapMsg.classList.toggle("msg-err", !!isErr);
+}
+
+function mappingFormFill(mapping) {
+  const ct = mapping.coordinate_transform || {};
+  for (const axis of MAP_AXES) {
+    const c = ct[axis] || {};
+    if (c.axis) els.mapAxisSel[axis].value = c.axis;
+    els.mapSignSel[axis].value = String((c.sign ?? 1) >= 0 ? 1 : -1);
+  }
+  const at = mapping.attitude_transform || {};
+  if (at.forward_axis) els.mapFwdAxis.value = at.forward_axis;
+  if (at.up_axis) els.mapUpAxis.value = at.up_axis;
+  els.mapYawSign.value = String((at.yaw_sign ?? 1) >= 0 ? 1 : -1);
+  els.mapYawOffset.value =
+    (typeof at.yaw_offset_deg === "number" ? at.yaw_offset_deg : 0).toFixed(1);
+  els.mapFlipCorr.checked = at.flip_correction !== false;
+  els.mapFlipGate.value =
+    (typeof at.flip_gate === "number" ? at.flip_gate : 0.5).toFixed(2);
+}
+
+function mappingFormPayload() {
+  const ct = {};
+  for (const axis of MAP_AXES) {
+    ct[axis] = { axis: els.mapAxisSel[axis].value,
+                 sign: parseInt(els.mapSignSel[axis].value, 10) };
+  }
+  return {
+    coordinate_transform: ct,
+    attitude_transform: {
+      forward_axis: els.mapFwdAxis.value,
+      up_axis: els.mapUpAxis.value,
+      yaw_sign: parseInt(els.mapYawSign.value, 10),
+      yaw_offset_deg: clamp(parseFloat(els.mapYawOffset.value) || 0, -360, 360),
+      flip_correction: els.mapFlipCorr.checked,
+      flip_gate: clamp(parseFloat(els.mapFlipGate.value) || 0.5, 0.05, 0.95),
+    },
+  };
+}
+
+async function loadMapping(quiet) {
+  const res = await apiGet("/api/mocap/mapping", !!quiet);
+  if (!res || !res.ok) {
+    if (!quiet) setMapMsg("マッピングの取得に失敗しました", true);
+    return;
+  }
+  mappingFormFill(res.mapping || {});
+  appliedMapping = res.mapping || null;
+  mapPrimaryRbId = res.primary_rigid_body_id ?? null;
+  setMapMsg(res.can_apply
+    ? "適用可能です(地上)"
+    : (res.blocked_reason || "現在は適用できません"), !res.can_apply);
+}
+
+async function applyMapping() {
+  setMapMsg("適用中…", false);
+  const res = await apiPut("/api/mocap/mapping", mappingFormPayload());
+  if (!res) { setMapMsg("サーバとの通信に失敗しました", true); return; }
+  if (!res.ok) { setMapMsg(res.message || "適用できませんでした", true); return; }
+  mappingFormFill(res.mapping || {});
+  appliedMapping = res.mapping || null;
+  setMapMsg("適用しました(control.json 保存済み・位置フィルタ再初期化・目標リセット)", false);
+  appendConsole("ui", "MoCap マッピングを適用しました");
+}
+
+/* 機体表示ヨー(renderDrone と同じ選択規範: EKF健全なら EKF、他は Madgwick) */
+function currentDroneYawDeg() {
+  const d = lastDrone;
+  const ekfYaw = pick(d, "yaw_est");
+  const fromEkf = !!(d && d.est_mode_ekf && d.anchor_valid && d.mag_fresh
+                     && typeof ekfYaw === "number");
+  const yaw = fromEkf ? ekfYaw : pick(d, "yaw", "yaw_deg");
+  return (typeof yaw === "number") ? yaw : null;
+}
+
+function primaryPreviewBody() {
+  const bodies = (mapBodies && mapBodies.bodies) || [];
+  // primary RB(単機 Position の rigid_body_id)のみを対象にする。
+  // 別ボディへの黙ったフォールバックはしない(隣の機体でゼロ合わせして
+  // しまう事故を防ぐ)。primary 未設定時のみ唯一の観測ボディを許す。
+  let primary = null;
+  if (mapPrimaryRbId !== null) {
+    primary = bodies.find((b) => b.rigid_body_id === mapPrimaryRbId) || null;
+  } else if (bodies.length === 1) {
+    primary = bodies[0];
+  }
+  if (!primary) return null;
+  if (typeof primary.age_s === "number" && primary.age_s > 1.0) return null;
+  return primary;
+}
+
+/* 編集フォームの「軸」設定(座標変換+前方軸)が適用済みマッピングと一致
+ * しているか。heading はサーバが適用済みマッピングで計算するため、軸を
+ * 編集したまま未適用だとゼロ合わせの前提が崩れる(符号・オフセットの編集は
+ * 計算に折り込むので未適用でよい) */
+function mapAxesMatchApplied() {
+  if (!appliedMapping) return false;
+  const ct = appliedMapping.coordinate_transform || {};
+  for (const axis of MAP_AXES) {
+    const c = ct[axis] || {};
+    if (els.mapAxisSel[axis].value !== c.axis) return false;
+    if (parseInt(els.mapSignSel[axis].value, 10) !== ((c.sign ?? 1) >= 0 ? 1 : -1)) {
+      return false;
+    }
+  }
+  const at = appliedMapping.attitude_transform || {};
+  return els.mapFwdAxis.value === (at.forward_axis || "+x");
+}
+
+/* ゼロ合わせ: 現在の生 heading から「正解Yaw = targetDeg」となるオフセットを
+ * フォームへ設定する(適用は別途「適用」ボタン)。yaw_true = sign*heading+offset */
+async function alignYawOffset(targetDeg) {
+  if (!mapAxesMatchApplied()) {
+    setMapMsg("軸設定(座標変換・前方軸)が未適用です。先に「適用」してからゼロ合わせしてください", true);
+    return;
+  }
+  // 鮮度を保証するため必ず取り直す(失敗時は古いキャッシュへ落とさない)
+  mapBodies = await apiGet("/api/mocap/bodies", true);
+  if (mapPollTimer !== null) renderMapPreview(mapBodies);
+  const primary = primaryPreviewBody();
+  if (!primary || typeof primary.heading_rad !== "number") {
+    setMapMsg(mapPrimaryRbId !== null
+      ? `単機リジッドボディ(RB ${mapPrimaryRbId})の方位が取得できません(Motive 配信と RB 検出を確認してください)`
+      : "リジッドボディの方位が取得できません(Motive 配信と RB 検出を確認してください)", true);
+    return;
+  }
+  const sign = parseInt(els.mapYawSign.value, 10) || 1;
+  const offset = wrap180(targetDeg - sign * primary.heading_rad * RAD2DEG);
+  els.mapYawOffset.value = offset.toFixed(1);
+  setMapMsg(`ヨーオフセットを ${offset.toFixed(1)}° に設定しました(RB ${primary.rigid_body_id} 基準・未適用 — 「適用」で保存されます)`, false);
+}
+
+function flipFlagsText(flags) {
+  if (!flags) return "なし";
+  const parts = [];
+  if (flags & 0x01) parts.push("上方軸反転補正");
+  if (flags & 0x02) parts.push("ヨー180°補正");
+  return parts.join("+");
+}
+
+function renderMapPreview(result) {
+  const box = els.mapPreviewBox;
+  box.innerHTML = "";
+  if (!result || !result.connected) {
+    box.textContent = "NatNet 未接続(Motive の配信設定を確認してください)";
+    return;
+  }
+  const bodies = result.bodies || [];
+  if (!bodies.length) {
+    box.textContent = "リジッドボディ未検出(Motive 側で作成されているか確認)";
+    return;
+  }
+  const tlmYaw = currentDroneYawDeg();
+  for (const b of bodies) {
+    const stale = typeof b.age_s === "number" && b.age_s > 1.0;
+    const assigned = airframes.find((a) => a.rigid_body_id === b.rigid_body_id);
+    const isPrimary = b.rigid_body_id === mapPrimaryRbId;
+
+    const head = document.createElement("div");
+    head.className = "rb-line";
+    head.classList.toggle("stale", stale);
+    head.textContent =
+      `RB ${b.rigid_body_id}${isPrimary ? "(単機)" : ""}` +
+      `${assigned ? ` ← ${assigned.name}` : ""}${stale ? "(途絶)" : ""}`;
+    box.appendChild(head);
+
+    const posLine = document.createElement("div");
+    posLine.className = "rb-line rb-sub";
+    posLine.classList.toggle("stale", stale);
+    const mp = b.motive_pos;
+    const motiveText = Array.isArray(mp)
+      ? `Motive(${fmtNum(mp[0], 2)}, ${fmtNum(mp[1], 2)}, ${fmtNum(mp[2], 2)})`
+      : "Motive(--)";
+    posLine.textContent =
+      `  ${motiveText} → 制御(x${fmtNum(b.x, 2)} y${fmtNum(b.y, 2)} z${fmtNum(b.z, 2)})`;
+    box.appendChild(posLine);
+
+    const yawLine = document.createElement("div");
+    yawLine.className = "rb-line rb-sub";
+    yawLine.classList.toggle("stale", stale);
+    const yawTrue = (typeof b.yaw_true_rad === "number")
+      ? (b.yaw_true_rad * RAD2DEG) : null;
+    const heading = (typeof b.heading_rad === "number")
+      ? (b.heading_rad * RAD2DEG) : null;
+    let text = `  正解Yaw ${yawTrue === null ? "--" : yawTrue.toFixed(1)}°` +
+      `(heading生値 ${heading === null ? "--" : heading.toFixed(1)}°、` +
+      `フリップ補正: ${flipFlagsText(b.flip_flags)})`;
+    if (isPrimary && tlmYaw !== null && yawTrue !== null) {
+      text += ` / 機体ヨー ${tlmYaw.toFixed(1)}°(差 ${wrap180(yawTrue - tlmYaw).toFixed(1)}°)`;
+    }
+    yawLine.textContent = text;
+    box.appendChild(yawLine);
+  }
+}
+
+async function pollMapPreview() {
+  mapBodies = await apiGet("/api/mocap/bodies", true);
+  renderMapPreview(mapBodies);
+}
+
+function stopMapPreview() {
+  if (mapPollTimer === null) return;
+  clearInterval(mapPollTimer);
+  mapPollTimer = null;
+  els.btnMapPreview.textContent = "プレビュー開始";
+}
+
+function toggleMapPreview() {
+  if (mapPollTimer !== null) {
+    stopMapPreview();
+    return;
+  }
+  els.btnMapPreview.textContent = "プレビュー停止";
+  pollMapPreview();
+  mapPollTimer = setInterval(pollMapPreview, UI.MAP_POLL_MS);
+}
+
+/* 設定タブの表示同期: モードecho(applyMode)が4タブを再活性化しても、
+ * 設定タブ表示中はモードパネルを非表示に戻す */
+function syncSettingsVisual() {
+  els.tabSettings.classList.toggle("active", settingsOpen);
+  els.panelSettings.classList.toggle("active", settingsOpen);
+  if (settingsOpen) {
+    for (const el of [els.tabPosture, els.tabPosition, els.tabMulti,
+                      els.tabExperiment, els.panelPosture, els.panelPosition,
+                      els.panelMulti, els.panelExperiment]) {
+      el.classList.remove("active");
+    }
+  }
+}
+
+function openSettings() {
+  if (settingsOpen) return;
+  settingsOpen = true;
+  syncSettingsVisual();
+  loadMapping(false);
+}
+
+function closeSettings() {
+  if (!settingsOpen) return;
+  settingsOpen = false;
+  stopMapPreview();
+  syncSettingsVisual();
+}
+
 /* ===================== コンソール ===================== */
 const CONSOLE_TAGS = {
   ui: "UI", relay: "RELAY", drone: "DRONE", event: "EVENT",
@@ -1532,6 +1828,8 @@ function applyMode(mode, sendToServer) {
     stopRbCheck();   // タブ離脱時に RB 確認ポーリングを止める
   }
   if (mode === "experiment") refreshExperimentPanels();
+  // 設定タブ表示中はモードechoでパネルを奪わない(UI専用タブ)
+  syncSettingsVisual();
 }
 
 /* ===================== STOP(緊急停止) ===================== */
@@ -1996,17 +2294,56 @@ function wireEvents() {
     }
   });
 
-  // タブ(4タブ: posture / position / multi / experiment)
+  // タブ(4モードタブ: posture / position / multi / experiment)
   for (const tab of [els.tabPosture, els.tabPosition, els.tabMulti,
                      els.tabExperiment]) {
     tab.addEventListener("click", () => {
+      // 設定タブ → 現行モードタブへの復帰は純 UI 操作(set_mode を送らない)
+      // のため飛行中でも許可する(設定タブ表示中に TLM 由来の飛行昇格が
+      // 起きた場合に操作パネルへ戻れなくなるのを防ぐ)
+      if (settingsOpen && tab.dataset.mode === uiMode) {
+        closeSettings();
+        applyMode(uiMode, false);
+        return;
+      }
       if (isFlying()) {
         appendConsole("ui", "飛行中はモードを切り替えできません");
         return;
       }
-      if (tab.dataset.mode !== uiMode) applyMode(tab.dataset.mode, true);
+      const wasSettings = settingsOpen;
+      closeSettings();
+      if (tab.dataset.mode !== uiMode) {
+        applyMode(tab.dataset.mode, true);
+      } else if (wasSettings) {
+        applyMode(uiMode, false);   // 設定タブから同一モードタブへ戻る場合の表示復元
+      }
     });
   }
+
+  // 設定タブ(UI専用: set_mode を送らない)
+  els.tabSettings.addEventListener("click", () => {
+    if (isFlying()) {
+      appendConsole("ui", "飛行中はモードを切り替えできません");
+      return;
+    }
+    openSettings();
+  });
+  els.btnMapApply.addEventListener("click", () =>
+    withBusy(els.btnMapApply, applyMapping));
+  els.btnMapReload.addEventListener("click", () =>
+    withBusy(els.btnMapReload, () => loadMapping(false)));
+  els.btnMapPreview.addEventListener("click", toggleMapPreview);
+  els.btnYawZeroAlign.addEventListener("click", () =>
+    withBusy(els.btnYawZeroAlign, () => alignYawOffset(0)));
+  els.btnYawTlmAlign.addEventListener("click", () =>
+    withBusy(els.btnYawTlmAlign, async () => {
+      const yaw = currentDroneYawDeg();
+      if (yaw === null) {
+        setMapMsg("機体のヨー推定が取得できません(テレメトリ未受信)", true);
+        return;
+      }
+      await alignYawOffset(yaw);
+    }));
 
   // 複数機タブ: 選択適用 / 一斉スタート / リジッドボディ確認
   els.btnMultiApply.addEventListener("click", sendMultiSelect);

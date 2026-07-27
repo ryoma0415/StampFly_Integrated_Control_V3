@@ -1,8 +1,9 @@
 """ヨー解析(本プロジェクトの主目的)。
 
-- ヨー比較図: tlm_yaw_rad(Madgwick)/ tlm_yaw_est_rad(EKF)/ ヨー指令
-  (MoCap 真値・ジャイロ積算は 2026-07 に図から除外。MoCap ヨーは信頼性が
-  低いため。統計 compute_yaw_stats は従来どおり全系統で計算しレポートに使う)
+- ヨー比較図: tlm_yaw_rad(Madgwick)/ tlm_yaw_est_rad(EKF)/
+  mocap_yaw_true_deg(MoCap 正解Yaw、v5 ログのみ)/ ヨー指令
+  (ジャイロ積算は図から除外。統計 compute_yaw_stats は全系統で計算し
+  レポートに使う。旧 mocap_yaw_deg は軸違いのため全面的に不使用)
 - 対基準誤差の統計(RMS / ドリフト率 [°/min])— レポート・2ログ比較用
 - EKF 診断: NIS・磁気バイアス b_m・FF 補正 db_hat・ffg ゲートタイムライン
 - ヨー指令追従: cmd_yaw_ref vs 機体適用目標 vs 実測
@@ -159,14 +160,17 @@ def compute_yaw_stats(log: FlightLog) -> dict:
 # ---------------------------------------------------------------------------
 
 def _fig_yaw_comparison(log: FlightLog, out_dir: Path) -> Path | None:
-    """10: ヨー比較(Madgwick / EKF / 指令。アンラップ+±180° ラップ)。
+    """10: ヨー比較(Madgwick / EKF / MoCap 正解Yaw / 指令)。
 
-    MoCap 真値・ジャイロ積算は表示しない(2026-07 仕様変更)。
+    MoCap は v5 の正解Yaw(mocap_yaw_true_deg: 符号/オフセット/フリップ
+    補正済み)のみ表示する。旧列 mocap_yaw_deg による「MoCap 真値」は
+    軸違いのため 2026-07 に除外し、正解Yaw の導入で復帰した。
+    ジャイロ積算は表示しない(参考値のため。統計には含む)。
     """
     available = [
         (key, label, color)
         for key, _col, label, color, _deg in YAW_SOURCES
-        if key in ("madgwick", "ekf") and log.has(f"yaw_{key}_deg")
+        if key in ("madgwick", "ekf", "mocap") and log.has(f"yaw_{key}_deg")
     ]
     if not available:
         return None
@@ -182,7 +186,8 @@ def _fig_yaw_comparison(log: FlightLog, out_dir: Path) -> Path | None:
         ax.plot(t, unwrap_deg(df["cmd_yaw_ref_deg"].to_numpy(dtype=float)),
                 color=COLORS["yaw_cmd"], linewidth=1.0, linestyle="--", alpha=0.8,
                 label="ヨー指令(PC)")
-    ax.set_title("ヨー比較: Madgwick / EKF / 指令(アンラップ)", fontsize=14)
+    ax.set_title("ヨー比較: Madgwick / EKF / MoCap 正解Yaw / 指令(アンラップ)",
+                 fontsize=14)
     ax.set_ylabel("ヨー角 [deg](連続)", fontsize=10)
     styled_legend(ax, ncol=2)
 

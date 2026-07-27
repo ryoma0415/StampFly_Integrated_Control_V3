@@ -178,8 +178,27 @@ async def api_mocap_bodies() -> dict:
 
     NatNet 未接続なら接続を試みる。UI はこれをポーリングして ID と座標を
     ライブ表示し、機体プロファイルの rigid_body_id 割り当てを支援する。
+    設定タブのライブプレビュー(変換後座標・正解ヨー)も同じ応答を使う。
     """
     return await asyncio.to_thread(session.mocap_bodies)
+
+
+@app.get("/api/mocap/mapping")
+async def api_mocap_mapping() -> dict:
+    """適用中の MoCap マッピング(座標変換+姿勢)と適用可否。"""
+    return await asyncio.to_thread(session.mocap_mapping)
+
+
+@app.put("/api/mocap/mapping")
+async def api_mocap_mapping_update(body: dict) -> dict:
+    """MoCap マッピングの検証・適用・永続化(設定タブから)。
+
+    body: {"coordinate_transform": {...}, "attitude_transform": {...}}。
+    検証・地上ガード・原子的保存・アトミック差し替え・フィルタ再初期化は
+    session.update_mocap_mapping が行う(core/ は fastapi 非依存のまま)。
+    失敗時も HTTP 200 で {"ok":false,"message":...} を返し、UI が表示する。
+    """
+    return await asyncio.to_thread(session.update_mocap_mapping, body)
 
 
 # ----------------------------------------------------------------------

@@ -105,6 +105,11 @@ class PositionController:
         # NatNet スレッドが旧世代フィルタで計算した結果をリセット後に
         # 書き戻す競合を検出して捨てるために使う
         self._filter_generation = 0
+        # MoCap マッピング世代フロア: これ未満の pose["mapping_gen"] を
+        # 持つフレームは破棄する。マッピング差し替え(set_mapping)直前に
+        # 旧マッピングで計算中だったフレームが、リセット直後のフィルタを
+        # 旧座標系でシードする競合(逆向きの世代競合)の防止
+        self._mapping_gen_floor = 0
 
         # 直近の送信値(バイアス加算前)
         self._last_output = (0.0, 0.0, self._target[2])
@@ -292,8 +297,14 @@ class PositionController:
         """新規 mocap フレームでフィルタを更新し、位置誤差をキャッシュする。"""
         t = pose["t_mono"]
         position = (pose["x"], pose["y"], pose["z"])
+        mapping_gen = pose.get("mapping_gen")
 
         with self._lock:
+            # マッピング差し替え直前に旧マッピングで計算されたフレームは
+            # 破棄する(旧座標系の位置がリセット直後のフィルタのアンカーに
+            # なるのを防ぐ。set_mocap_mapping_floor 参照)
+            if mapping_gen is not None and mapping_gen < self._mapping_gen_floor:
+                return
             prev_t = self._last_pose_t
             frame_dt = None if prev_t is None else (t - prev_t)
             self._last_pose = pose
@@ -398,6 +409,18 @@ class PositionController:
             self._traj = None
             self._traj_phase = None
             self._last_yaw_output = 0.0
+
+    def set_mocap_mapping_floor(self, generation: int) -> None:
+        """MoCap マッピング世代フロアを設定する(マッピング差し替え時)。
+
+        session.update_mocap_mapping が MocapSource.set_mapping の直後・
+        reset_filter の前に呼ぶ: 差し替え前に NatNet スレッドが旧マッピングで
+        計算し始めていたフレーム(pose["mapping_gen"] < generation)は
+        on_mocap_pose で破棄され、リセット済みフィルタが旧座標系の位置で
+        シードされることがなくなる。
+        """
+        with self._lock:
+            self._mapping_gen_floor = int(generation)
 
     def reset_filter(self) -> None:
         """位置フィルタのみ再初期化する(離陸 CMD_START 受理時)。
@@ -523,6 +546,18 @@ class PositionController:
             if heading is not None:
                 meta["mocap_heading_rad"] = heading
                 meta["mocap_heading_deg"] = heading * RAD_TO_DEG
+            # 正解ヨー(符号/オフセット/フリップ補正済み)+生クォータニオン
+            # (ログ列 mocap_yaw_true_deg / mocap_flip / mocap_q*)
+            yaw_true = pose.get("yaw_true_rad")
+            if yaw_true is not None:
+                meta["mocap_yaw_true_deg"] = yaw_true * RAD_TO_DEG
+            flip_flags = pose.get("flip_flags")
+            if flip_flags is not None:
+                meta["mocap_flip"] = flip_flags
+            quat = pose.get("quat")
+            if quat is not None:
+                (meta["mocap_qx"], meta["mocap_qy"],
+                 meta["mocap_qz"], meta["mocap_qw"]) = quat
         if filter_result is not None:
             meta["filtered_pos"] = tuple(filter_result["filtered_position"])
             meta["is_outlier"] = filter_result["is_outlier"]
@@ -593,7 +628,7 @@ class PositionController:
                     if filter_result is not None else (pose["x"], pose["y"], pose["z"]))
         confidence = (filter_result["confidence"] if filter_result is not None
                       else pose["quality"])
-        return {
+        snapshot = {
             "x": float(position[0]),
             "y": float(position[1]),
             "z": float(position[2]),
@@ -604,3 +639,12 @@ class PositionController:
             # 「受信中」緑、fresh だが invalid は警告色にする
             "valid": bool(data_valid),
         }
+        # 正解ヨー(符号/オフセット/フリップ補正済み)。yaw_deg(旧オイラー
+        # 分解・表示専用)と別掲する — UI のヨーモニタと設定タブが使う
+        yaw_true = pose.get("yaw_true_rad")
+        if yaw_true is not None:
+            snapshot["yaw_true_deg"] = yaw_true * RAD_TO_DEG
+        flip_flags = pose.get("flip_flags")
+        if flip_flags is not None:
+            snapshot["flip"] = int(flip_flags)
+        return snapshot

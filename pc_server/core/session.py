@@ -35,7 +35,8 @@ from .experiment import ExperimentHub
 from .ffprofile import FfProfileManager
 from . import logger as logger_mod
 from .logger import FlightLogger
-from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource
+from .mocap import (DEFAULT_ATTITUDE_TRANSFORM, DEG_TO_RAD, RAD_TO_DEG,
+                    MocapSource, validate_mapping)
 from .multi import MultiControlManager
 from .position import PositionController
 from .posture import PostureController, run_paced_loop
@@ -189,6 +190,7 @@ class SessionManager:
                                  on_disconnect=self._on_serial_disconnect)
         self.mocap = MocapSource(self.control_config["natnet"],
                                  self.control_config["coordinate_transform"],
+                                 self.control_config.get("attitude_transform"),
                                  client_factory=natnet_client_factory)
         self.posture = PostureController(self.server_config, self._emit_setpoint,
                                          clock=clock)
@@ -1125,6 +1127,140 @@ class SessionManager:
         }
 
     # ------------------------------------------------------------------
+    # MoCap マッピング(設定タブ: 座標変換・姿勢の実行時変更)
+    # ------------------------------------------------------------------
+
+    def _mapping_apply_blocked(self) -> Optional[str]:
+        """マッピング変更を拒否すべき状態なら理由を返す(地上限定ガード)。
+
+        座標変換の変更は位置誤差とヨーの両方を不連続にステップさせる。
+        飛行中に許すと符号変更が閉ループの極性反転(正帰還)になり、
+        発散フェイルセーフが効くまで機体が加速し続けるため、単機・
+        複数機のいずれかが armed/flying の間は一切受け付けない。
+        ログ記録中も拒否する(1ファイル内に2つの座標系が混ざり、
+        サイドカー meta.json の記録と矛盾するため)。
+        """
+        with self._lock:
+            phase = self._phase
+        if phase in (PHASE_ARMED, PHASE_FLYING):
+            return "飛行中は MoCap マッピングを変更できません。着陸後にやり直してください"
+        if self.multi.any_armed_or_flying():
+            return ("複数機制御で飛行中のため MoCap マッピングを変更できません。"
+                    "全機着陸後にやり直してください")
+        # 単機ロガーに加えて複数機の機体別ログも検査する(全機着陸検知〜
+        # supervise がログを閉じるまでの短い窓でもファイルは開いている)
+        if self.logger.active or self.multi.logging_active:
+            return "ログ記録中は MoCap マッピングを変更できません"
+        return None
+
+    def mocap_mapping(self) -> dict:
+        """適用中のマッピングと適用可否(設定タブの GET 用)。"""
+        blocked = self._mapping_apply_blocked()
+        mapping = self.mocap.mapping_snapshot()
+        return {
+            "ok": True,
+            "mapping": mapping,
+            "can_apply": blocked is None,
+            "blocked_reason": blocked,
+            "primary_rigid_body_id":
+                self.control_config["natnet"]["rigid_body_id"],
+        }
+
+    @_ui_command
+    def update_mocap_mapping(self, payload) -> dict:
+        """MoCap マッピング(座標変換+姿勢)を検証・適用・永続化する。
+
+        受理条件: validate_mapping の厳格検証(符号付き置換など)を通過し、
+        かつ地上(非武装・非記録中)であること。受理時は
+        (1) control.json へ原子的保存 → (2) メモリの control_config 同期 →
+        (3) MocapSource へアトミック差し替え → (4) 位置フィルタ再初期化
+        (単機+複数機全スロット)の順で適用する。保存に失敗した場合は
+        適用もしない(ファイル・メモリ・適用状態の三者一致を維持)。
+        """
+        if not isinstance(payload, dict):
+            return {"ok": False, "message": "リクエスト形式が不正です"}
+        transform_cfg = payload.get("coordinate_transform")
+        attitude_cfg = payload.get("attitude_transform") or {}
+        error = validate_mapping(transform_cfg, attitude_cfg)
+        if error is not None:
+            return {"ok": False, "message": error}
+        blocked = self._mapping_apply_blocked()
+        if blocked is not None:
+            self.warn(f"MoCap マッピング変更不可: {blocked}")
+            return {"ok": False, "message": blocked}
+
+        # 正規化(欠損キーへの既定値充填)してから保存・適用する
+        merged_attitude = dict(DEFAULT_ATTITUDE_TRANSFORM)
+        merged_attitude.update(attitude_cfg)
+        normalized_transform = {
+            axis: {"axis": transform_cfg[axis]["axis"],
+                   "sign": transform_cfg[axis]["sign"]}
+            for axis in ("x", "y", "z")
+        }
+
+        # 保存はコピーで先に行い、失敗時はメモリ・適用状態を一切変えない。
+        # 成功後のメモリ反映は「同一 dict への in-place 更新」とする
+        # (MultiControlManager が control_config の生参照を保持しており、
+        # dict ごと差し替えると参照が分裂するため)。
+        old_transform = self.control_config["coordinate_transform"]
+        old_attitude = self.control_config.get(
+            "attitude_transform", dict(DEFAULT_ATTITUDE_TRANSFORM))
+        new_config = dict(self.control_config)
+        new_config["coordinate_transform"] = normalized_transform
+        new_config["attitude_transform"] = merged_attitude
+        try:
+            cfg.save_control_config(new_config)
+        except OSError as exc:
+            return {"ok": False,
+                    "message": f"control.json の保存に失敗しました: {exc}"}
+        self._apply_mapping(normalized_transform, merged_attitude)
+
+        # 適用後の再検査: 地上ガードは RX スレッドの飛行昇格(TLM による
+        # CONNECTED→FLYING 等)とは非同期のため、チェック→適用の間に
+        # 昇格が起き得る。ここで再検査し、昇格していたら旧マッピングへ
+        # 巻き戻す(ファイルも戻す)。巻き戻し後の飛行は従来どおりの
+        # 座標系で継続する。
+        blocked = self._mapping_apply_blocked()
+        if blocked is not None:
+            try:
+                revert_config = dict(self.control_config)
+                revert_config["coordinate_transform"] = old_transform
+                revert_config["attitude_transform"] = old_attitude
+                cfg.save_control_config(revert_config)
+            except OSError:
+                pass   # ファイルが新設定のまま残っても適用状態は旧に戻す
+            self._apply_mapping(old_transform, old_attitude)
+            self.warn(f"MoCap マッピング変更を取り消しました: {blocked}")
+            return {"ok": False,
+                    "message": f"適用と並行して状態が変化したため取り消しました: {blocked}"}
+
+        self.info("MoCap マッピングを更新しました(位置フィルタ再初期化・"
+                  "目標リセット)")
+        return self.mocap_mapping()
+
+    def _apply_mapping(self, transform: dict, attitude: dict) -> None:
+        """マッピング一式をメモリ・MocapSource・下流状態へ適用する。
+
+        _command_lock 内(update_mocap_mapping)からのみ呼ぶ。順序:
+        (1) メモリ設定を in-place 更新 → (2) MocapSource へアトミック差し替え
+        → (3) 世代フロア設定+位置フィルタ再初期化(単機+複数機全スロット。
+        差し替え直前に旧マッピングで計算中だったフレームのシード防止)→
+        (4) 旧座標系の絶対値が残る状態のリセット(単機目標を既定へ、
+        円軌道解除、複数機スロット目標のクリア)。
+        """
+        self.control_config["coordinate_transform"] = transform
+        self.control_config["attitude_transform"] = attitude
+        self.mocap.set_mapping(transform, attitude)
+        floor = self.mocap.mapping_generation
+        self.position.set_mocap_mapping_floor(floor)
+        self.position.reset_filter()
+        self.position.stop_circle()
+        target_default = self.control_config["target_default"]
+        self.position.set_target(target_default["x"], target_default["y"],
+                                 target_default["z"])
+        self.multi.reset_for_mapping_change(floor)
+
+    # ------------------------------------------------------------------
     # v2: モーターテスト(Experiment タブ)
     # ------------------------------------------------------------------
 
@@ -1313,8 +1449,20 @@ class SessionManager:
         """単機の飛行ログファイルを開く(START 受理時/飛行中のログ ON)。"""
         with self._lock:
             mode = self._mode
-        path = self.logger.start(mode)
+        path = self.logger.start(mode, metadata=self._log_metadata())
         self.info(f"ログ開始: {path.name}")
+
+    def _log_metadata(self) -> dict:
+        """飛行ログのサイドカー(*.meta.json)に残すマッピング情報。
+
+        CSV の位置・ヨー列がどの座標マッピングで記録されたかを恒久記録
+        する(マッピングが実行時変更可能になったため、列契約だけでは
+        フレームが自明でなくなった)。
+        """
+        return {
+            "log_columns_version": 5,
+            "mocap_mapping": self.mocap.mapping_snapshot(),
+        }
 
     def _finish_flight_log(self) -> None:
         """飛行ログを閉じ、予約フラグを自動 OFF する(飛行終了の一元フック)。

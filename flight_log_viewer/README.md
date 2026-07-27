@@ -1,7 +1,8 @@
 # flight_log_viewer — V2 フライトログ可視化ツール
 
-V2 の飛行ログ(50Hz・**109列**、`docs/LOG_STRUCTURE.md` v4 =
-`pc_server/core/logger.py` の `COLUMNS` と 1 対 1)を可視化する
+V2 の飛行ログ(50Hz・**115列**、`docs/LOG_STRUCTURE.md` v5 =
+`pc_server/core/logger.py` の `COLUMNS` と 1 対 1。v4 以前の 109 列ログも
+後方互換で読める)を可視化する
 スタンドアロンツール群。旧 `Drone_Log_Viewer`
 (For_Research / For_Presentation。当時 `Previous_Version/` 配下にあったが
 2026-07-27 に削除、別途アーカイブ保管)の静止画グラフ・同期アニメーション・
@@ -9,7 +10,7 @@ OpenCV トラッキング機能を V2 の列構成で再構築したもの。移
 本ツールの動作に旧フォルダは不要。
 
 本プロジェクトの主目的である**ヨー推定の評価**
-(Madgwick / EKF / ジャイロ積算 / MoCap 真値の 4 系統比較、EKF 診断)に
+(Madgwick / EKF / ジャイロ積算 / MoCap 正解Yaw の 4 系統比較、EKF 診断)に
 重点を置いている。Posture / Position の単機ログに加え、
 **Multi(複数機同時制御)** のグループログにも対応する。
 

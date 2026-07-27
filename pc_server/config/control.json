@@ -10,9 +10,26 @@
     "reseed_probation_frames": 10
   },
   "coordinate_transform": {
-    "x": { "axis": "z", "sign": 1 },
-    "y": { "axis": "x", "sign": -1 },
-    "z": { "axis": "y", "sign": 1 }
+    "x": {
+      "axis": "z",
+      "sign": 1
+    },
+    "y": {
+      "axis": "x",
+      "sign": -1
+    },
+    "z": {
+      "axis": "y",
+      "sign": 1
+    }
+  },
+  "attitude_transform": {
+    "forward_axis": "+x",
+    "up_axis": "+y",
+    "yaw_sign": 1,
+    "yaw_offset_deg": 0,
+    "flip_correction": true,
+    "flip_gate": 0.5
   },
   "natnet": {
     "server_address": "127.0.0.1",
@@ -25,7 +42,11 @@
     "frame_hold_ms": 300,
     "pos_err_clamp_m": 2.0
   },
-  "target_default": { "x": 0.0, "y": 0.0, "z": 0.3 },
+  "target_default": {
+    "x": 0.0,
+    "y": 0.0,
+    "z": 0.3
+  },
   "trajectory": {
     "radius_min_m": 0.05,
     "radius_max_m": 1.5,

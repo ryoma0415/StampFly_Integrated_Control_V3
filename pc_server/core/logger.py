@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import threading
 import time
 from datetime import datetime
@@ -25,7 +26,8 @@ import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from .config import LOGS_DIR
 
-# 列定義 v4(109列。docs/LOG_STRUCTURE.md と1対1で対応させること)
+# 列定義 v5(115列 = v4 の109列+MoCap 正解ヨー/生クォータニオン6列。
+# docs/LOG_STRUCTURE.md と1対1で対応させること)
 COLUMNS: tuple[str, ...] = (
     # --- セッション / タイミング(7) ---
     "timestamp", "elapsed_time", "mode", "phase",
@@ -81,6 +83,14 @@ COLUMNS: tuple[str, ...] = (
     # --- リジッドボディ / フレーム診断(5) ---
     "rb_error", "rb_marker_count", "frame_number", "frame_dt_ms",
     "mocap_age_ms",
+    # --- MoCap 正解ヨー・生クォータニオン(2026-07 追加。互換のため既存列の
+    #     末尾に追加のみ: 旧ログは列不足として区別できる)(6) ---
+    # mocap_yaw_true_deg: 符号/オフセット/フリップ補正済みの正解ヨー
+    #   (-180, 180]。ビューアの「正解Yaw」系列はこの列を使う。
+    # mocap_flip: フリップ補正フラグ(bit0=上方軸反転補正, bit1=ヨー180°補正)
+    # mocap_q*: Motive 生クォータニオン — 任意のマッピングを事後再計算できる
+    "mocap_yaw_true_deg", "mocap_flip",
+    "mocap_qx", "mocap_qy", "mocap_qz", "mocap_qw",
 )
 
 FLOAT_DECIMALS = 6   # CSV 上の float 桁数
@@ -101,6 +111,8 @@ META_PASSTHROUGH_KEYS: tuple[str, ...] = (
     "tracking_valid", "rb_error", "frame_number",
     "frame_dt_ms", "mocap_age_ms",
     "mocap_yaw_deg", "mocap_heading_deg",
+    "mocap_yaw_true_deg", "mocap_flip",
+    "mocap_qx", "mocap_qy", "mocap_qz", "mocap_qw",
     "traj_mode", "traj_phase_rad",
 )
 
@@ -222,11 +234,17 @@ class FlightLogger:
         with self._lock:
             return self._file_path
 
-    def start(self, mode: str, stamp: Optional[str] = None) -> Path:
+    def start(self, mode: str, stamp: Optional[str] = None,
+              metadata: Optional[dict] = None) -> Path:
         """ログファイルを作成しヘッダを書く。既に開いていれば閉じてから開く。
 
         stamp を指定すると そのタイムスタンプ文字列でファイル名を作る
         (複数機モードで全機のファイル名を同一時刻に揃えるため)。
+
+        metadata を指定すると同名の ``*.meta.json`` サイドカーに書き出す
+        (適用中の MoCap マッピング等 — 「このログはどのフレームで取った
+        ものか」を CSV 列契約を変えずに恒久記録する)。書き込み失敗は
+        ログ本体を妨げない(サイドカーは診断情報であり必須ではない)。
         """
         self.stop()
         self._logs_dir.mkdir(parents=True, exist_ok=True)
@@ -241,6 +259,14 @@ class FlightLogger:
             self._file_path = path
             self._t0 = time.monotonic()
             self._rows_since_flush = 0
+        if metadata is not None:
+            meta_path = path.with_suffix(".meta.json")
+            try:
+                with open(meta_path, "w", encoding="utf-8") as fp:
+                    json.dump(metadata, fp, ensure_ascii=False, indent=2)
+                    fp.write("\n")
+            except OSError:
+                pass
         return path
 
     def stop(self) -> None:

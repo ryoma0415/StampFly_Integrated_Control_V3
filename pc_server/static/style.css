@@ -926,6 +926,16 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
 .multi-chip.chip-flying { background: rgba(52, 211, 153, 0.08); }
 .rb-list { font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
 .rb-line.stale { color: var(--text-dim); }
+.rb-line.rb-sub { color: var(--text-dim); white-space: pre; }
+
+/* 設定タブ(MoCap マッピング) */
+.map-table { border-collapse: collapse; font-size: 13px; }
+.map-table th, .map-table td { padding: 4px 8px; text-align: left; }
+.map-table thead th { color: var(--text-dim); font-weight: normal; font-size: 12px; }
+.map-table tbody th { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.map-table select { min-width: 56px; }
+.tab-settings { margin-left: auto; }
+.exp-msg.msg-err { color: var(--warn); }
 #multiCanvas {
   display: block;
   margin: 12px auto 0;

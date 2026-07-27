@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""合成ダミーフライトログ(v4・109列・50Hz)の生成スクリプト。
+"""合成ダミーフライトログ(v5・115列・50Hz)の生成スクリプト。
 
 flight_log_viewer の全機能(静止画・ヨー解析・アニメーション・レポート)を
-実ログなしで検証するための CSV を生成する。列は viewer.constants.V4_COLUMNS
-(= docs/LOG_STRUCTURE.md v4 契約の 109 列。TLM_CTRL 由来の指令角速度+
+実ログなしで検証するための CSV を生成する。列は viewer.constants.V5_COLUMNS
+(= docs/LOG_STRUCTURE.md v5 契約の 115 列。TLM_CTRL 由来の指令角速度+
 姿勢 PID 成分 23 列を含む)と同一順序で出力する。
 出力先は新レイアウト <repo>/logs/flight_logs/。
 
@@ -58,13 +58,12 @@ from viewer.constants import (  # noqa: E402
     FF_STATUS_MAG_FRESH,
     FF_STATUS_YAW_CTRL_ACTIVE,
     LOG_RATE_HZ,
-    N_COLUMNS,
     TLM_CTRL_FLAG_FLYING,
     TLM_CTRL_FLAG_XY_ONBOARD,
     TLM_CTRL_FLAG_YAW_CTRL,
     TLM_FLAG_FLYING,
     TLM_FLAG_SETPOINT_FRESH,
-    V4_COLUMNS,
+    V5_COLUMNS,
 )
 
 # 新レイアウト: 飛行ログは <repo>/logs/flight_logs/ に置く
@@ -180,7 +179,7 @@ def generate_rows(
 
     for i in range(n_rows):
         t = i * dt
-        row: dict = {col: None for col in V4_COLUMNS}
+        row: dict = {col: None for col in V5_COLUMNS}
 
         # ---- フェーズ判定 ----
         if t < t_connect:
@@ -401,8 +400,19 @@ def generate_rows(
             row["frame_number"] = int(t * 100.0)
             row["frame_dt_ms"] = 10.0 + float(rng.normal(0, 0.5))
             row["mocap_age_ms"] = float(rng.uniform(1.0, 9.0))
-            row["mocap_yaw_deg"] = _wrap_deg(yaw_true_noisy)  # MoCap 出力は ±180
-            row["mocap_heading_deg"] = _wrap_deg(yaw_true_noisy)
+            # v5: 正解ヨーは mocap_yaw_true_deg。旧列 mocap_yaw_deg は
+            # 実機では軸違いのオイラー分解値(機首方位でない)のため、
+            # ダミーでも別値(ピッチ相当に漏れた値)を入れて区別を保つ
+            row["mocap_yaw_true_deg"] = _wrap_deg(yaw_true_noisy)
+            row["mocap_yaw_deg"] = _wrap_deg(0.3 * yaw_true_noisy)
+            row["mocap_heading_deg"] = _wrap_deg(yaw_true_noisy - 90.0)
+            row["mocap_flip"] = 0
+            # 生クォータニオン(Y-up・ヨーのみ): q = (0, sin(θ/2), 0, cos(θ/2))
+            half = math.radians(yaw_true_noisy) / 2.0
+            row["mocap_qx"] = 0.0
+            row["mocap_qy"] = math.sin(half)
+            row["mocap_qz"] = 0.0
+            row["mocap_qw"] = math.cos(half)
             row["traj_mode"] = traj_mode
             row["traj_phase_rad"] = circle_phase if traj_mode == 1 else None
 
@@ -492,9 +502,9 @@ def write_csv(rows: list[dict], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(V4_COLUMNS)
+        writer.writerow(V5_COLUMNS)
         for row in rows:
-            writer.writerow([_fmt(row.get(col)) for col in V4_COLUMNS])
+            writer.writerow([_fmt(row.get(col)) for col in V5_COLUMNS])
 
 
 def _cleanup_legacy_dummies() -> None:
@@ -511,7 +521,7 @@ def make_single(mode: str, duration_s: float, out_path: Path | None = None) -> P
     out_path = out_path or (DEFAULT_LOGS_DIR / f"dummy_{mode}.csv")
     rows = generate_rows(mode, duration_s)
     write_csv(rows, out_path)
-    print(f"生成完了: {out_path} ({len(rows)}行 × {N_COLUMNS}列, mode={mode})")
+    print(f"生成完了: {out_path} ({len(rows)}行 × {len(V5_COLUMNS)}列, mode={mode})")
     return out_path
 
 
@@ -526,7 +536,7 @@ def make_multi_group(duration_s: float, ts: str = DUMMY_MULTI_TS) -> list[Path]:
             circle_phase0=phase0, seed=seed,
         )
         write_csv(rows, out_path)
-        print(f"生成完了: {out_path} ({len(rows)}行 × {N_COLUMNS}列, "
+        print(f"生成完了: {out_path} ({len(rows)}行 × {len(V5_COLUMNS)}列, "
               f"mode=multi, drone={name})")
         paths.append(out_path)
     return paths

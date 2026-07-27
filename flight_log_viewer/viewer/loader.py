@@ -26,6 +26,7 @@ from .constants import (
     TEXT_COLUMNS,
     TLM_FLAG_FLYING,
     V4_COLUMNS,
+    V5_COLUMNS,
     YAW_SOURCES,
 )
 
@@ -139,10 +140,12 @@ class FlightLog:
     def yaw_reference(self) -> tuple[str, np.ndarray] | None:
         """ヨー誤差の基準系統(キー名, アンラップ済み deg 系列)を返す。
 
-        MoCap 真値があればそれを、なければ Madgwick を基準とする。
-        どちらも無ければ None。
+        MoCap 正解Yaw(v5: mocap_yaw_true_deg)があればそれを、なければ
+        Madgwick を基準とする。どちらも無ければ None。旧列 mocap_yaw_deg は
+        機首方位でない(Y-up へ Z-up 前提オイラーを適用した値)ため基準に
+        使わない — v4 以前のログは Madgwick 基準になる。
         """
-        if self.has("mocap_yaw_deg"):
+        if self.has("mocap_yaw_true_deg"):
             return "mocap", self.df["yaw_mocap_unwrap_deg"].to_numpy(dtype=float)
         if self.has("tlm_yaw_rad"):
             return "madgwick", self.df["yaw_madgwick_unwrap_deg"].to_numpy(dtype=float)
@@ -260,9 +263,12 @@ def load_log(csv_path: str | Path) -> FlightLog:
     if "elapsed_time" not in df.columns:
         raise ValueError(f"必須列 elapsed_time がありません: {csv_path}")
 
-    # 列の検証(過不足は警告のみ。109列契約は docs/LOG_STRUCTURE.md v4 を参照)
+    # 列の検証(過不足は警告のみ。契約は docs/LOG_STRUCTURE.md を参照)。
+    # 必須は v4 の 109 列。v5 追加列(MoCap 正解ヨー等)は旧ログに無くて
+    # 正常なため欠落警告の対象にしない — v5 列が有れば「契約に無い列」にも
+    # しない(V5_COLUMNS 基準で判定)。
     missing = [c for c in V4_COLUMNS if c not in df.columns]
-    extra = [c for c in df.columns if c not in V4_COLUMNS]
+    extra = [c for c in df.columns if c not in V5_COLUMNS]
     if missing:
         warnings.append(
             f"契約({N_COLUMNS}列)に対して欠けている列が {len(missing)} 個あります: "

@@ -1,9 +1,17 @@
-# StampFly Integrated Control — フライトログ形式(v4・109列)
+# StampFly Integrated Control — フライトログ形式(v5・115列)
 
 本書は `pc_server/core/logger.py` が生成する CSV の列構成を定義する。
 列定義の実体は `logger.py` の `COLUMNS` であり、本書と1対1で対応させること。
-flight_log_viewer(`viewer/constants.py` の `V4_COLUMNS`)も同一の 109 列契約を
-正として読み込む(旧ログ v1〜v3 との互換は「旧版からの変更履歴」参照)。
+flight_log_viewer(`viewer/constants.py` の `V5_COLUMNS` = `V4_COLUMNS` +
+`V5_APPENDED_COLUMNS`)も同一の 115 列契約を正として読み込む
+(旧ログ v1〜v4 との互換は「旧版からの変更履歴」参照)。
+
+v5 は v4 の 109 列を**不変のまま**、末尾に MoCap 正解ヨー/生クォータニオン
+6 列を追加した(§14)。合わせてログファイルと同名の `*.meta.json`
+サイドカーに、記録時に適用されていた MoCap マッピング
+(`coordinate_transform` / `attitude_transform`)を保存する — マッピングが
+実行時変更可能になったため、「このログがどの座標フレームで記録されたか」を
+列契約と独立に恒久記録する。
 
 v4 は従来の「末尾追加のみ」方式をやめた**全面再編**である:
 v3(100列)から 14 列を削除し、TLM_CTRL(制御ループ診断テレメトリ、
@@ -30,7 +38,7 @@ PROTOCOL.md 0x35)由来の 23 列を追加、全列を論理グループ順に�
 
 ## 書式と書き込み挙動(`logger.py` 実装)
 
-- 列数は 109(1行目がヘッダ)。順序は `COLUMNS` の宣言順(下の列リファレンスの
+- 列数は 115(1行目がヘッダ)。順序は `COLUMNS` の宣言順(下の列リファレンスの
   掲載順と同一)。
 - float は小数 6 桁の固定表記(`FLOAT_DECIMALS = 6`)。bool は `"1"`/`"0"`、
   `None`(未取得)は空文字で出力される。
@@ -59,7 +67,7 @@ PROTOCOL.md 0x35)由来の 23 列を追加、全列を論理グループ順に�
 - 時間系(`*_ms`)はミリ秒。`elapsed_time` は秒(time.monotonic 基準)。
 - 0/1 フラグは文字列 `"0"`/`"1"`。値が未取得の列は空文字。
 
-## 列リファレンス(v4・109列。ファイル上の並び順)
+## 列リファレンス(v5・115列。ファイル上の並び順)
 
 各グループ見出しの「出所」は値の生成元:
 **PC** = pc_server(session / multi の送信・ログ組み立て)、
@@ -216,6 +224,17 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
 | `frame_dt_ms` | float | ms | 連続する NatNet フレーム間の時間差。 |
 | `mocap_age_ms` | float | ms | 最後の有効 pose からこの行までの経過。 |
 
+### 14. MoCap 正解ヨー・生クォータニオン(6列、出所: meta。v5 追加。Posture では空)
+
+| 列 | 型 | 単位 | 説明 |
+| --- | --- | --- | --- |
+| `mocap_yaw_true_deg` | float | deg | **正解ヨー**。前方軸の制御座標方位に `attitude_transform` の符号・オフセット・フリップ補正を適用し (-180, 180] にラップした値。ビューアの「MoCap 正解Yaw」系列・ヨー統計の基準はこの列(旧 `mocap_yaw_deg` は Z-up 前提オイラー分解で Motive が Y-up の場合は機首方位ではない — 2026-07-27 実測確定。診断用に残置)。 |
+| `mocap_flip` | int | bit | フリップ補正フラグ。bit0 = 上方軸反転補正(マーカー対称性による前方軸まわり180°別解)、bit1 = ヨー継続性ガードの180°補正。0 = 補正なし。 |
+| `mocap_qx` | float | - | Motive 生クォータニオン x(NatNet unpack 順)。 |
+| `mocap_qy` | float | - | 同 y。 |
+| `mocap_qz` | float | - | 同 z。 |
+| `mocap_qw` | float | - | 同 w。**生クォータニオンがあれば任意のマッピングを事後再計算できる**(軸ずれ調査の再発防止)。 |
+
 ## TLM_CTRL スナップショットの注意(25Hz)
 
 - TLM_CTRL は 25Hz(400Hz ループの 16 分周、TLM_STATE から 4 tick 位相ずらし)
@@ -240,7 +259,7 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
 - **v3(100列)**: 末尾に 6 列追加 — 機上XY制御(CMD_POS_ERR)診断
   (`xy_cmd_mode` / `cmd_err_x_m` / `cmd_err_y_m` / `cmd_xy_valid` /
   `cmd_mocap_yaw_deg` / `mocap_heading_deg`)。
-- **v4(109列、本版)**: 全面再編。
+- **v4(109列)**: 全面再編。
   - **削除(14列)**: deg 重複列 `roll_ref_deg` / `pitch_ref_deg` /
     `cmd_yaw_ref_deg`(rad 列から導出可能)、`marker_count`
     (`rb_marker_count` と重複)、`tlm_state_name` / `tlm_reason_name`
@@ -255,6 +274,11 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
   - **並び替え**: 追記順を廃し、セッション → 目標/位置 → 送信指令 → 機体実測 →
     機体計算指令 → PID 成分 → 高度 → ヨー推定 → モータ/電源 → 状態 →
     MoCap/軌道 → フィルタ → RB 診断 の論理順にした。
+- **v5(115列、本版)**: 末尾追加のみ — MoCap 正解ヨー・生クォータニオン
+  6 列(`mocap_yaw_true_deg` / `mocap_flip` / `mocap_qx/qy/qz/qw`、§14)。
+  同時にログと同名の `*.meta.json` サイドカー(適用中 MoCap マッピングの
+  記録)を導入。v4 の 109 列は順序・意味とも不変のため、旧ツールは先頭
+  109 列をそのまま読める。
 - **旧ログ互換(flight_log_viewer)**: `viewer/loader.py` は列の過不足を警告のみで
   続行する(必須列は `elapsed_time` のみ)。加えて v4 で廃止された
   `roll_ref_deg` / `pitch_ref_deg` / `cmd_yaw_ref_deg` は「CSV に列があれば

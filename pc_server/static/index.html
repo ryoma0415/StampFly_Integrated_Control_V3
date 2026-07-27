@@ -46,6 +46,9 @@
       <button id="tabPosition" class="tab" data-mode="position">Position<span class="tab-jp">位置制御</span></button>
       <button id="tabMulti" class="tab" data-mode="multi">Multi<span class="tab-jp">複数機</span></button>
       <button id="tabExperiment" class="tab" data-mode="experiment">Experiment<span class="tab-jp">実験</span></button>
+      <!-- 設定は UI 専用タブ(サーバの session モードではない: set_mode を送らず、
+           20Hz state echo のモード同期からも除外される) -->
+      <button id="tabSettings" class="tab tab-settings">Settings<span class="tab-jp">設定</span></button>
     </nav>
 
     <!-- ---- Posture タブ ---- -->
@@ -423,6 +426,104 @@
           <div class="exp-msg" id="ffApplyMsg">--</div>
         </div>
 
+      </div>
+    </div>
+
+    <!-- ---- Settings タブ(UI 専用: MoCap 座標・姿勢マッピング) ---- -->
+    <div id="panelSettings" class="panel">
+      <div class="exp-section">
+        <h3>MoCap 位置マッピング <span class="unit-h">制御軸 ← Motive軸 × 符号</span></h3>
+        <p class="note">Motive の座標軸と制御座標系(x=前, y=左, z=上)の対応を設定します。
+          各 Motive 軸はちょうど1回ずつ参照してください(符号付き置換)。
+          ヨー(機首方位)は同じマッピングから自動導出されるため、
+          位置を直せばヨーの軸も追従します。</p>
+        <table class="map-table">
+          <thead><tr><th>制御軸</th><th>Motive軸</th><th>符号</th></tr></thead>
+          <tbody>
+            <tr><th>x(前)</th>
+              <td><select id="mapXAxis" class="map-axis">
+                <option value="x">X</option><option value="y">Y</option><option value="z">Z</option>
+              </select></td>
+              <td><select id="mapXSign" class="map-sign">
+                <option value="1">+</option><option value="-1">&minus;</option>
+              </select></td></tr>
+            <tr><th>y(左)</th>
+              <td><select id="mapYAxis" class="map-axis">
+                <option value="x">X</option><option value="y">Y</option><option value="z">Z</option>
+              </select></td>
+              <td><select id="mapYSign" class="map-sign">
+                <option value="1">+</option><option value="-1">&minus;</option>
+              </select></td></tr>
+            <tr><th>z(上)</th>
+              <td><select id="mapZAxis" class="map-axis">
+                <option value="x">X</option><option value="y">Y</option><option value="z">Z</option>
+              </select></td>
+              <td><select id="mapZSign" class="map-sign">
+                <option value="1">+</option><option value="-1">&minus;</option>
+              </select></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="exp-section">
+        <h3>MoCap 姿勢(ヨー)マッピング</h3>
+        <div class="target-row">
+          <label>前方軸(機首)
+            <select id="mapFwdAxis">
+              <option value="+x">+X</option><option value="-x">&minus;X</option>
+              <option value="+y">+Y</option><option value="-y">&minus;Y</option>
+              <option value="+z">+Z</option><option value="-z">&minus;Z</option>
+            </select></label>
+          <label>上方軸(正立時)
+            <select id="mapUpAxis">
+              <option value="+x">+X</option><option value="-x">&minus;X</option>
+              <option value="+y">+Y</option><option value="-y">&minus;Y</option>
+              <option value="+z">+Z</option><option value="-z">&minus;Z</option>
+            </select></label>
+        </div>
+        <div class="target-row">
+          <label>ヨー符号
+            <select id="mapYawSign">
+              <option value="1">+1</option><option value="-1">&minus;1</option>
+            </select></label>
+          <label>ヨーオフセット
+            <input type="number" id="mapYawOffset" step="0.1" min="-360" max="360" value="0.0"><span class="unit">deg</span></label>
+        </div>
+        <div class="preset-row">
+          <button id="btnYawZeroAlign" class="btn btn-small"
+            title="選択中リジッドボディの現在方位が 0° になるようオフセットを設定します(機体を基準方位へ向けて押す)">現在方位を 0&deg; に</button>
+          <button id="btnYawTlmAlign" class="btn btn-small"
+            title="MoCap 正解ヨーが機体のヨー推定(EKF/Madgwick)と一致するようオフセットを設定します">機体ヨー推定に合わせる</button>
+        </div>
+        <label class="switch-label">
+          <input type="checkbox" id="mapFlipCorr" checked>フリップ補正(マーカー対称性による180°反転解の自動補正)
+        </label>
+        <div class="target-row">
+          <label>反転判定ゲート
+            <input type="number" id="mapFlipGate" step="0.05" min="0.05" max="0.95" value="0.5"><span class="unit">|上方軸·鉛直|</span></label>
+        </div>
+      </div>
+
+      <div class="exp-section">
+        <div class="multi-head">
+          <span class="mlabel">ライブプレビュー</span>
+          <button id="btnMapPreview" class="btn btn-small">プレビュー開始</button>
+        </div>
+        <p class="note">機体を手で動かして、変換後の座標とヨーが期待どおり動くか確認できます
+          (適用前の編集内容ではなく<strong>適用済みマッピング</strong>の値です)。
+          ヨー確認の要点: 機体を左回りに回したとき「正解Yaw」と機体側ヨー推定が同方向に増えること。</p>
+        <div id="mapPreviewBox" class="rb-list mono"></div>
+      </div>
+
+      <div class="exp-section">
+        <div class="preset-row">
+          <button id="btnMapApply" class="btn btn-small btn-primary">適用(保存)</button>
+          <button id="btnMapReload" class="btn btn-small">再読込</button>
+        </div>
+        <p class="note">適用は地上(非武装・非記録中)でのみ可能です。適用と同時に
+          control.json へ保存し、位置フィルタを再初期化します。飛行ログには適用中の
+          マッピングが *.meta.json として残ります。</p>
+        <div class="exp-msg" id="mapMsg">--</div>
       </div>
     </div>
   </section>

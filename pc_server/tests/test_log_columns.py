@@ -1,7 +1,9 @@
-"""ログ列契約 v4: 109 列(順序は docs/LOG_STRUCTURE.md v4 と 1 対 1)。
+"""ログ列契約 v5: 115 列(順序は docs/LOG_STRUCTURE.md と 1 対 1)。
 
 v3 までの「末尾追加のみ」契約は v4 で破棄し、列の削除+追加+論理的な
-並び替えを行った(TLM_CTRL 追加に伴う全面再編)。本テストが順序の正。
+並び替えを行った(TLM_CTRL 追加に伴う全面再編)。v5 は v4 の 109 列を
+不変のまま、MoCap 正解ヨー/生クォータニオン 6 列を末尾に追加した
+(旧ログとは列数で判別できる)。本テストが順序の正。
 """
 
 from __future__ import annotations
@@ -70,6 +72,14 @@ V4_COLUMNS = (
     "mocap_age_ms",
 )
 
+# v5 で末尾に追加された MoCap 正解ヨー/生クォータニオン列(6)。
+# mocap_yaw_true_deg はフリップ補正+sign/offset 適用済みの (-180,180]、
+# mocap_q* は Motive 生クォータニオン(任意マッピングの事後再計算用)。
+V5_APPENDED_COLUMNS = (
+    "mocap_yaw_true_deg", "mocap_flip",
+    "mocap_qx", "mocap_qy", "mocap_qz", "mocap_qw",
+)
+
 # v4 で削除された v3 列(残存すれば契約違反)
 V3_REMOVED_COLUMNS = (
     "roll_ref_deg", "pitch_ref_deg", "cmd_yaw_ref_deg", "marker_count",
@@ -79,13 +89,15 @@ V3_REMOVED_COLUMNS = (
 )
 
 
-def test_column_count_is_109():
+def test_column_count_is_115():
     assert len(V4_COLUMNS) == 109
-    assert len(COLUMNS) == 109
+    assert len(COLUMNS) == 115
 
 
-def test_columns_match_v4_contract_order():
-    assert COLUMNS == V4_COLUMNS
+def test_columns_match_v5_contract_order():
+    """v5 = v4 の 109 列(順序不変)+末尾6列。旧ツールは先頭 109 列を
+    そのまま読める(末尾追加のみ)。"""
+    assert COLUMNS == V4_COLUMNS + V5_APPENDED_COLUMNS
 
 
 def test_removed_v3_columns_absent():

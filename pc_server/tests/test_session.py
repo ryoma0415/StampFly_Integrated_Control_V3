@@ -481,7 +481,7 @@ class TestLoggingIntegration:
 
         lines = log_file.read_text(encoding="utf-8").strip().splitlines()
         header = lines[0].split(",")
-        assert len(header) == 109              # v4 契約
+        assert len(header) == 115              # v5 契約(v4 109列+MoCap 6列)
         row = lines[1].split(",")
 
         def cell(name: str) -> str:

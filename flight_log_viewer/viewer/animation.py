@@ -372,15 +372,16 @@ class _AnimationBuilder:
             (("tlm_voltage_v", "電圧", COLORS["voltage"], "-"),
              ("tlm_current_a", "電流", COLORS["current"], "-")))
 
-        # --- ヨーパネル(Madgwick / EKF / 指令) ---
-        # MoCap 真値・ジャイロ積算は表示しない(2026-07 仕様変更。
-        # MoCap ヨーは信頼性が低く、ジャイロ積算は参考値のため)
+        # --- ヨーパネル(Madgwick / EKF / MoCap 正解Yaw / 指令) ---
+        # MoCap は v5 の正解Yaw(mocap_yaw_true_deg)のみ表示(旧列は軸違い
+        # のため 2026-07 に除外、正解Yaw 導入で復帰)。ジャイロ積算は参考値の
+        # ため表示しない。v4 以前のログでは MoCap 系統は自動スキップされる。
         slot_yaw = gs[1, 3] if video_frames else gs[1, 2:]
         self.ax_yaw = self.fig.add_subplot(slot_yaw)
         # ラップ表示のため補間はアンラップ列で行い、描画時に ±180° へ畳む
         yaw_specs = []
         for key, _col, label, color, _deg in YAW_SOURCES:
-            if key not in ("madgwick", "ekf"):
+            if key not in ("madgwick", "ekf", "mocap"):
                 continue
             yaw_specs.append((f"yaw_{key}_unwrap_deg", label, color, "-"))
         yaw_specs.append(("cmd_yaw_ref_deg", "指令", COLORS["yaw_cmd"], "--"))

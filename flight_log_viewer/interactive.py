@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """インタラクティブ HTML プレーヤーのエクスポータ CLI。
 
-フライトログ CSV 1 本を読み込み、契約の 58 系列を little-endian float32
+フライトログ CSV 1 本を読み込み、契約の 59 系列を little-endian float32
 → base64 でテンプレート(viewer/interactive_template.html)に埋め込んだ
 自己完結 HTML を output/<ログ名>/interactive.html に出力する。
 
-データ契約(58 系列の格納順・単位・注入プレースホルダ)は
+データ契約(59 系列の格納順・単位・注入プレースホルダ)は
 INTERACTIVE_VIEWER_SPEC.md「データ契約」に従う。**系列の格納順自体が契約**で
 あり、テンプレート側の実装と 1 対 1 で一致させること(名前は JSON に
 含めない)。欠損値は float32 の NaN のまま格納する(テンプレートは NaN で
@@ -51,10 +51,10 @@ TEMPLATE_PATH = _HERE / "viewer" / "interactive_template.html"
 EMBED_PLACEHOLDER = "const EMBED = /*__EMBED_JSON__*/null;"
 
 # EMBED スキーマのバージョン
-EMBED_VERSION = 1
+EMBED_VERSION = 2   # v2: 59系列(yaw_mocap 追加。2026-07)
 
 # ---------------------------------------------------------------------------
-# 系列定義(58 系列。この格納順が契約 — INTERACTIVE_VIEWER_SPEC.md)
+# 系列定義(59 系列。この格納順が契約 — INTERACTIVE_VIEWER_SPEC.md)
 # ---------------------------------------------------------------------------
 
 SERIES_NAMES: tuple[str, ...] = (
@@ -90,9 +90,12 @@ SERIES_NAMES: tuple[str, ...] = (
     "alt_vel", "z_dot_ref",
     # 57: 制御フラグ(bit0=xy_onboard, bit1=yaw_ctrl, bit2=flying。NaN=未受信)
     "ctrl_flags",
+    # 58: MoCap 正解ヨー [deg ±180](v5 ログ mocap_yaw_true_deg。
+    #     v4 以前のログでは全 NaN — テンプレートは線を描かない)
+    "yaw_mocap",
 )
 N_SERIES = len(SERIES_NAMES)
-assert N_SERIES == 58, f"系列数が契約(58)と不一致: {N_SERIES}"
+assert N_SERIES == 59, f"系列数が契約(59)と不一致: {N_SERIES}"
 
 # 生成 HTML から EMBED を抽出する正規表現(自己検証用。JSON は 1 行で注入)
 _EMBED_RE = re.compile(r"const EMBED = (\{.*\});")
@@ -103,7 +106,7 @@ _EMBED_RE = re.compile(r"const EMBED = (\{.*\});")
 # ---------------------------------------------------------------------------
 
 def _column(log: FlightLog, name: str) -> np.ndarray:
-    """列を float 配列で返す(無い列は全 NaN — 系列数は常に 58 を保つ)。"""
+    """列を float 配列で返す(無い列は全 NaN — 系列数は常に 59 を保つ)。"""
     if name in log.df.columns:
         return log.df[name].to_numpy(dtype=float)
     return np.full(len(log.df), np.nan)
@@ -115,7 +118,7 @@ def _deg(log: FlightLog, name: str) -> np.ndarray:
 
 
 def build_series(log: FlightLog) -> dict[str, np.ndarray]:
-    """契約の 58 系列を格納順の dict で構築する(float64・NaN 保持)。
+    """契約の 59 系列を格納順の dict で構築する(float64・NaN 保持)。
 
     - rad 列は deg に変換、yaw 系は ±180° に折り返す(ラップ跨ぎの線切りは
       テンプレート側の表示処理)。
@@ -192,6 +195,8 @@ def build_series(log: FlightLog) -> dict[str, np.ndarray]:
     series["alt_vel"] = _column(log, "tlm_alt_velocity_m_s")
     series["z_dot_ref"] = _column(log, "tlm_z_dot_ref_m_s")
     series["ctrl_flags"] = _column(log, "tlm_ctrl_flags")
+    # MoCap 正解ヨー(v5: deg・±180 で記録済み。折り返しは記録側の契約)
+    series["yaw_mocap"] = _column(log, "mocap_yaw_true_deg")
 
     assert tuple(series.keys()) == SERIES_NAMES, "系列の格納順が契約と不一致"
     return series
@@ -202,7 +207,7 @@ def build_series(log: FlightLog) -> dict[str, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def encode_series_b64(series: dict[str, np.ndarray]) -> str:
-    """58 系列を格納順に連結した little-endian float32 を base64 化する。"""
+    """59 系列を格納順に連結した little-endian float32 を base64 化する。"""
     packed = np.concatenate(
         [np.ascontiguousarray(values, dtype="<f4")
          for values in series.values()])
@@ -210,7 +215,7 @@ def encode_series_b64(series: dict[str, np.ndarray]) -> str:
 
 
 def build_embed(log: FlightLog, series: dict[str, np.ndarray]) -> dict:
-    """EMBED スキーマ(version 1)の dict を構築する。
+    """EMBED スキーマ(version は EMBED_VERSION)の dict を構築する。
 
     datasets は将来の複数ログ比較を見越した配列(初版は要素 1 のみ)。
     """

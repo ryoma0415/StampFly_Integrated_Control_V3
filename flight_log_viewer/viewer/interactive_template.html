@@ -10,9 +10,9 @@
   - interactive.py が「const EMBED = …null;」の契約行を JSON リテラルに置換して出力する
     (プレースホルダ文字列そのものをこのコメントに書くと置換対象が二重になるため書かない)。
   - EMBED === null(テンプレート単体で開いた場合)は内蔵デモデータ
-    (30秒・50Hz・58系列の合成飛行データ)で全機能が動作する。
+    (30秒・50Hz・59系列の合成飛行データ)で全機能が動作する。
   - 自己完結 1 ファイル。外部 CDN・ネットワーク接続は一切使わない。
-  - データ契約(58系列の格納順・単位)は INTERACTIVE_VIEWER_SPEC.md に従う。
+  - データ契約(59系列の格納順・単位)は INTERACTIVE_VIEWER_SPEC.md に従う。
 -->
 <style>
 :root {
@@ -190,8 +190,9 @@ input[type="range"] { accent-color: var(--accent); }
 /* エクスポータが置換する埋め込みデータ(この行は完全一致契約。編集禁止) */
 const EMBED = /*__EMBED_JSON__*/null;
 
-/* ===================== データ契約(58系列・格納順) ===================== */
-/* INTERACTIVE_VIEWER_SPEC.md「系列定義」と 1:1。順序自体が契約。 */
+/* ===================== データ契約(59系列・格納順) ===================== */
+/* INTERACTIVE_VIEWER_SPEC.md「系列定義」と 1:1。順序自体が契約。
+   v2(2026-07): 58系列の末尾に yaw_mocap(MoCap 正解ヨー)を追加。 */
 const SERIES_NAMES = [
   "t",                                                    // 0  [s]
   "alt_est", "alt_tof", "alt_ref",                        // 1-3  [m]
@@ -214,10 +215,11 @@ const SERIES_NAMES = [
   "bm_x", "bm_y",                                         // 53-54 [µT]
   "alt_vel", "z_dot_ref",                                 // 55-56 [m/s]
   "ctrl_flags",                                           // 57 [bit]
+  "yaw_mocap",                                            // 58 [deg ±180](v5 ログのみ。無ければ NaN)
 ];
-const N_SERIES = 58;
+const N_SERIES = 59;
 if (SERIES_NAMES.length !== N_SERIES) {
-  throw new Error("系列定義が契約(58系列)と不一致: " + SERIES_NAMES.length);
+  throw new Error("系列定義が契約(59系列)と不一致: " + SERIES_NAMES.length);
 }
 
 /* tlm_ctrl_flags のビット(viewer/constants.py と同値) */
@@ -257,7 +259,7 @@ function isLittleEndian() {
   return new Uint8Array(buf)[0] === 0x44;
 }
 
-/* base64 の連結 float32 を 58 系列の名前付き Float32Array 群に分解する */
+/* base64 の連結 float32 を 59 系列の名前付き Float32Array 群に分解する */
 function decodeSeriesMap(dataB64, n) {
   const bytes = base64ToBytes(dataB64);
   const expected = N_SERIES * n * 4;
@@ -505,6 +507,8 @@ function generateDemoSeries() {
     cols.yaw_ref[i] = yawRef;
     cols.yaw_ekf[i] = yawEkf;
     cols.yaw_mad[i] = wrap180(yawEkfU + 0.35 * t + noise(0.4));  /* ドリフト */
+    /* MoCap 正解ヨー: EKF に近い真値(低ノイズ・ドリフトなし) */
+    cols.yaw_mocap[i] = wrap180(yawEkfU + noise(0.15));
     cols.err_yaw[i] = wrap180(yawRef - yawEkf);
 
     /* --- 角速度(姿勢の数値微分+ノイズ) --- */
@@ -611,7 +615,7 @@ function generateDemoEmbed() {
     for (let i = 0; i < flat.length; i++) dv.setFloat32(i * 4, flat[i], true);
   }
   return {
-    version: 1,
+    version: 2,
     log_name: "demo_30s_position",
     generated_at: "2026-07-17T00:00:00",
     rate_hz: d.rate,
@@ -632,6 +636,7 @@ const C = {
   pitchAxis: "#9B59B6",  /* Pitch 系(COLORS["meas_pitch"]) */
   yawAxis: "#e74c3c",    /* Yaw 系(COLORS["yaw_ekf"]) */
   yawMad: "#a16207",     /* Madgwick ヨー(Roll と区別する暗色) */
+  yawMocap: "#16a34a",   /* MoCap 正解ヨー(COLORS["yaw_mocap"]) */
   pidP: "#dc2626",       /* PID P(COLORS["p"]) */
   pidI: "#0d9488",       /* PID I(COLORS["i"]) */
   pidD: "#16a34a",       /* PID D(COLORS["d"]) */
@@ -675,6 +680,7 @@ const PANEL_DEFS = [
     { key: "pitch", label: "Pitch", color: C.pitchAxis, w: 1.4 },
     { key: "yaw_ekf", label: "Yaw(EKF)", color: C.yawAxis, w: 1.4, wrap: true },
     { key: "yaw_mad", label: "Yaw(Mad)", color: C.yawMad, w: 0.9, wrap: true, faded: true },
+    { key: "yaw_mocap", label: "Yaw(MoCap正解)", color: C.yawMocap, w: 1.2, wrap: true },
   ]},
   { id: "att_cmd", title: "姿勢指令角度", type: "ts", unit: "deg", digits: 2, series: [
     { key: "roll_ref", label: "Roll", color: C.rollAxis, w: 1.4 },

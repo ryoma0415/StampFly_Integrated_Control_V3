@@ -54,21 +54,36 @@ def load_airframes() -> list[dict[str, Any]]:
     return _load_json(AIRFRAMES_CONFIG_PATH)["airframes"]
 
 
-def save_airframes(airframes: list[dict[str, Any]]) -> None:
-    """機体プロファイル配列を airframes.json へ原子的に書き込む。
+def _save_json_atomic(path: Path, payload: Any) -> None:
+    """JSON 設定を原子的に書き込む(共通実装)。
 
     同一ディレクトリの一時ファイルへ全文を書いてから os.replace で置換する
     (書き込み途中のクラッシュで設定ファイルが壊れることを防ぐ)。
     キー順は呼び出し側の dict 挿入順をそのまま保持する。
     """
-    path = AIRFRAMES_CONFIG_PATH
     tmp_path = path.with_name(path.name + ".tmp")
-    text = json.dumps({"airframes": airframes}, ensure_ascii=False, indent=2) + "\n"
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     with open(tmp_path, "w", encoding="utf-8") as fp:
         fp.write(text)
         fp.flush()
         os.fsync(fp.fileno())
     os.replace(tmp_path, path)
+
+
+def save_airframes(airframes: list[dict[str, Any]]) -> None:
+    """機体プロファイル配列を airframes.json へ原子的に書き込む。"""
+    _save_json_atomic(AIRFRAMES_CONFIG_PATH, {"airframes": airframes})
+
+
+def save_control_config(control_config: dict[str, Any]) -> None:
+    """control.json 全体を原子的に書き込む(MoCap マッピングの実行時変更用)。
+
+    呼び出し側(session.update_mocap_mapping)がメモリ上の control_config
+    と適用済みオブジェクト(MocapSource のマッピング)を同期させる責務を
+    持つ — ファイル・メモリ・適用状態の三者が食い違わないよう、書き込みは
+    必ず session 層のコマンド直列化(_command_lock)の内側で行うこと。
+    """
+    _save_json_atomic(CONTROL_CONFIG_PATH, control_config)
 
 
 # MAC 未設定の正準表現は「空文字列」(airframes.json / UI / API で共通)

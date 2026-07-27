@@ -70,6 +70,16 @@ V4_COLUMNS: tuple[str, ...] = (
 N_COLUMNS = len(V4_COLUMNS)
 assert N_COLUMNS == 109, f"列数が契約(109列)と不一致: {N_COLUMNS}"
 
+# v5 で末尾に追加された列(2026-07: MoCap 正解ヨー・生クォータニオン)。
+# 読み込みは列名ベース(pandas)のため v4 ログもそのまま読める — これらの
+# 列が無いログでは対応する系統・図が自動的にスキップされる。
+V5_APPENDED_COLUMNS: tuple[str, ...] = (
+    "mocap_yaw_true_deg", "mocap_flip",
+    "mocap_qx", "mocap_qy", "mocap_qz", "mocap_qw",
+)
+V5_COLUMNS: tuple[str, ...] = V4_COLUMNS + V5_APPENDED_COLUMNS
+assert len(V5_COLUMNS) == 115, f"列数が契約(115列)と不一致: {len(V5_COLUMNS)}"
+
 # 数値変換しない(文字列のままにする)列
 # (tlm_state_name / tlm_reason_name / xy_cmd_mode は v4 で廃止された列だが、
 #  旧ログ v1〜v3 の読み込み互換のため文字列扱いを維持する)
@@ -175,7 +185,7 @@ COLORS: dict[str, str] = {
     "yaw_madgwick": "#ca8a04",   # Madgwick(tlm_yaw_rad)
     "yaw_ekf": "#e74c3c",        # EKF(tlm_yaw_est_rad)
     "yaw_gyro": "#3498db",       # ジャイロ積算(tlm_yaw_gyro_int_rad)
-    "yaw_mocap": "#16a34a",      # MoCap 真値(mocap_yaw_deg)
+    "yaw_mocap": "#16a34a",      # MoCap 正解Yaw(mocap_yaw_true_deg)
     "yaw_cmd": "#111111",        # PC ヨー指令(cmd_yaw_ref)
     "yaw_ref_applied": "#ea580c",  # 機体適用ヨー目標(tlm_yaw_ref_rad)
     # 高度
@@ -212,9 +222,14 @@ MULTI_DRONE_COLORS: tuple[str, ...] = (
 )
 
 # ヨー4系統の (キー名, 列名(rad or deg), 表示名, 色, 単位が deg か)
+# mocap は v5 の mocap_yaw_true_deg(符号/オフセット/フリップ補正済みの
+# 正解ヨー)。旧列 mocap_yaw_deg は Z-up 前提オイラー分解で Motive(Y-up)
+# では機首方位でないことが 2026-07-27 実測で確定したため使わない
+# (v4 以前のログでは mocap 系統は自動的に非表示となり、基準は Madgwick に
+# フォールバックする)。
 YAW_SOURCES: tuple[tuple[str, str, str, str, bool], ...] = (
     ("madgwick", "tlm_yaw_rad", "Madgwick", COLORS["yaw_madgwick"], False),
     ("ekf", "tlm_yaw_est_rad", "EKF (アクティブ推定器)", COLORS["yaw_ekf"], False),
     ("gyro_int", "tlm_yaw_gyro_int_rad", "ジャイロ積算", COLORS["yaw_gyro"], False),
-    ("mocap", "mocap_yaw_deg", "MoCap 真値", COLORS["yaw_mocap"], True),
+    ("mocap", "mocap_yaw_true_deg", "MoCap 正解Yaw", COLORS["yaw_mocap"], True),
 )

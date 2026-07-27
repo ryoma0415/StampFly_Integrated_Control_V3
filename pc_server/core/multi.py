@@ -536,11 +536,16 @@ class MultiControlManager:
             return []
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         names: list[str] = []
+        # 全機共通のマッピング情報(MocapSource は全スロット共有)
+        metadata = {
+            "log_columns_version": 5,
+            "mocap_mapping": self._mocap.mapping_snapshot(),
+        }
         for slot in slots:
             logger = FlightLogger(logs_dir=self.logs_dir,
                                   flush_every_rows=self._flush_every_rows)
             path = logger.start(f"multi_{_sanitize_name(slot.name)}",
-                                stamp=stamp)
+                                stamp=stamp, metadata=metadata)
             with self._lock:
                 slot.logger = logger
             names.append(path.name)
@@ -934,6 +939,25 @@ class MultiControlManager:
         with self._lock:
             return {s.name: s.profile for s in self._slots
                     if s.phase in (SLOT_ARMED, SLOT_FLYING)}
+
+    def reset_for_mapping_change(self, mapping_floor: int) -> None:
+        """MoCap マッピングの実行時変更後の全スロット仕切り直し。
+
+        session.update_mocap_mapping(地上限定)から呼ぶ:
+        - マッピング世代フロアを設定してから位置フィルタを再初期化する
+          (旧フレームのアンカー/差し替え直前の旧座標 pose によるシードの
+          両方を防ぐ)
+        - 設定済み目標をクリアする(スロット目標は旧座標系の絶対値のため。
+          start_all の target_set ゲートにより、次の一斉開始前に新しい
+          座標系で目標を入れ直すことが強制される)
+        """
+        with self._lock:
+            slots = list(self._slots)
+            for slot in slots:
+                slot.target_set = False
+        for slot in slots:
+            slot.controller.set_mocap_mapping_floor(mapping_floor)
+            slot.controller.reset_filter()
 
     def snapshot(self, now: float) -> dict:
         """WebSocket 20Hz 配信用(session.multi ノード。UI 単位系 deg/m)。"""
