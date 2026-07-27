@@ -1,8 +1,8 @@
 # 電流FF較正パイプライン 実装仕様書(インターフェース契約)— V2
 
 スイープ実験データ → パラメーター抽出 → FFプロファイルJSON → UI選択 → ファームウェア配信 →
-補正Yaw飛行、の全区間を定義する。方式の数式は yaw側プロジェクト
-(`../Yaw_Estimation_Project/Yaw_Calibration_and_Estimation`)の
+補正Yaw飛行、の全区間を定義する。方式の数式は yaw側プロジェクト(旧
+`Yaw_Estimation_Project/Yaw_Calibration_and_Estimation`)の
 `yaw_estimation_ff_two_methods.md`(方式A/B)と `yaw_estimation_method_v2.md`(§5)に従う。
 本書は**実装間のインターフェース**を確定する契約書。
 
@@ -13,6 +13,12 @@
 スイープのサンプル源(UDP JSON テレメトリ → TLM_EXP)である。
 なお上記 yaw側プロジェクトへの参照は**移植元の歴史的出所**であり、
 V2 の動作(ビルド・実行・テスト)には不要(数式の規範を示すための参照)。
+**yaw側フォルダは 2026-07-27 に本ツリーから削除済み**(別途アーカイブに保管)。
+以降、実装上の正典は本書と V2 実コード
+(`firmware_stampfly/src/yaw_estimation/ff_calibration.*` / `yaw_estimator_kf.*`、
+`pc_server/core/ffprofile.py`、`data_analysis/ff_params`)とする。
+方式A/Bの補間式は §5.1、抽出計算は §3.2、4状態EKF の予測・更新・ゲートは §5.5 に
+すべて明記してあり、**本書だけで実装・検証が完結する**(削除済み文書の参照は不要)。
 
 ---
 

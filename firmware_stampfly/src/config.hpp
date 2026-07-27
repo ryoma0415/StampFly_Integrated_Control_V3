@@ -3,7 +3,9 @@
 //
 // ARCHITECTURE.md コーディング規約: マジックナンバーはこのファイル以外に
 // 置かない。PIDゲインは飛行実績のある OptiTrack版
-// (StampFly_OptiTrack_PID_Control_System/M5StampFly/src/flight_control.cpp:77-92)
+// (StampFly_OptiTrack_PID_Control_System/M5StampFly/src/flight_control.cpp:77-92。
+//  ローカルの Previous_Version/ は削除済み、原典は
+//  github.com/ryoma0415/StampFly_OptiTrack_PID_Control_System)
 // の値を踏襲する。機体固有のバイアスはPC側プロファイルで扱い、ここには置かない。
 // ===========================================================================
 #pragma once

@@ -1,7 +1,8 @@
 """実験モード(モーターテスト/電流×磁場スイープ/加算性シーケンス)。
 
-yaw側 Yaw_Calibration_and_Estimation/pc_server/server.py の
-TelemetryHub(モーター部)/ SweepRunner / SequenceRunner をシリアル版に移植:
+旧 yaw側プロジェクト(Yaw_Calibration_and_Estimation。2026-07-27 に削除済み)の
+pc_server/server.py の TelemetryHub(モーター部)/ SweepRunner / SequenceRunner を
+シリアル版に移植:
 - モーター駆動: UDP motor_run → CMD_MOTOR_RUN(0.4s キープアライブ再送、
   機体側 1.5s 途絶で自動停止)。停止は CMD_MOTOR_STOP を3回送出。
 - サンプル源: UDP JSON テレメトリ → TLM_EXP(25Hz、MOTOR_TEST 状態のみ)。

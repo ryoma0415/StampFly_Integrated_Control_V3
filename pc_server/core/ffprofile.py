@@ -1,7 +1,7 @@
 """電流フィードフォワード(FF)プロファイルの抽出・適用・状態管理。
 
-yaw側 Yaw_Calibration_and_Estimation/pc_server/server.py の FfProfileManager を
-シリアル版に移植:
+旧 yaw側プロジェクト(Yaw_Calibration_and_Estimation。2026-07-27 に削除済み)の
+pc_server/server.py の FfProfileManager をシリアル版に移植:
 - 抽出: サブプロセスで data_analysis/make_ff_profile.py --folder … を実行
   (数値挙動は data_analysis 側の受入テストで固定。サーバは起動するだけ)。
 - 適用: mag3d binding 照合(要素毎 2e-3、不一致は警告+force 可)→

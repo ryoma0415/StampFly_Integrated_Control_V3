@@ -5,8 +5,10 @@
 PROTOCOL.md / ARCHITECTURE.md)。ヨー角制御プロジェクトの完了後に、StampFly 底面搭載の
 オプティカルフローセンサー PMW3901 を追加活用する価値があるかを検討した結果をまとめる。
 
-出典: `../Yaw_Estimation_Project/StampFly_technical_specification/` の各仕様文書、
+出典: `../StampFly_Telemetry/StampFly_technical_specification/` の各仕様文書、
 V2 実コード、および外部事例(Bitcraze Crazyflie Flow deck v2 / PX4 / ArduPilot の実装)。
+(本書執筆時の出典は `Yaw_Estimation_Project/StampFly_technical_specification/` だったが、
+同フォルダは 2026-07-27 に削除。内容同一のコピーが上記パスに現存する。)
 
 ---
 
@@ -44,8 +46,9 @@ V2 実コード、および外部事例(Bitcraze Crazyflie Flow deck v2 / PX4 / 
 - タイミング制約: 初期化の約80レジスタ列は書込間 t_SWW=45µs、読出系 t_SRR・t_SRW=20µs の
   コマンド間ギャップを遵守。リセット→有効モーションデータまで t_MOT-RST=50ms。
   **飛行中の再初期化は不可**(シャットダウンからの復帰もフル再初期化で 50ms を要する)。
-- 旧ファームウェア(Previous_Version 配下)にも PMW3901 の使用コードは存在しない
-  (grep で確認)。**ドライバは新規実装**となる(初期化手順は仕様文書に完備)。
+- 旧ファームウェア(当時の `Previous_Version/` 配下。2026-07-27 に削除済み)にも
+  PMW3901 の使用コードは存在しなかった(調査時に grep で確認)。
+  **ドライバは新規実装**となる(初期化手順は仕様文書に完備)。
 
 ### 1.2 取得できる生値
 
@@ -189,7 +192,7 @@ firmware_stampfly/src/flow_estimation/        # yaw_estimation/ と同型の分�
 ## 4. 参考資料
 
 **プロジェクト内**:
-- `Yaw_Estimation_Project/StampFly_technical_specification/pmw3901_doc_ja.md`(レジスタ・初期化・品質基準)
+- `../StampFly_Telemetry/StampFly_technical_specification/pmw3901_doc_ja.md`(レジスタ・初期化・品質基準)
 - 同 `M5StamFly_spec_ja.md` §4.2(SPI 共有ピン配置)、`VL53L3CX_doc_ja.md`(対地距離)
 - V2: `firmware_stampfly/src/yaw_estimation/`(統合パターンの前例)、`docs/ARCHITECTURE.md`(位相スタガ・ライター/リーダー規約)
 

@@ -7,8 +7,9 @@
   (session 層が CMD_POS_ERR に組み立てて送信・ログする)。roll/pitch の
   角度指令は機体側 XY PID が計算するため、この層では生成・整形しない。
 - v2 軌道モード: hover(固定目標)/ circle(円軌道)。円軌道は 50Hz 送信
-  ループ内で目標 (x, y) を時間更新する(旧 Previous_Version の
-  circling_controller.py の軌道生成を参考)。開始時は現在位置から円周
+  ループ内で目標 (x, y) を時間更新する(旧 OptiTrack版 NatNet_PID_Controller の
+  circling_controller.py の軌道生成を参考。当該フォルダは削除済み)。
+  開始時は現在位置から円周
   最近傍点に位相を合わせ、滑らかに合流する。
 - v2 ヨー指令: UI のヨー角スライダ(±180°)+「進行方向を向く」オプション
   (円軌道中かつヨー角制御 ON のとき yaw_ref を接線方向に追従)。

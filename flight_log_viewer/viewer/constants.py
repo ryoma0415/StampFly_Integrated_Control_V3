@@ -1,8 +1,9 @@
 """V2 フライトログの列定義・ビット定義・描画スタイル定数。
 
 列定義は docs/LOG_STRUCTURE.md(v4・109列)= pc_server/core/logger.py の
-COLUMNS と 1 対 1 で対応させること。ffg のビット定義は yaw 側
-(Yaw_Calibration_and_Estimation firmware/src/yaw_estimator_kf.hpp)を、
+COLUMNS と 1 対 1 で対応させること。ffg のビット定義は
+`firmware_stampfly/src/yaw_estimation/yaw_estimator_kf.hpp`(出自は yaw 側
+Yaw_Calibration_and_Estimation、同フォルダは削除済み)を、
 ff_status のビット定義はプロトコル v2(TLM_STATE 末尾拡張)を、
 tlm_ctrl_flags のビット定義は TLM_CTRL(プロトコル 0x35)を踏襲する。
 """

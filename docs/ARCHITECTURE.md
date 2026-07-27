@@ -28,8 +28,9 @@ PC 側にはそのスナップショット(プロファイル JSON)を置く(§N
 v2 で追加された機能ブロック:
 - **ヨー推定**(`firmware_stampfly/src/yaw_estimation/`): BMM150 磁気 +
   INA3221 電流 + モーター電流FF補正(ΔB̂)+ 4状態EKF / 補正CF。
-  yaw側(`../Yaw_Estimation_Project/Yaw_Calibration_and_Estimation`)からの
-  移植で、数式・符号・定数値は不変(定数は `yaw_config.hpp` に集約)。
+  yaw側プロジェクト(旧 `Yaw_Estimation_Project/Yaw_Calibration_and_Estimation`。
+  2026-07-27 に本ツリーから削除、同内容は `../StampFly_Telemetry/Telemetry/` に現存)
+  からの移植で、数式・符号・定数値は不変(定数は `yaw_config.hpp` に集約)。
 - **ヨー角制御**: psi_pid(角度誤差 wrapPi → ヨーレート目標)。
   CMD_SETPOINT flags bit1 が無効なら V1 と同一のレートダンピングのみ。
 - **機上XY制御**(CMD_POS_ERR 0x24): PC は位置誤差ストリームのみを送り、
@@ -534,29 +535,38 @@ cd pc_server && .venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000
 ## 既存資産の参照元(コピー/移植元のパス)
 
 以下は**移植元の歴史的記録であり、V2 の動作(ビルド・実行・テスト)には
-不要**(参照先が無くても V2 は完結する)。パスはリポジトリルートからの相対。
+不要**(参照先が無くても V2 は完結する)。
+
+> **注記(2026-07-27)**: 移植元のうち `Previous_Version/`(OptiTrack版・
+> Drone_Log_Viewer・PySerial版)と `Yaw_Estimation_Project/` は
+> **本ツリーから削除済み**(別途アーカイブに保管)。以下に挙げるパスは
+> **由来の記録であって、この作業ツリー内で解決できるパスではない**。
+> 現存する参照先は `../../../Original_Projects/`(リポジトリルートからの相対)と、
+> ヨー実験系の同期先 `../StampFly_Telemetry/` のみ。
 
 - 機体ファーム流用層:
-  `../Previous_Version/StampFly_OptiTrack_PID_Control_System/M5StampFly/src/`
+  `Previous_Version/StampFly_OptiTrack_PID_Control_System/M5StampFly/src/`
   (sensor, imu, tof, alt_kalman, pid, flight_state.hpp の構造化パターン,
   esp_now_callback_compat.hpp)と同 `lib/`
+  (原典: github.com/ryoma0415/StampFly_OptiTrack_PID_Control_System)
 - LED/ブザー: `../../../Original_Projects/M5StampFly-main/src/led.*`(流用),
-  `buzzer.*`(非ブロッキング化+ピン修正のうえ移植)
+  `buzzer.*`(非ブロッキング化+ピン修正のうえ移植)**← 現存**
 - PC側:
-  `../Previous_Version/StampFly_OptiTrack_PID_Control_System/NatNet_PID_Controller/`
+  `Previous_Version/StampFly_OptiTrack_PID_Control_System/NatNet_PID_Controller/`
   の pid_controller.py, position_filter.py, NatNetClient.py ほか、config.json の
-  ゲイン値(NatNet SDK 本体は `../../../Original_Projects/NatNetSDK/`)
-- v2 ヨー推定・実験機能: `../Yaw_Estimation_Project/Yaw_Calibration_and_Estimation/`
+  ゲイン値(NatNet SDK 本体は `../../../Original_Projects/NatNetSDK/` **← 現存**)
+- v2 ヨー推定・実験機能: `Yaw_Estimation_Project/Yaw_Calibration_and_Estimation/`
   (firmware/src の bmm150_driver, mag_calibration, current_sensor, ff_calibration,
   yaw_estimator, yaw_estimator_kf, persistence と sensor_hub.cpp の FF 挿入点/
   アンカー、pc_server/server.py の SweepRunner/SequenceRunner/fit_ellipsoid/
   calprofile/geomag/FfProfileManager、data_analysis/ 一式)。数式・符号・定数値は
   無変更(ω_z=−gyro_z−offset、R_z 標準CCW、levelMagVector 非教科書符号、
-  Q は dt スケール)
-- v2 円軌道: `../Previous_Version/StampFly_OptiTrack_PID_Control_System/
+  Q は dt スケール)。同内容の実装は `../StampFly_Telemetry/Telemetry/`
+  (firmware/src/yaw_estimation/, pc_server/)に現存する
+- v2 円軌道: `Previous_Version/StampFly_OptiTrack_PID_Control_System/
   NatNet_PID_Controller/circling_controller.py`(軌道生成の参考のみ。ゲイン・
   符号は V2 の座標変換規約に従い、旧 config の値は流用しない)
-- v2 flight_log_viewer: `../Previous_Version/Drone_Log_Viewer/`
+- v2 flight_log_viewer: `Previous_Version/Drone_Log_Viewer/`
   (For_Research / For_Presentation のグラフ・同期アニメーション構成を参考)
 - 既知の流用禁止物: 旧esp32_relay(両方)、HoveringControllerの__getattr__委譲、
   -O0のplatformio.ini、全マーカー重心フォールバック

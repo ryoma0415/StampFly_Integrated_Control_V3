@@ -1,9 +1,10 @@
 """キャリブレーション機能(3D磁気 / 加速度6面 / マウント・ヨーゼロ /
 地磁気47都道府県 / キャリブレーション・プロファイル)。
 
-yaw側 Yaw_Calibration_and_Estimation/pc_server/server.py の
-fit_ellipsoid・calprofile 系・geomag 系と、firmware/src/accel_calibration.cpp の
-6面ソルバをシリアル版(CMD_* + TLM_ACK / CMD_CAL_GET → TLM_CAL_DATA)に移植:
+旧 yaw側プロジェクト(Yaw_Calibration_and_Estimation。2026-07-27 に削除済み)の
+pc_server/server.py の fit_ellipsoid・calprofile 系・geomag 系と、
+firmware/src/accel_calibration.cpp の 6面ソルバを
+シリアル版(CMD_* + TLM_ACK / CMD_CAL_GET → TLM_CAL_DATA)に移植:
 - 保存プロファイルは `stampfly_calibration_profile` v1 スキーマを維持
   (yaw側と同一。保存先は pc_server/data/calibration_profiles/)。
 - 適用は accel6 → attmount → mag3d → yawzero の順(accel6 は姿勢参照リセット、
