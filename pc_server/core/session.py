@@ -1283,6 +1283,47 @@ class SessionManager:
         self._wire_frame_warned = False
         self.multi.reset_for_mapping_change(floor)
 
+    @_ui_command
+    def set_primary_rigid_body(self, rigid_body_id) -> dict:
+        """単機(Position)対象のリジッドボディ ID を変更・永続化する。
+
+        Motive はリジッドボディを作り直すたびに Streaming ID を増やす
+        (例: RB1 を削除して再作成すると RB2 になり 1 は欠番)ため、
+        設定タブから観測中のボディを明示選択できるようにする。
+        地上限定(飛行・記録中は拒否 — 制御対象の付け替えは座標の
+        テレポートと同じ)。適用後は位置フィルタを再初期化する。
+        複数機モードの RB 紐付け(機体プロファイルの rigid_body_id)とは
+        独立(こちらは単機モード専用)。
+        """
+        try:
+            rb_id = int(rigid_body_id)
+        except (TypeError, ValueError):
+            return {"ok": False,
+                    "message": f"リジッドボディ ID が不正です: {rigid_body_id!r}"}
+        if rb_id <= 0:
+            return {"ok": False,
+                    "message": f"リジッドボディ ID は正の整数です: {rb_id}"}
+        blocked = self._mapping_apply_blocked()
+        if blocked is not None:
+            self.warn(f"単機リジッドボディ変更不可: {blocked}")
+            return {"ok": False, "message": blocked}
+
+        # 保存はコピーで先に行い、失敗時は何も変えない(mapping と同じ規約)
+        new_config = dict(self.control_config)
+        new_config["natnet"] = dict(self.control_config["natnet"])
+        new_config["natnet"]["rigid_body_id"] = rb_id
+        try:
+            cfg.save_control_config(new_config)
+        except OSError as exc:
+            return {"ok": False,
+                    "message": f"control.json の保存に失敗しました: {exc}"}
+        self.control_config["natnet"]["rigid_body_id"] = rb_id
+        self.mocap.set_rigid_body_id(rb_id)
+        # 旧 RB の位置がアンカーに残らないよう仕切り直す
+        self.position.reset_filter()
+        self.info(f"単機対象リジッドボディを RB {rb_id} に変更しました")
+        return self.mocap_mapping()
+
     def _warn_unsupported_wire_frame(self) -> None:
         """未対応マッピングによる XY 制御無効化の警告(エピソードごとに1回)。
 

@@ -189,6 +189,18 @@ async def api_mocap_mapping() -> dict:
     return await asyncio.to_thread(session.mocap_mapping)
 
 
+@app.post("/api/mocap/primary")
+async def api_mocap_primary(body: dict) -> dict:
+    """単機(Position)対象リジッドボディ ID の変更(設定タブから)。
+
+    body: {"rigid_body_id": N}。Motive の Streaming ID は作り直しで増える
+    ため、観測中のボディを明示選択して control.json へ永続化する。
+    検証・地上ガード・フィルタ再初期化は session 側。失敗も HTTP 200。
+    """
+    return await asyncio.to_thread(
+        session.set_primary_rigid_body, body.get("rigid_body_id"))
+
+
 @app.put("/api/mocap/mapping")
 async def api_mocap_mapping_update(body: dict) -> dict:
     """MoCap マッピングの検証・適用・永続化(設定タブから)。

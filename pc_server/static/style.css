@@ -927,6 +927,7 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
 .rb-list { font-size: 12px; display: flex; flex-direction: column; gap: 2px; }
 .rb-line.stale { color: var(--text-dim); }
 .rb-line.rb-sub { color: var(--text-dim); white-space: pre; }
+.rb-primary-btn { margin-left: 8px; font-size: 11px; padding: 1px 8px; }
 
 /* 設定タブ(MoCap マッピング) */
 .map-table { border-collapse: collapse; font-size: 13px; }

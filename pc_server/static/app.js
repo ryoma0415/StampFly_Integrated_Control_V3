@@ -1691,6 +1691,18 @@ function renderMapPreview(result) {
     head.textContent =
       `RB ${b.rigid_body_id}${isPrimary ? "(単機)" : ""}` +
       `${assigned ? ` ← ${assigned.name}` : ""}${stale ? "(途絶)" : ""}`;
+    if (!isPrimary) {
+      // Motive の Streaming ID は作り直しで増える(RB1 削除→再作成で RB2)。
+      // 単機対象を観測中のボディへ明示的に付け替えるボタン(黙った
+      // フォールバックはしない — 別機体への誤紐付け防止)
+      const btn = document.createElement("button");
+      btn.className = "btn btn-small rb-primary-btn";
+      btn.textContent = "単機対象に設定";
+      btn.title = "単機 Position モードの制御・ゼロ合わせの対象をこのリジッドボディに変更します(control.json へ保存。地上でのみ)";
+      btn.addEventListener("click", () =>
+        withBusy(btn, () => setPrimaryRigidBody(b.rigid_body_id)));
+      head.appendChild(btn);
+    }
     box.appendChild(head);
 
     const posLine = document.createElement("div");
@@ -1725,6 +1737,18 @@ function renderMapPreview(result) {
 async function pollMapPreview() {
   mapBodies = await apiGet("/api/mocap/bodies", true);
   renderMapPreview(mapBodies);
+}
+
+/* 単機対象リジッドボディの付け替え(Motive の ID 増加への運用対応) */
+async function setPrimaryRigidBody(rbId) {
+  const res = await apiPost("/api/mocap/primary", { rigid_body_id: rbId });
+  if (!res) { setMapMsg("サーバとの通信に失敗しました", true); return; }
+  if (!res.ok) { setMapMsg(res.message || "変更できませんでした", true); return; }
+  mapPrimaryRbId = res.primary_rigid_body_id ?? rbId;
+  appliedMapping = res.mapping || appliedMapping;
+  setMapMsg(`単機対象を RB ${mapPrimaryRbId} に変更しました(control.json 保存済み)`, false);
+  appendConsole("ui", `単機対象リジッドボディ: RB ${mapPrimaryRbId}`);
+  if (mapBodies) renderMapPreview(mapBodies);   // (単機)マーカー即時更新
 }
 
 function stopMapPreview() {

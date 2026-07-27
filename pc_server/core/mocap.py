@@ -783,6 +783,25 @@ class MocapSource:
         }
 
     @property
+    def rigid_body_id(self) -> int:
+        """単機(primary)対象のリジッドボディ ID。"""
+        return self._rigid_body_id
+
+    def set_rigid_body_id(self, rigid_body_id: int) -> None:
+        """単機対象のリジッドボディ ID を実行時に差し替える。
+
+        Motive はリジッドボディを作り直すたびに Streaming ID を増やす
+        (欠番は再利用されない)ため、実運用では ID の付け替えが起きる。
+        int 属性の単一代入なので NatNet 受信スレッド(_receive_frame の
+        poses.get(self._rigid_body_id))に対してアトミック。
+
+        呼び出し側(session 層)の責務: 地上でのみ呼び、呼び出し後に
+        PositionController.reset_filter() を呼ぶこと(旧 RB の位置が
+        フィルタのアンカーに残るため)。
+        """
+        self._rigid_body_id = int(rigid_body_id)
+
+    @property
     def machine_wire_y_sign(self) -> Optional[float]:
         """CMD_POS_ERR ワイヤフレーム変換係数(適用中マッピング準拠)。
 

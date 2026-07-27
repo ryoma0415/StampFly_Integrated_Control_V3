@@ -602,3 +602,61 @@ def test_tangent_yaw_negated_for_right_handed(server_config, control_config):
     outputs["right"] = make(-1.0)
     assert outputs["legacy"] != 0.0
     assert outputs["right"] == pytest.approx(-outputs["legacy"])
+
+
+# ----------------------------------------------------------------------
+# 単機対象リジッドボディの付け替え(Motive の Streaming ID 増加への対応)
+# ----------------------------------------------------------------------
+
+class TestSetPrimaryRigidBody:
+    def test_change_applies_and_persists(self, session_factory,
+                                         control_json_path):
+        """RB ID 変更が MocapSource・control.json・GET 応答へ反映される。"""
+        import json as _json
+        session, _, _ = session_factory()
+        assert session.mocap.rigid_body_id == 1
+        result = session.set_primary_rigid_body(2)
+        assert result["ok"], result
+        assert result["primary_rigid_body_id"] == 2
+        assert session.mocap.rigid_body_id == 2
+        assert session.control_config["natnet"]["rigid_body_id"] == 2
+        saved = _json.loads(control_json_path.read_text(encoding="utf-8"))
+        assert saved["natnet"]["rigid_body_id"] == 2
+
+    def test_rejected_while_armed(self, session_factory, control_json_path):
+        from core import session as session_mod
+        session, _, _ = session_factory()
+        with session._lock:
+            session._phase = session_mod.PHASE_ARMED
+        result = session.set_primary_rigid_body(2)
+        assert not result["ok"] and "飛行中" in result["message"]
+        assert session.mocap.rigid_body_id == 1
+        assert not control_json_path.exists()
+
+    @pytest.mark.parametrize("bad", [None, "abc", 0, -3])
+    def test_rejects_invalid_id(self, session_factory, control_json_path, bad):
+        session, _, _ = session_factory()
+        result = session.set_primary_rigid_body(bad)
+        assert not result["ok"]
+        assert session.mocap.rigid_body_id == 1
+
+    def test_primary_pose_follows_new_id(self):
+        """RX 経路: 付け替え後は新 ID の pose が primary として届く。"""
+        source = _make_source()
+        received = []
+        source._on_pose = received.append
+
+        class _Frame:
+            def __init__(self, bodies):
+                self.rigid_body_data = type("RBD", (), {
+                    "rigid_body_list": bodies})()
+
+        q = quat_about_y(0.0)
+        frame = {"mocap_data": _Frame([_RigidBody(2, (1.0, 2.0, 3.0), q)]),
+                 "frame_number": 1}
+        source._receive_frame(frame)
+        assert received == []                    # RB1 待ちで届かない
+        source.set_rigid_body_id(2)
+        source._receive_frame(frame)
+        assert len(received) == 1
+        assert received[0]["rigid_body_id"] == 2
