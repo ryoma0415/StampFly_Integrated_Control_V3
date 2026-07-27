@@ -44,7 +44,7 @@ import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from . import config as cfg
 from .logger import FlightLogger, meta_to_row, tlm_ctrl_to_row, tlm_state_to_row
-from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource
+from .mocap import DEG_TO_RAD, RAD_TO_DEG, MocapSource, wrap_pi
 from .position import PositionController
 from .serial_link import SerialLink, SerialLinkError
 
@@ -274,10 +274,15 @@ class MultiControlManager:
                 self._warn("NatNet 接続に失敗しました(複数機モード)")
 
         slots: list[DroneSlot] = []
+        wire_sign = self._mocap.machine_wire_y_sign
         for node_id, profile in enumerate(profiles):
             controller = PositionController(
                 self._server_config, self._control_config,
                 self._make_emit(node_id), clock=self._clock)
+            # 接線ヨーの方位角→機体規約符号を適用中マッピングに合わせる
+            # (単機 session と同じ配線。未対応 None は XY 無効化のため +1)
+            controller.set_yaw_azimuth_wire_sign(
+                wire_sign if wire_sign is not None else 1.0)
             slot = DroneSlot(node_id, profile, controller)
             slots.append(slot)
         with self._lock:
@@ -955,9 +960,12 @@ class MultiControlManager:
             slots = list(self._slots)
             for slot in slots:
                 slot.target_set = False
+        wire_sign = self._mocap.machine_wire_y_sign
         for slot in slots:
             slot.controller.set_mocap_mapping_floor(mapping_floor)
             slot.controller.reset_filter()
+            slot.controller.set_yaw_azimuth_wire_sign(
+                wire_sign if wire_sign is not None else 1.0)
 
     def snapshot(self, now: float) -> dict:
         """WebSocket 20Hz 配信用(session.multi ノード。UI 単位系 deg/m)。"""
@@ -1054,6 +1062,16 @@ class MultiControlManager:
             err_y = max(-clamp, min(clamp,
                                     float(meta.get("error_y") or 0.0)))
             heading = meta.get("mocap_heading_rad")
+            # 機体ワイヤフレーム変換(単機 session._emit_pos_err と同一規約:
+            # 右手系マッピングでは err_y と方位角を反転、未対応マッピングは
+            # XY_ERR_VALID を落とす。詳細は mocap.machine_wire_y_sign)
+            wire_sign = self._mocap.machine_wire_y_sign
+            if wire_sign is None:
+                xy_valid = False
+            else:
+                err_y *= wire_sign
+                if heading is not None:
+                    heading = wrap_pi(heading * wire_sign)
             flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
             if yaw_ctrl_on:
                 flags |= proto.CmdPosErr.FLAG_YAW_REF_VALID

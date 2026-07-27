@@ -36,7 +36,7 @@ from .ffprofile import FfProfileManager
 from . import logger as logger_mod
 from .logger import FlightLogger
 from .mocap import (DEFAULT_ATTITUDE_TRANSFORM, DEG_TO_RAD, RAD_TO_DEG,
-                    MocapSource, validate_mapping)
+                    MocapSource, validate_mapping, wrap_pi)
 from .multi import MultiControlManager
 from .position import PositionController
 from .posture import PostureController, run_paced_loop
@@ -256,6 +256,16 @@ class SessionManager:
 
         # STOP 再送管理: None または {"deadline": t, "resends": n}
         self._stop_pending: Optional[dict] = None
+
+        # 未対応ワイヤフレーム警告のエピソード管理(50Hz 送信ごとの氾濫防止)
+        self._wire_frame_warned = False
+
+        # 接線ヨーの方位角→機体規約符号を適用中マッピングから配線する
+        # (レガシー +1 / 右手系 −1。未対応 None は +1 のまま = XY 無効化で
+        # 実害なし)
+        wire_sign = self.mocap.machine_wire_y_sign
+        self.position.set_yaw_azimuth_wire_sign(
+            wire_sign if wire_sign is not None else 1.0)
 
         # MoCap 途絶警告のエピソード管理
         self._mocap_warned = False
@@ -1157,6 +1167,10 @@ class SessionManager:
         """適用中のマッピングと適用可否(設定タブの GET 用)。"""
         blocked = self._mapping_apply_blocked()
         mapping = self.mocap.mapping_snapshot()
+        wire_sign = self.mocap.machine_wire_y_sign
+        machine_frame = ("legacy" if wire_sign == 1.0
+                         else "mirrored_y" if wire_sign == -1.0
+                         else "unsupported")
         return {
             "ok": True,
             "mapping": mapping,
@@ -1164,6 +1178,10 @@ class SessionManager:
             "blocked_reason": blocked,
             "primary_rigid_body_id":
                 self.control_config["natnet"]["rigid_body_id"],
+            # 機上XY制御へのワイヤ変換の状態(UI 表示用):
+            # legacy = 無変換 / mirrored_y = err_y・方位角を反転して送信 /
+            # unsupported = 位置制御飛行が無効化される
+            "machine_frame": machine_frame,
         }
 
     @_ui_command
@@ -1258,7 +1276,25 @@ class SessionManager:
         target_default = self.control_config["target_default"]
         self.position.set_target(target_default["x"], target_default["y"],
                                  target_default["z"])
+        # 接線ヨーの方位角符号と警告エピソードを新マッピングに追従させる
+        wire_sign = self.mocap.machine_wire_y_sign
+        self.position.set_yaw_azimuth_wire_sign(
+            wire_sign if wire_sign is not None else 1.0)
+        self._wire_frame_warned = False
         self.multi.reset_for_mapping_change(floor)
+
+    def _warn_unsupported_wire_frame(self) -> None:
+        """未対応マッピングによる XY 制御無効化の警告(エピソードごとに1回)。
+
+        50Hz 送信スレッドから呼ばれるため、警告済みフラグで氾濫を防ぐ
+        (マッピング適用でリセットされる)。
+        """
+        if self._wire_frame_warned:
+            return
+        self._wire_frame_warned = True
+        self.warn("適用中の座標マッピングは機上XY制御の対応外です"
+                  "(レガシー配置か Y 符号反転のみ対応)。位置制御は"
+                  "無効化されます — 設定タブでマッピングを見直してください")
 
     # ------------------------------------------------------------------
     # v2: モーターテスト(Experiment タブ)
@@ -1588,6 +1624,20 @@ class SessionManager:
         err_x = max(-clamp, min(clamp, float(meta.get("error_x") or 0.0)))
         err_y = max(-clamp, min(clamp, float(meta.get("error_y") or 0.0)))
         heading = meta.get("mocap_heading_rad")
+        # 機体ワイヤフレーム変換: 機上XY制御の符号規約はレガシーフレーム
+        # (旧既定マッピング・鏡映)で実証されているため、右手系マッピング
+        # 適用中は err_y と方位角を符号反転して送る(mocap.py
+        # machine_wire_y_sign 参照)。未対応マッピング(軸入れ替え等)では
+        # 機体側符号との対応が未定義のため XY_ERR_VALID を立てない
+        # (機体は水平指令+PID減衰 = 位置制御飛行の無効化)。
+        wire_sign = self.mocap.machine_wire_y_sign
+        if wire_sign is None:
+            xy_valid = False
+            self._warn_unsupported_wire_frame()
+        else:
+            err_y *= wire_sign
+            if heading is not None:
+                heading = wrap_pi(heading * wire_sign)
         flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
         if yaw_ctrl_on:
             flags |= proto.CmdPosErr.FLAG_YAW_REF_VALID

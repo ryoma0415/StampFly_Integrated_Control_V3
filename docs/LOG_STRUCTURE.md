@@ -60,6 +60,11 @@ PROTOCOL.md 0x35)由来の 23 列を追加、全列を論理グループ順に�
 ## 座標系と単位
 
 - 位置(`pos_*`, `raw_pos_*`, `target_*`)は Motive 座標を制御座標系へ変換した後の値 [m]。
+- **送信指令の `cmd_err_x_m` / `cmd_err_y_m` は「実際に機体へ送ったワイヤ値」**
+  (機体ワイヤフレーム)。右手系マッピング適用中は `cmd_err_y_m = -error_y`
+  となる(機上XY制御の符号規約がレガシーフレーム前提のため、送信境界で
+  自動変換する — 2026-07 導入)。`error_x`/`error_y` 列は従来どおり
+  制御座標系。適用中マッピングは同名 `*.meta.json` を参照。
   変換は `config/control.json` の `coordinate_transform`(既定: 制御x←Motive z、
   制御y←−Motive x、制御z←Motive y)。旧システムの y 軸負ゲイン規約は廃止し、
   符号はこの座標変換に移した(そのため y 座標の符号は旧ログと反転している)。

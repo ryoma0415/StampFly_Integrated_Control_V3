@@ -110,6 +110,13 @@ class PositionController:
         # 旧マッピングで計算中だったフレームが、リセット直後のフィルタを
         # 旧座標系でシードする競合(逆向きの世代競合)の防止
         self._mapping_gen_floor = 0
+        # 制御座標系の方位角 → 機体ヨー規約への符号(接線ヨー用)。
+        # CMD_POS_ERR の yaw_ref は機体の ψ 規約(レガシーフレームの方位角と
+        # 一致)で送る契約。UI スライダ由来のヨー目標はもともと機体規約だが、
+        # 円軌道の接線ヨーは制御座標系の方位角として計算されるため、
+        # 右手系マッピング(machine_wire_y_sign=−1)では符号反転が要る。
+        # session 層がマッピング適用時に設定する(既定 +1 = レガシー互換)
+        self._yaw_azimuth_wire_sign = 1.0
 
         # 直近の送信値(バイアス加算前)
         self._last_output = (0.0, 0.0, self._target[2])
@@ -410,6 +417,16 @@ class PositionController:
             self._traj_phase = None
             self._last_yaw_output = 0.0
 
+    def set_yaw_azimuth_wire_sign(self, sign: float) -> None:
+        """制御座標系方位角→機体ヨー規約の符号を設定する(接線ヨー用)。
+
+        session 層がマッピング適用時に MocapSource.machine_wire_y_sign から
+        設定する(+1 = レガシー/−1 = 右手系。未対応マッピング時は +1 の
+        ままでよい — その場合 XY 制御自体が無効化されるため)。
+        """
+        with self._lock:
+            self._yaw_azimuth_wire_sign = 1.0 if float(sign) >= 0 else -1.0
+
     def set_mocap_mapping_floor(self, generation: int) -> None:
         """MoCap マッピング世代フロアを設定する(マッピング差し替え時)。
 
@@ -482,8 +499,13 @@ class PositionController:
                 traj_phase = wrap_pi(phase)
                 self._traj_phase = traj_phase
                 if traj["face_tangent"]:
-                    # 接線方向(速度ベクトルの向き)= 位相 + 回転方向×90°
-                    yaw_tangent = wrap_pi(phase + sign * (pi / 2.0))
+                    # 接線方向(速度ベクトルの向き)= 位相 + 回転方向×90°。
+                    # これは制御座標系の方位角なので、機体ヨー規約へ
+                    # _yaw_azimuth_wire_sign で変換して指令にする
+                    # (レガシーフレームでは +1 = 従来と同一)
+                    yaw_tangent = wrap_pi(
+                        self._yaw_azimuth_wire_sign
+                        * (phase + sign * (pi / 2.0)))
             error_x, error_y = self._last_errors
             data_valid = self._last_data_valid
             filter_result = self._last_filter_result

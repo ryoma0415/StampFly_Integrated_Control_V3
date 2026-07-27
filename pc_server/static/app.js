@@ -1560,9 +1560,19 @@ async function loadMapping(quiet) {
   mappingFormFill(res.mapping || {});
   appliedMapping = res.mapping || null;
   mapPrimaryRbId = res.primary_rigid_body_id ?? null;
-  setMapMsg(res.can_apply
-    ? "適用可能です(地上)"
-    : (res.blocked_reason || "現在は適用できません"), !res.can_apply);
+  setMapMsg(mappingStatusText(res), !res.can_apply
+    || res.machine_frame === "unsupported");
+}
+
+/* GET/PUT 応答 → ステータス行(適用可否+機上XY制御への変換状態) */
+function mappingStatusText(res) {
+  const frameNote = res.machine_frame === "mirrored_y"
+    ? " / 機体への位置指令は自動変換されます(右手系→機体フレーム)"
+    : res.machine_frame === "unsupported"
+      ? " / ⚠ このマッピングは機上XY制御の対応外です(位置制御飛行は無効化されます)"
+      : "";
+  if (!res.can_apply) return (res.blocked_reason || "現在は適用できません") + frameNote;
+  return "適用可能です(地上)" + frameNote;
 }
 
 async function applyMapping() {
@@ -1572,7 +1582,13 @@ async function applyMapping() {
   if (!res.ok) { setMapMsg(res.message || "適用できませんでした", true); return; }
   mappingFormFill(res.mapping || {});
   appliedMapping = res.mapping || null;
-  setMapMsg("適用しました(control.json 保存済み・位置フィルタ再初期化・目標リセット)", false);
+  const frameNote = res.machine_frame === "mirrored_y"
+    ? " 機体への位置指令は自動変換されます(右手系→機体フレーム)。"
+    : res.machine_frame === "unsupported"
+      ? " ⚠ このマッピングは機上XY制御の対応外のため位置制御飛行は無効化されます。"
+      : "";
+  setMapMsg("適用しました(control.json 保存済み・位置フィルタ再初期化・目標リセット)。"
+    + frameNote, res.machine_frame === "unsupported");
   appendConsole("ui", "MoCap マッピングを適用しました");
 }
 

@@ -469,3 +469,136 @@ def test_update_mocap_mapping_resets_targets(session_factory,
     default = session.control_config["target_default"]
     assert session.position.get_target() == (
         default["x"], default["y"], default["z"])
+
+
+# ----------------------------------------------------------------------
+# 機体ワイヤフレーム変換(CMD_POS_ERR。2026-07-28 フレーム代数検証に基づく)
+# ----------------------------------------------------------------------
+
+RIGHT_HANDED_TRANSFORM = {
+    "x": {"axis": "z", "sign": 1},
+    "y": {"axis": "x", "sign": 1},    # レガシーの y 符号のみ反転(det=+1)
+    "z": {"axis": "y", "sign": 1},
+}
+
+SWAPPED_TRANSFORM = {
+    "x": {"axis": "x", "sign": 1},    # 軸入れ替え(ワイヤ変換の対応外)
+    "y": {"axis": "z", "sign": 1},
+    "z": {"axis": "y", "sign": 1},
+}
+
+
+def test_machine_wire_y_sign_classification():
+    """レガシー=+1 / Y反転のみ=−1 / 軸入れ替え=None。"""
+    assert CoordinateTransformer(None).machine_wire_y_sign == 1.0
+    assert CoordinateTransformer(VALID_TRANSFORM).machine_wire_y_sign == 1.0
+    assert CoordinateTransformer(
+        RIGHT_HANDED_TRANSFORM).machine_wire_y_sign == -1.0
+    assert CoordinateTransformer(SWAPPED_TRANSFORM).machine_wire_y_sign is None
+
+
+class TestWireFrameConversion:
+    """CMD_POS_ERR 送信時の機体フレーム変換(単機 session 経路)。"""
+
+    def _meta(self, **overrides) -> dict:
+        meta = {
+            "mode": "position", "data_valid": True, "control_active": True,
+            "mocap_dropout": False, "error_x": 0.35, "error_y": -0.2,
+            "yaw_ref_rad": 0.5, "yaw_ctrl_on": True,
+            "mocap_heading_rad": 1.62,
+        }
+        meta.update(overrides)
+        return meta
+
+    def _sent(self, transport):
+        import stampfly_protocol as proto
+        return [proto.CmdPosErr.from_payload(f.payload)
+                for f in transport.sent_frames
+                if f.type == proto.MsgType.CMD_POS_ERR]
+
+    def _connect_quiet(self, session, transport):
+        assert session.connect("COM-fake")
+        session.posture.stop()
+        session.position.stop()
+        transport.sent_frames.clear()
+
+    def test_legacy_mapping_unchanged(self, session_factory):
+        """レガシーフレーム(det=−1)は無変換 = 従来とビット一致。"""
+        import stampfly_protocol as proto
+        session, transport, _ = session_factory()
+        self._connect_quiet(session, transport)
+        session._emit_setpoint(0.0, 0.0, 0.5, self._meta())
+        pe = self._sent(transport)[0]
+        assert pe.err_y == pytest.approx(-0.2)
+        assert pe.mocap_yaw == pytest.approx(1.62)
+        assert pe.flags & proto.CmdPosErr.FLAG_XY_ERR_VALID
+
+    def test_right_handed_mapping_negates_err_y_and_heading(
+            self, session_factory, control_json_path):
+        """右手系マッピング適用中は err_y と方位角を反転して送る。
+
+        検証済みフレーム代数: wire = diag(1,−1)·e_ctrl = e_legacy により
+        機上XY制御は全ヨー角で負帰還に戻る(y=+0.2 目標で −y へ飛ぶ
+        正帰還の修正)。
+        """
+        import stampfly_protocol as proto
+        session, transport, _ = session_factory()
+        result = session.update_mocap_mapping(
+            {"coordinate_transform": RIGHT_HANDED_TRANSFORM,
+             "attitude_transform": {}})
+        assert result["ok"], result
+        assert result["machine_frame"] == "mirrored_y"
+        self._connect_quiet(session, transport)
+        session._emit_setpoint(0.0, 0.0, 0.5, self._meta())
+        pe = self._sent(transport)[0]
+        assert pe.err_x == pytest.approx(0.35)      # x は不変
+        assert pe.err_y == pytest.approx(+0.2)      # 反転
+        assert pe.mocap_yaw == pytest.approx(-1.62)  # 方位角も反転
+        assert pe.yaw_ref == pytest.approx(0.5)     # スライダ由来ヨーは不変
+        assert pe.flags & proto.CmdPosErr.FLAG_XY_ERR_VALID
+
+    def test_unsupported_mapping_disables_xy(self, session_factory,
+                                             control_json_path):
+        """軸入れ替えマッピングでは XY_ERR_VALID を立てない(飛行無効化)。"""
+        import stampfly_protocol as proto
+        session, transport, _ = session_factory()
+        result = session.update_mocap_mapping(
+            {"coordinate_transform": SWAPPED_TRANSFORM,
+             "attitude_transform": {}})
+        assert result["ok"], result
+        assert result["machine_frame"] == "unsupported"
+        self._connect_quiet(session, transport)
+        session._emit_setpoint(0.0, 0.0, 0.5, self._meta())
+        pe = self._sent(transport)[0]
+        assert not (pe.flags & proto.CmdPosErr.FLAG_XY_ERR_VALID)
+
+
+def test_tangent_yaw_negated_for_right_handed(server_config, control_config):
+    """円軌道の接線ヨー(制御座標系方位角)は右手系では符号反転して指令。"""
+    from core.position import PositionController
+    outputs = {}
+
+    def make(sign):
+        emitted = []
+        ctl = PositionController(server_config, control_config,
+                                 emit=lambda r, p, a, meta: emitted.append(meta))
+        ctl.set_yaw_azimuth_wire_sign(sign)
+        ctl.set_yaw_control(True)
+        # 円軌道を有効化(位相=0 開始、接線追従 ON)
+        ctl._traj = {"center": (0.0, 0.0), "radius": 0.5, "period_s": 10.0,
+                     "clockwise": False, "alt": 0.3, "face_tangent": True,
+                     "phase0": 0.0, "t0": 0.0, "frozen_at": None}
+        # mocap 有効状態を偽装(位相凍結を避ける)
+        ctl._last_pose_t = 0.0
+        ctl._last_data_valid = True
+        # シェイパーは初回呼び出しで基準を確立し、以降スルーレートで
+        # 目標へ向かう — 2回呼んで非ゼロの整形済みヨーを得る
+        ctl.step(now=0.02)
+        ctl._last_pose_t = 1.0
+        ctl.step(now=1.0)
+        return emitted[-1]["yaw_ref_rad"]
+
+    outputs["legacy"] = make(1.0)
+    outputs["right"] = make(-1.0)
+    assert outputs["legacy"] != 0.0
+    assert outputs["right"] == pytest.approx(-outputs["legacy"])

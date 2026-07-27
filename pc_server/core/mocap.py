@@ -176,6 +176,10 @@ class CoordinateTransformer:
                 raise ValueError(f"coordinate_transform: invalid axis {src_axis!r}")
             sign = -1 if float(axis_cfg["sign"]) < 0 else 1
             self.axis_map[axis] = (self.AXIS_INDEX[src_axis], sign)
+        # CMD_POS_ERR ワイヤフレーム変換(+1/−1/None)。毎フレーム参照される
+        # ため構築時に1回だけ計算する
+        self.machine_wire_y_sign: Optional[float] = (
+            self._compute_machine_wire_y_sign())
 
     def motive_to_control(self, position) -> Optional[tuple[float, float, float]]:
         """Motive 座標タプル → 制御座標タプル。"""
@@ -194,6 +198,47 @@ class CoordinateTransformer:
         """
         return {axis: {"axis": "xyz"[idx], "sign": sign}
                 for axis, (idx, sign) in self.axis_map.items()}
+
+    def _as_matrix(self) -> list[list[float]]:
+        """Motive→制御の符号付き置換行列(行 = 制御 x/y/z)。"""
+        matrix = [[0.0] * 3 for _ in range(3)]
+        for row, axis in enumerate(("x", "y", "z")):
+            idx, sign = self.axis_map[axis]
+            matrix[row][idx] = float(sign)
+        return matrix
+
+    def _compute_machine_wire_y_sign(self) -> Optional[float]:
+        """CMD_POS_ERR ワイヤフレームへの変換係数を求める(構築時に1回)。
+
+        機上XY制御の符号規約(誤差回転式・PID符号・ミキサ)は旧既定
+        マッピング(鏡映・det=−1)の座標系で実証されている。つまり
+        CMD_POS_ERR のワイヤ契約は「レガシーフレームの誤差」であり、
+        適用中マッピング C からレガシー L への変換 T = L·C⁻¹ が
+          - 単位行列        → そのまま送ってよい(+1.0)
+          - diag(1,−1,1)   → err_y と方位角を符号反転して送る(−1.0)
+        のどちらかであれば位置制御飛行が可能。それ以外(軸の入れ替えを
+        含むマッピング)は機体側符号との対応が未定義のため None を返し、
+        送信側は XY_ERR_VALID を立てない(位置制御飛行を無効化する)。
+        検証: 2026-07-28 フレーム代数(ファーム flight_control.cpp の
+        実式に対し、この鏡映変換で全ヨー角・全軸が負帰還になることを確認)。
+        """
+        legacy = CoordinateTransformer.__new__(CoordinateTransformer)
+        legacy.axis_map = {
+            axis: (self.AXIS_INDEX[cfg["axis"]], cfg["sign"])
+            for axis, cfg in DEFAULT_COORDINATE_TRANSFORM.items()
+        }
+        l_mat = legacy._as_matrix()
+        c_mat = self._as_matrix()
+        # C は直交(符号付き置換)なので C⁻¹ = Cᵀ
+        t = [[sum(l_mat[i][k] * c_mat[j][k] for k in range(3))
+              for j in range(3)] for i in range(3)]
+        identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        mirror_y = [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]]
+        if t == identity:
+            return 1.0
+        if t == mirror_y:
+            return -1.0
+        return None
 
 
 # 前方軸/上方軸の指定文字列("+x" / "-z" など)→ (軸index, 符号)
@@ -736,6 +781,15 @@ class MocapSource:
             "coordinate_transform": transformer.describe(),
             "attitude_transform": attitude.describe(),
         }
+
+    @property
+    def machine_wire_y_sign(self) -> Optional[float]:
+        """CMD_POS_ERR ワイヤフレーム変換係数(適用中マッピング準拠)。
+
+        +1.0 = レガシーフレーム(無変換)/ −1.0 = 右手系(err_y と方位角を
+        符号反転して送る)/ None = 未対応マッピング(位置制御飛行不可)。
+        """
+        return self._mapping[0].machine_wire_y_sign
 
     @property
     def mapping_generation(self) -> int:
