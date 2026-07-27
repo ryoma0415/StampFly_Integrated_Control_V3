@@ -16,7 +16,7 @@ import pytest
 import stampfly_protocol as sp
 
 SEED = 0x5F4641  # 固定シード(再現性)
-CASES_PER_TYPE = 60         # 33型 x 60 = 1980 ケース(>500)
+CASES_PER_TYPE = 60         # 36型 x 60 = 2160 ケース(>500)
 STREAM_CASES = 50
 
 # LOG_TEXT は UTF-8(PROTOCOL.md)。1B(ASCII)/2B/3B(日本語)/4B(非BMP)の
@@ -97,9 +97,20 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
     if msg_type == sp.MsgType.CMD_FF_COMMIT:
         return sp.CmdFfCommit(crc32=rng.randrange(2**32))
     if msg_type == sp.MsgType.CMD_FF_MODE:
-        return sp.CmdFfMode(ff_mode=rng.randrange(3), est_mode=rng.randrange(2))
+        return sp.CmdFfMode(ff_mode=rng.randrange(3), est_mode=rng.randrange(3))
     if msg_type == sp.MsgType.CMD_LED_MODE:
         return sp.CmdLedMode(mode=rng.randrange(2))
+    if msg_type == sp.MsgType.CMD_MAGBIAS_SET:
+        return sp.CmdMagbiasSet(mode=rng.randrange(2),
+                                dx=f32(rng.uniform(-30, 30)),
+                                dy=f32(rng.uniform(-30, 30)),
+                                dz=f32(rng.uniform(-30, 30)))
+    if msg_type == sp.MsgType.CMD_FLOWCAL_SET:
+        return sp.CmdFlowcalSet(mode=rng.randrange(2),
+                                kx=f32(rng.uniform(300, 600)),
+                                ky=f32(rng.uniform(300, 600)))
+    if msg_type == sp.MsgType.CMD_FLOW_PROBE:
+        return sp.CmdFlowProbe(n_cycles=rng.randrange(256))
     if msg_type == sp.MsgType.TLM_STATE:
         return sp.TlmState(
             seq_echo=rng.randrange(2**32),
@@ -139,14 +150,30 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
             bm_y_ut=f32(rng.uniform(-5, 5)),
             nis=f32(rng.uniform(0, 20)),
             ffg=rng.randrange(256),
-            ff_status=rng.randrange(128))
+            ff_status=rng.randrange(256),
+            mag_cal_x_ut=f32(rng.uniform(-100, 100)),
+            mag_cal_y_ut=f32(rng.uniform(-100, 100)),
+            mag_cal_z_ut=f32(rng.uniform(-100, 100)),
+            mag_lev_x_ut=f32(rng.uniform(-50, 50)),
+            mag_lev_y_ut=f32(rng.uniform(-50, 50)),
+            ekf2_yaw_rad=f32(rng.uniform(-3.2, 3.2)),
+            ekf2_bm_x_ut=f32(rng.uniform(-20, 20)),
+            ekf2_bm_y_ut=f32(rng.uniform(-20, 20)),
+            ekf2_yaw_innov_rad=f32(rng.uniform(-0.6, 0.6)),
+            ekf2_status=rng.randrange(256),
+            ekf2_gate=rng.randrange(256),
+            flow_vx_mps=f32(rng.uniform(-2, 2)),
+            flow_vy_mps=f32(rng.uniform(-2, 2)),
+            flow_squal=rng.randrange(256),
+            flow_status=rng.randrange(64),
+            flow_dt_ms=rng.randrange(256))
     if msg_type == sp.MsgType.TLM_EVENT:
         return sp.TlmEvent(
             state=rng.randrange(8), prev_state=rng.randrange(8),
             reason=rng.randrange(12), flags=rng.randrange(256),
             voltage=f32(rng.uniform(3.0, 4.3)))
     if msg_type == sp.MsgType.TLM_ACK:
-        return sp.TlmAck(acked_type=rng.randrange(0x14, 0x24),
+        return sp.TlmAck(acked_type=rng.randrange(0x14, 0x29),
                          acked_seq=rng.randrange(2**32),
                          status=rng.randrange(6))
     if msg_type == sp.MsgType.TLM_EXP:
@@ -176,7 +203,7 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
             flags=rng.randrange(8))
     if msg_type == sp.MsgType.TLM_CAL_DATA:
         return sp.TlmCalData(
-            valid_flags=rng.randrange(64),
+            valid_flags=rng.randrange(256),
             mag3d_offset=tuple(f32(rng.uniform(-100, 100)) for _ in range(3)),
             mag3d_matrix=tuple(f32(rng.uniform(-2, 2)) for _ in range(9)),
             accel6_offset=tuple(f32(rng.uniform(-0.2, 0.2)) for _ in range(3)),
@@ -189,7 +216,9 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
                                   sp.CmdFfBegin.NLUT_MAX + 1),
             ff_crc32=rng.randrange(2**32),
             ff_mode=rng.randrange(3),
-            est_mode=rng.randrange(2))
+            est_mode=rng.randrange(3),
+            magbias=tuple(f32(rng.uniform(-30, 30)) for _ in range(3)),
+            flowcal=tuple(f32(rng.uniform(300, 600)) for _ in range(2)))
     if msg_type == sp.MsgType.TLM_CTRL:
         return sp.TlmCtrl(
             elapsed_ms=rng.randrange(2**32),
@@ -382,6 +411,113 @@ def test_utf8_truncate_len_edge_cases():
     assert sp.utf8_truncate_len(b"abc", 100) == 3         # 上限未満はそのまま
     # 不正な UTF-8(孤立継続バイト)は新たな分断を作らない範囲でそのまま通す
     assert sp.utf8_truncate_len(b"\x80\x80\x80", 2) == 2
+
+
+# ---------------------------------------------------------------------------
+# 磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1)のサイズ・境界値
+# ---------------------------------------------------------------------------
+
+def test_mag_autotune_payload_size_contract():
+    """契約 §1 のペイロードサイズ(184/132/13/9/1B と既存不変分)。"""
+    assert sp.TlmState.PAYLOAD_SIZE == 184
+    assert len(sp.TlmState().to_payload()) == 184
+    assert sp.TlmCalData.PAYLOAD_SIZE == 132
+    assert len(sp.TlmCalData().to_payload()) == 132
+    assert sp.CmdMagbiasSet.PAYLOAD_SIZE == 13
+    assert len(sp.CmdMagbiasSet().to_payload()) == 13
+    assert sp.CmdFlowcalSet.PAYLOAD_SIZE == 9
+    assert len(sp.CmdFlowcalSet().to_payload()) == 9
+    assert sp.CmdFlowProbe.PAYLOAD_SIZE == 1
+    assert len(sp.CmdFlowProbe().to_payload()) == 1
+    # 既存フィールドのサイズ不変(契約 §1.2)
+    assert sp.CmdPosErr.PAYLOAD_SIZE == 21
+
+
+def test_mag_autotune_type_and_bit_constants():
+    """契約 §1 の型番・ビット割当(既存ビットと衝突しないこと)。"""
+    assert sp.MsgType.CMD_MAGBIAS_SET == 0x26
+    assert sp.MsgType.CMD_FLOWCAL_SET == 0x27
+    assert sp.MsgType.CMD_FLOW_PROBE == 0x28
+    assert sp.is_uplink_type(sp.MsgType.CMD_MAGBIAS_SET)
+    assert sp.is_uplink_type(sp.MsgType.CMD_FLOW_PROBE)
+    assert sp.CmdPosErr.FLAG_YAW_REF_LOW_TRUST == 0x10          # bit4(§1.2)
+    assert sp.CmdFfMode.EST_MODE_EKF2 == 2                      # §1.3
+    assert sp.TlmState.FF_STATUS_EST_EKF2 == 0x80               # bit7(§1.1)
+    assert sp.TlmState.FF_STATUS_EST_EKF2 != sp.TlmState.FF_STATUS_EST_EKF
+    assert sp.TlmCalData.VALID_MAGBIAS == 0x40                  # bit6(§1.5)
+    assert sp.TlmCalData.VALID_FLOWCAL == 0x80                  # bit7(同)
+
+
+def test_tlm_state_rejects_legacy_135b():
+    """旧 135B TLM_STATE フレームは受理しない(長さ厳格検査)。"""
+    for bad_len in (0, 134, 135, 183, 185):
+        with pytest.raises(ValueError):
+            sp.TlmState.from_payload(bytes(bad_len))
+    sp.TlmState.from_payload(bytes(184))  # 正しい長さは受理
+
+
+def test_tlm_cal_data_rejects_legacy_112b():
+    """旧 112B TLM_CAL_DATA フレームは受理しない(長さ厳格検査)。"""
+    for bad_len in (0, 111, 112, 131, 133):
+        with pytest.raises(ValueError):
+            sp.TlmCalData.from_payload(bytes(bad_len))
+    sp.TlmCalData.from_payload(bytes(132))  # 正しい長さは受理
+
+
+def test_new_cmd_length_strictness():
+    """新コマンド 3 種の長さ厳格検査(±1B は拒否)。"""
+    for cls in (sp.CmdMagbiasSet, sp.CmdFlowcalSet, sp.CmdFlowProbe):
+        for bad_len in (cls.PAYLOAD_SIZE - 1, cls.PAYLOAD_SIZE + 1):
+            with pytest.raises(ValueError):
+                cls.from_payload(bytes(max(bad_len, 0)))
+
+
+def test_new_cmd_boundary_values_roundtrip():
+    """新コマンドの境界値(mode 0/1、n_cycles 0/255、±大振幅 f32)往復。"""
+    for mode in (sp.CmdMagbiasSet.MODE_CLEAR, sp.CmdMagbiasSet.MODE_SET):
+        msg = sp.CmdMagbiasSet(mode=mode, dx=f32(-1000.0), dy=0.0, dz=f32(1000.0))
+        assert sp.CmdMagbiasSet.from_payload(msg.to_payload()) == msg
+    for mode in (sp.CmdFlowcalSet.MODE_CLEAR, sp.CmdFlowcalSet.MODE_SET):
+        msg = sp.CmdFlowcalSet(mode=mode, kx=f32(450.0), ky=f32(0.0))
+        assert sp.CmdFlowcalSet.from_payload(msg.to_payload()) == msg
+    for n_cycles in (0, 1, sp.CmdFlowProbe.DEFAULT_CYCLES, 255):
+        msg = sp.CmdFlowProbe(n_cycles=n_cycles)
+        assert sp.CmdFlowProbe.from_payload(msg.to_payload()) == msg
+
+
+def test_tlm_state_extension_offsets():
+    """拡張フィールドが契約 §1.1 のオフセットに載ること(既存 0–134 不変)。"""
+    msg = sp.TlmState(nis=1.25, ffg=0xAA, ff_status=0x81,
+                      mag_cal_x_ut=1.0, mag_cal_y_ut=2.0, mag_cal_z_ut=3.0,
+                      mag_lev_x_ut=4.0, mag_lev_y_ut=5.0,
+                      ekf2_yaw_rad=6.0, ekf2_bm_x_ut=7.0, ekf2_bm_y_ut=8.0,
+                      ekf2_yaw_innov_rad=9.0,
+                      ekf2_status=0x5B, ekf2_gate=0x0C,
+                      flow_vx_mps=10.0, flow_vy_mps=11.0,
+                      flow_squal=200, flow_status=0x1F, flow_dt_ms=250)
+    payload = msg.to_payload()
+    assert struct.unpack_from("<f", payload, 129)[0] == 1.25   # 既存 nis 不変
+    assert payload[133] == 0xAA and payload[134] == 0x81
+    for off, want in ((135, 1.0), (139, 2.0), (143, 3.0), (147, 4.0),
+                      (151, 5.0), (155, 6.0), (159, 7.0), (163, 8.0),
+                      (167, 9.0), (173, 10.0), (177, 11.0)):
+        assert struct.unpack_from("<f", payload, off)[0] == want, off
+    assert payload[171] == 0x5B
+    assert payload[172] == 0x0C
+    assert payload[181] == 200
+    assert payload[182] == 0x1F
+    assert payload[183] == 250
+    assert sp.TlmState.from_payload(payload) == msg
+
+
+def test_tlm_cal_data_extension_offsets():
+    """magbias / flowcal が契約 §1.5 のオフセット(112 / 124)に載ること。"""
+    msg = sp.TlmCalData(valid_flags=0xC0,
+                        magbias=(1.5, -2.5, 3.5), flowcal=(450.0, 451.0))
+    payload = msg.to_payload()
+    assert struct.unpack_from("<3f", payload, 112) == (1.5, -2.5, 3.5)
+    assert struct.unpack_from("<2f", payload, 124) == (450.0, 451.0)
+    assert sp.TlmCalData.from_payload(payload) == msg
 
 
 def test_cobs_boundary_lengths():

@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "comm.hpp"
+#include "flow/flow_hub.hpp"
 #include "indicators.hpp"
 #include "pid.hpp"
 #include "sensor.hpp"
@@ -519,7 +520,16 @@ void apply_pos_err(const CommandSnapshot& cmd) {
     cs.pos_mocap_yaw_valid =
         (pe.flags & stampfly::CmdPosErr::FLAG_MOCAP_YAW_VALID) != 0 &&
         isfinite(pe.mocap_yaw);
+    // bit4 = 基準ヨー低信頼(移動ベースヨー時に PC が立てる。契約 §1.2)
+    cs.pos_mocap_yaw_low_trust =
+        (pe.flags & stampfly::CmdPosErr::FLAG_YAW_REF_LOW_TRUST) != 0;
     cs.pos_err_fresh_sample = true;
+    // 外部ヨー基準を EKF2 のヨー擬似観測へ配線(consume-once ステージ。
+    // 次 tick の sensorHubFfUpdate が age<100ms 検査の上で融合する。契約 §2.3)
+    if (cs.pos_mocap_yaw_valid) {
+        sensorHubFfStageYawObs(pe.mocap_yaw, cs.pos_mocap_yaw_low_trust,
+                               cmd.pos_err_rx_ms);
+    }
 
     // ヨー・高度目標は CMD_SETPOINT と同じ規約
     cs.target_yaw_rad = pe.yaw_ref;
@@ -628,15 +638,23 @@ void update_thrust_and_attitude_command(void) {
     out.Thrust_command = out.Thrust0 * cfg.battery_nominal_v;
 
     // ヨー推定ソースの選択(ヨー角制御と機上XY回転補償が共用)。
-    // yaw_used: est_mode==1 かつ EKF 健全なら EKF ψ、est_mode==0 なら Madgwick。
-    // est_mode==1 で EKF が不健全(磁気更新凍結/アンカー無効/FF無効)な間は、
+    // yaw_used: est_mode==1 かつ EKF 健全なら EKF ψ、est_mode==2 かつ EKF2
+    // 健全(healthy2)なら EKF2 ψ、est_mode==0 なら Madgwick。
+    // est_mode==1/2 で推定器が不健全(磁気更新凍結/アンカー無効/FF無効)な間は、
     // 飛行中のヨーソース切替による指令段差を作らないため角度制御を止めて
     // レートダンピングに縮退する(PC へは ffg / ff_status bit5 で通知される)。
+    // EKF2 の healthy2 に yaw_obs 鮮度は含まれない(MoCap 途絶はコースト。契約 §2.2)。
     bool yaw_source_ok = true;
     float yaw_used = sensor_state.Yaw_angle;
     if (sensor_state.Est_mode == 1) {
         if (sensorHubFfEkfHealthy()) {
             yaw_used = sensor_state.Yaw_ekf_rad;
+        } else {
+            yaw_source_ok = false;
+        }
+    } else if (sensor_state.Est_mode == 2) {
+        if (sensorHubFfEkf2Healthy()) {
+            yaw_used = sensor_state.Ekf2_yaw_rad;
         } else {
             yaw_source_ok = false;
         }
@@ -658,8 +676,12 @@ void update_thrust_and_attitude_command(void) {
         float yaw_for_pos = yaw_used;
         if (!yaw_source_ok) {
             if (pos_yaw_fallback_prev_ok) {
+                // フレーム差は直前まで使っていた推定器(est_mode に対応)で取る
+                const float est_yaw = sensor_state.Est_mode == 2
+                    ? sensor_state.Ekf2_yaw_rad
+                    : sensor_state.Yaw_ekf_rad;
                 pos_yaw_fallback_offset =
-                    wrapPi(sensor_state.Yaw_ekf_rad - sensor_state.Yaw_angle);
+                    wrapPi(est_yaw - sensor_state.Yaw_angle);
             }
             yaw_for_pos = wrapPi(sensor_state.Yaw_angle
                                  + pos_yaw_fallback_offset);
@@ -1093,9 +1115,10 @@ void handle_complete(const CommandSnapshot& cmd) {
 }
 
 // ---------------------------------------------------------------------------
-// v2 コマンド処理(0x14-0x23, 0x25。契約 §1.2 / §2.4 / §2.5)
+// v2 コマンド処理(0x14-0x23, 0x25-0x28。契約 §1.2 / §2.4 / §2.5、
+// 磁気オートチューン/フロー拡張は MAG_AUTOTUNE_DESIGN.md §1.4)
 //
-// 全コマンドに TLM_ACK で応答する。キャリブ/FF系(0x17-0x23)は
+// 全コマンドに TLM_ACK で応答する。キャリブ/FF系(0x17-0x23)と 0x26-0x28 は
 // WAIT / COMPLETE / MOTOR_TEST でのみ受理(飛行中の NVS 書込み禁止)。
 // 処理内容は yaw側 command.cpp の各ハンドラをバイナリプロトコルへ写像したもの。
 // ---------------------------------------------------------------------------
@@ -1264,16 +1287,48 @@ uint8_t handle_cmd_ff_commit(const stampfly::CmdFfCommit& m) {
     return TlmAck::STATUS_OK;
 }
 
-// CMD_FF_MODE: ff_mode / est_mode の実行時切替+NVS 永続化+再シード
+// CMD_FF_MODE: ff_mode / est_mode の実行時切替+NVS 永続化+再シード。
+// est_mode の受理範囲は 0..2(2=EKF2。契約 §1.3)。
 uint8_t handle_cmd_ff_mode(const stampfly::CmdFfMode& m) {
     if (m.ff_mode > stampfly::CmdFfMode::FF_MODE_B ||
-        m.est_mode > stampfly::CmdFfMode::EST_MODE_EKF) {
+        m.est_mode > stampfly::CmdFfMode::EST_MODE_EKF2) {
         return TlmAck::STATUS_INVALID_ARG;
     }
+    const uint8_t prev_est_mode = g_yaw_est.ff.est_mode;
+    // 切替前のアクティブ推定器ヨー(EKF2 アクティブ化時の再シード種)
+    const float prev_active_yaw = g_yaw_est.ff.yaw_active_rad;
     g_yaw_est.ff.ff_mode = m.ff_mode;
     g_yaw_est.ff.est_mode = m.est_mode;
     saveFfModes(m.ff_mode, m.est_mode);
     sensorHubFfReseed();
+    // 契約 §1.3: EKF2 のアクティブ化時は「直近のアクティブ推定器ヨー」で
+    // reseedYaw する(sensorHubFfReseed のリファレンスCF種を上書き)。
+    if (m.est_mode == stampfly::CmdFfMode::EST_MODE_EKF2 &&
+        prev_est_mode != stampfly::CmdFfMode::EST_MODE_EKF2) {
+        g_yaw_est.yaw_kf2.reseedYaw(prev_active_yaw);
+    }
+    return TlmAck::STATUS_OK;
+}
+
+// CMD_MAGBIAS_SET: 学習ハードアイアン残差 Δb [µT, b_cal 空間] の適用/クリア
+// (契約 §1.4)。NVS `magbias` 保存+即適用+アンカー無効化+窓リセット+
+// 補正系再シード(mag3d 変更時と同パターン)。**ff_mode は降格しない**
+// (FF 係数は b_cal 空間のまま有効)。受理状態はキャリブ系と同じ非飛行ガード。
+uint8_t handle_cmd_magbias_set(const stampfly::CmdMagbiasSet& m) {
+    if (m.mode > stampfly::CmdMagbiasSet::MODE_SET) {
+        return TlmAck::STATUS_INVALID_ARG;
+    }
+    if (m.mode == stampfly::CmdMagbiasSet::MODE_SET) {
+        if (!isfinite(m.dx) || !isfinite(m.dy) || !isfinite(m.dz)) {
+            return TlmAck::STATUS_INVALID_ARG;
+        }
+        const MagVector delta{m.dx, m.dy, m.dz};
+        sensorHubFfApplyMagbias(true, delta);
+        saveMagbias(true, delta);
+    } else {
+        sensorHubFfApplyMagbias(false, MagVector{});
+        saveMagbias(false, MagVector{});
+    }
     return TlmAck::STATUS_OK;
 }
 
@@ -1283,11 +1338,15 @@ uint8_t process_one_v2_command(const V2Command& c, bool& send_cal_data_after) {
     using stampfly::MsgType;
     const MsgType type = static_cast<MsgType>(c.type);
 
-    // キャリブ/FF系(0x17-0x23)と CMD_LED_MODE(0x25)は WAIT/COMPLETE/
-    // MOTOR_TEST のみ受理(契約 §1.2。LED_MODE も同じ非飛行ガードに相乗り)
+    // キャリブ/FF系(0x17-0x23)と CMD_LED_MODE(0x25)、磁気オートチューン/
+    // フロー系(0x26-0x28)は WAIT/COMPLETE/MOTOR_TEST のみ受理
+    // (契約 §1.2 / MAG_AUTOTUNE_DESIGN.md §1.4: 飛行中の NVS 書込み禁止。
+    //  LED_MODE も同じ非飛行ガードに相乗り)
     if (((c.type >= static_cast<uint8_t>(MsgType::CMD_CAL_GET) &&
           c.type <= static_cast<uint8_t>(MsgType::CMD_FF_ANCHOR)) ||
-         c.type == static_cast<uint8_t>(MsgType::CMD_LED_MODE)) &&
+         c.type == static_cast<uint8_t>(MsgType::CMD_LED_MODE) ||
+         (c.type >= static_cast<uint8_t>(MsgType::CMD_MAGBIAS_SET) &&
+          c.type <= static_cast<uint8_t>(MsgType::CMD_FLOW_PROBE))) &&
         !in_cal_command_state()) {
         return TlmAck::STATUS_BAD_STATE;
     }
@@ -1399,6 +1458,45 @@ uint8_t process_one_v2_command(const V2Command& c, bool& send_cal_data_after) {
             if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
             if (m.mode > stampfly::CmdLedMode::MODE_RECORDING) return TlmAck::STATUS_INVALID_ARG;
             indicators_set_led_mode(m.mode);
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_MAGBIAS_SET: {
+            stampfly::CmdMagbiasSet m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            return handle_cmd_magbias_set(m);
+        }
+        case MsgType::CMD_FLOWCAL_SET: {
+            // フロースケール適用/クリア+NVS `flowcal`(MAG_AUTOTUNE_DESIGN.md
+            // §1.4/§2.5)。mode=0 でクリア=既定 450.0 に戻る。
+            stampfly::CmdFlowcalSet m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (m.mode > stampfly::CmdFlowcalSet::MODE_SET) return TlmAck::STATUS_INVALID_ARG;
+            if (m.mode == stampfly::CmdFlowcalSet::MODE_SET) {
+                if (!isfinite(m.kx) || !isfinite(m.ky) ||
+                    m.kx < FLOW_SCALE_MIN_COUNTS_PER_RAD ||
+                    m.kx > FLOW_SCALE_MAX_COUNTS_PER_RAD ||
+                    m.ky < FLOW_SCALE_MIN_COUNTS_PER_RAD ||
+                    m.ky > FLOW_SCALE_MAX_COUNTS_PER_RAD) {
+                    return TlmAck::STATUS_INVALID_ARG;
+                }
+                flowHubApplyCalibration(m.kx, m.ky);  // 即適用+NVS 保存
+            } else {
+                flowHubClearCalibration();  // 既定 450.0 へ+NVS クリア
+            }
+            return TlmAck::STATUS_OK;
+        }
+        case MsgType::CMD_FLOW_PROBE: {
+            // PMW3901 burst プローブ(MAG_AUTOTUNE_DESIGN.md §1.4/§2.4)。
+            // 実行中は 400Hz ループが数秒ブロックする(テレメトリ・failsafe も
+            // 止まる)ためモーター停止時のみ: 非飛行ガードは通過済みだが、
+            // MOTOR_TEST 中の実出力あり(ランプダウン含む)は busy で拒否する。
+            stampfly::CmdFlowProbe m;
+            if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
+            if (motor_test_output_active()) return TlmAck::STATUS_BUSY;
+            // n_cycles=0 は既定 200。結果要約は LOG_TEXT 複数行、合否で
+            // burst_ok ラッチ更新(flow_hub 側)。実行不能(センサー init
+            // 不成立等)は incomplete。
+            if (!flowHubRunBurstProbe(m.n_cycles)) return TlmAck::STATUS_INCOMPLETE;
             return TlmAck::STATUS_OK;
         }
         default:
@@ -1513,7 +1611,7 @@ void loop_400Hz(void) {
     apply_setpoint(cmd);
     apply_pos_err(cmd);
 
-    // v2 コマンド(0x14-0x23, 0x25)の処理+TLM_ACK 応答。CMD_MODE の遷移は
+    // v2 コマンド(0x14-0x23, 0x25-0x28)の処理+TLM_ACK 応答。CMD_MODE の遷移は
     // この直後の状態スイッチで同tick内に反映される(STOP は各ハンドラが最優先)。
     process_v2_commands(cmd);
 

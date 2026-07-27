@@ -10,6 +10,7 @@ namespace {
 const uint32_t MAG3D_CALIBRATION_SCHEMA = 2;
 const uint32_t GEOMAGNETIC_SCHEMA = 1;
 const uint32_t FFCAL_SCHEMA = 1;
+const uint32_t MAGBIAS_SCHEMA = 1;  // MAG_AUTOTUNE_DESIGN.md §2.5
 
 Preferences preferences;
 
@@ -261,7 +262,8 @@ void loadFfCalibration(FfCalibration& calibration, uint8_t& ff_mode, uint8_t& es
 
     if (restored) {
         ff_mode = ff_stored <= 2 ? static_cast<uint8_t>(ff_stored) : 0;
-        est_mode = est_stored <= 1 ? static_cast<uint8_t>(est_stored) : 0;
+        // est の受理範囲は 0..2 (2=EKF2。MAG_AUTOTUNE_DESIGN.md §1.3)
+        est_mode = est_stored <= 2 ? static_cast<uint8_t>(est_stored) : 0;
         USBSerial.printf(
             "Loaded FF calibration: nlut=%lu crc=%08lx ff=%u est=%u\n",
             static_cast<unsigned long>(nlut),
@@ -274,5 +276,64 @@ void loadFfCalibration(FfCalibration& calibration, uint8_t& ff_mode, uint8_t& es
         calibration.clear();
         clearFfCalibration();
         USBSerial.println("Ignored corrupt FF calibration; re-send via ffcal_* commands");
+    }
+}
+
+// ---- 学習ハードアイアン残差 Δb (MAG_AUTOTUNE_DESIGN.md §2.5) ----
+// NVS namespace "magbias": schema(u32=1) / valid(u8) / blob(f32×3) / crc(u32)。
+// CRC は ffcal と同じ CRC-32 (IEEE, float32 列) を FfCalibration::crc32Of で共用。
+
+void saveMagbias(bool valid, const MagVector& delta_b_ut) {
+    preferences.begin("magbias", false);
+    preferences.putUInt("schema", MAGBIAS_SCHEMA);
+    preferences.putUChar("valid", valid ? 1 : 0);
+    if (valid) {
+        float blob[3] = {delta_b_ut.x, delta_b_ut.y, delta_b_ut.z};
+        preferences.putBytes("blob", blob, sizeof(blob));
+        preferences.putUInt("crc", FfCalibration::crc32Of(blob, 3));
+    }
+    preferences.end();
+}
+
+void clearMagbias() {
+    saveMagbias(false, MagVector{});
+}
+
+void loadMagbias(bool& valid, MagVector& delta_b_ut) {
+    valid = false;
+    delta_b_ut = MagVector{};
+
+    preferences.begin("magbias", true);
+    const uint32_t schema = preferences.getUInt("schema", 0);
+    const uint8_t stored_valid = preferences.getUChar("valid", 0);
+    float blob[3] = {0.0f, 0.0f, 0.0f};
+    const size_t read_bytes = preferences.getBytes("blob", blob, sizeof(blob));
+    const uint32_t crc = preferences.getUInt("crc", 0);
+    preferences.end();
+
+    bool corrupt = false;
+    if (stored_valid != 0 && schema == MAGBIAS_SCHEMA) {
+        if (read_bytes == sizeof(blob) &&
+            FfCalibration::crc32Of(blob, 3) == crc &&
+            isfinite(blob[0]) && isfinite(blob[1]) && isfinite(blob[2])) {
+            valid = true;
+            delta_b_ut = MagVector{blob[0], blob[1], blob[2]};
+            USBSerial.printf(
+                "Loaded magbias: db=(%.2f, %.2f, %.2f) uT\n",
+                static_cast<double>(blob[0]),
+                static_cast<double>(blob[1]),
+                static_cast<double>(blob[2])
+            );
+        } else {
+            corrupt = true;
+        }
+    } else if (stored_valid != 0) {
+        corrupt = true;  // schema 不一致も破棄対象
+    }
+
+    if (corrupt) {
+        // CRC/スキーマ不一致は自己修復破棄 (mag3d / ffcal の前例に従う)。
+        clearMagbias();
+        USBSerial.println("Ignored corrupt magbias; re-apply via magbias command");
     }
 }

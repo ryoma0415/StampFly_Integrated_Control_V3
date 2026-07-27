@@ -35,8 +35,10 @@ from .experiment import ExperimentHub
 from .ffprofile import FfProfileManager
 from . import logger as logger_mod
 from .logger import FlightLogger
+from .magbias import MagbiasManager
 from .mocap import (DEFAULT_ATTITUDE_TRANSFORM, DEG_TO_RAD, RAD_TO_DEG,
                     MocapSource, validate_mapping, wrap_pi)
+from .motion_yaw import MotionYawEstimator
 from .multi import MultiControlManager
 from .position import PositionController
 from .posture import PostureController, run_paced_loop
@@ -53,6 +55,12 @@ PHASE_IDLE = "idle"
 PHASE_CONNECTED = "connected"
 PHASE_ARMED = "armed"
 PHASE_FLYING = "flying"
+
+# ヨー基準ソース(CMD_POS_ERR mocap_yaw 欄の供給元。契約 §3.1)
+YAW_REF_OFF = "off"        # bit3 を立てない(ファームはコースト)
+YAW_REF_MOCAP = "mocap"    # MoCap 実測ヨー(bit4=0。従来動作)
+YAW_REF_MOTION = "motion"  # 移動ベースヨー(bit4=1: 低信頼プリセット)
+YAW_REF_SOURCES = (YAW_REF_OFF, YAW_REF_MOCAP, YAW_REF_MOTION)
 
 # 飛行中とみなす FlightState(LANDING 中も「flying」フェーズとして扱う)
 _IN_FLIGHT_STATES = frozenset({
@@ -207,6 +215,16 @@ class SessionManager:
             tlm_state_provider=self._tlm_state_snapshot)
         self.ffprofile = FfProfileManager(self.serial, self.experiment,
                                           self.calibration, notify=self.warn)
+        # magbias プロファイル+flowcal/probe(契約 §3.4-5。ffprofile と
+        # 同じ排他スロットを共有する)
+        self.magbias = MagbiasManager(self.serial, self.experiment,
+                                      self.calibration, notify=self.warn)
+        # 移動ベースヨー推定器(契約 §3.2)。Position モードの 50Hz 送信 tick
+        # (_emit_pos_err)だけが feed/estimate を呼ぶ(単一スレッド前提)。
+        # スナップショット用の直近推定は self._lock 配下にキャッシュする。
+        self.motion_yaw = MotionYawEstimator(
+            self.control_config.get("motion_yaw"),
+            dt_s=1.0 / self.server_config["rates"]["setpoint_hz"])
         # 実験計測ログ(ExpRecorder)への供給線: 最新 TLM_STATE スナップ
         # ショットと FF 適用状態(meta 用)。hub 構築時には ffprofile が
         # まだ無いため、ここで配線する(依存注入)。
@@ -282,6 +300,15 @@ class SessionManager:
         self._tlm_stale_warned = False
         self._relay_reassert_at: Optional[float] = None
         self._relay_reassert_busy = False
+
+        # ヨー基準ソース(契約 §3.1: server.json 既定+ランタイム API)。
+        # 既定 "mocap" は従来動作(heading 有効時に bit3 を立てる)と同一
+        source = str(self.server_config.get("yaw_ref", {})
+                     .get("source", YAW_REF_MOCAP))
+        self._yaw_ref_source = (source if source in YAW_REF_SOURCES
+                                else YAW_REF_MOCAP)
+        # 直近の移動ベースヨー推定(ワイヤ規約変換済み。WS スナップショット用)
+        self._motion_yaw_snap: Optional[dict] = None
 
         # 最新テレメトリ
         self._tlm_state: Optional[proto.TlmState] = None
@@ -925,6 +952,45 @@ class SessionManager:
         self.position.set_yaw_control(enabled)
         self.info(f"ヨー角制御: {'ON' if enabled else 'OFF'}")
 
+    @_ui_command
+    def set_yaw_ref_source(self, source: str) -> dict:
+        """ヨー基準ソース切替(契約 §3.1: off | mocap | motion)。
+
+        CMD_POS_ERR の mocap_yaw(外部ヨー基準)欄の供給元を切り替える:
+        - off:    bit3 を立てない(ファームの EKF2 はコースト)
+        - mocap:  MoCap 実測ヨー(heading。従来動作、bit4=0)
+        - motion: 移動ベースヨー(MotionYawEstimator。bit4=1 = 低信頼)。
+          推定 invalid(Fisher情報不足など)の間は bit3 を落とす。
+        飛行中も切替可能(ファームはソース非依存に消費する)。
+        """
+        clean = str(source or "").strip().lower()
+        if clean not in YAW_REF_SOURCES:
+            message = f"不明なヨー基準ソースです: {source!r}"
+            self.warn(message)
+            return {"ok": False, "message": message, **self.yaw_ref_status()}
+        with self._lock:
+            changed = clean != self._yaw_ref_source
+            self._yaw_ref_source = clean
+        if changed:
+            self.info(f"ヨー基準ソース: {clean}")
+        return {"ok": True, **self.yaw_ref_status()}
+
+    def yaw_ref_status(self) -> dict:
+        """ヨー基準ソースと移動ベースヨーの現況(REST/WS 用、UI 単位)。"""
+        with self._lock:
+            source = self._yaw_ref_source
+            motion = self._motion_yaw_snap
+        status = {"source": source,
+                  "motion_yaw_deg": None, "motion_J": None,
+                  "motion_valid": False}
+        if motion is not None:
+            yaw = motion.get("yaw_wire_rad")
+            status["motion_yaw_deg"] = (None if yaw is None
+                                        else yaw * RAD_TO_DEG)
+            status["motion_J"] = motion.get("j")
+            status["motion_valid"] = bool(motion.get("valid"))
+        return _json_safe(status)
+
     # ------------------------------------------------------------------
     # v2: 円軌道モード(Position タブ)
     # ------------------------------------------------------------------
@@ -1536,9 +1602,14 @@ class SessionManager:
         する(マッピングが実行時変更可能になったため、列契約だけでは
         フレームが自明でなくなった)。
         """
+        with self._lock:
+            yaw_ref_source = self._yaw_ref_source
         return {
-            "log_columns_version": 5,
+            "log_columns_version": 6,
             "mocap_mapping": self.mocap.mapping_snapshot(),
+            # ログ開始時点のヨー基準ソース(以後の切替は CSV の
+            # yaw_ref_source 列が行単位で持つ)
+            "yaw_ref_source": yaw_ref_source,
         }
 
     def _finish_flight_log(self) -> None:
@@ -1679,16 +1750,35 @@ class SessionManager:
             err_y *= wire_sign
             if heading is not None:
                 heading = wrap_pi(heading * wire_sign)
+        # 移動ベースヨー(契約 §3.2): ソースに関わらず毎 tick 更新・記録する
+        # (切替前の妥当性検証と、切替時の即応のため)
+        motion_wire, motion_est = self._update_motion_yaw(meta, wire_sign)
+
+        # ヨー基準ソース選択(契約 §3.1)。mocap は従来動作(heading 有効時
+        # bit3)、motion は推定 valid 時のみ bit3+bit4(低信頼)、off/invalid
+        # は bit3 を落とす(ファームの EKF2 はコースト)
+        with self._lock:
+            yaw_ref_source = self._yaw_ref_source
+        yaw_obs: Optional[float] = None
+        low_trust = False
+        if yaw_ref_source == YAW_REF_MOCAP:
+            yaw_obs = heading
+        elif yaw_ref_source == YAW_REF_MOTION:
+            yaw_obs = motion_wire
+            low_trust = True
         flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
         if yaw_ctrl_on:
             flags |= proto.CmdPosErr.FLAG_YAW_REF_VALID
         if xy_valid:
             flags |= proto.CmdPosErr.FLAG_XY_ERR_VALID
-        if heading is not None:
+        if yaw_obs is not None:
             flags |= proto.CmdPosErr.FLAG_MOCAP_YAW_VALID
+            if low_trust:
+                flags |= proto.CmdPosErr.FLAG_YAW_REF_LOW_TRUST
         pos_err = proto.CmdPosErr(
             err_x=err_x, err_y=err_y, alt_ref=alt_m, yaw_ref=yaw_ref,
-            mocap_yaw=float(heading or 0.0), flags=flags)
+            mocap_yaw=float(yaw_obs if yaw_obs is not None else 0.0),
+            flags=flags)
         seq: Optional[int] = None
         send_success = False
         try:
@@ -1708,7 +1798,59 @@ class SessionManager:
             row["cmd_err_x_m"] = err_x
             row["cmd_err_y_m"] = err_y
             row["cmd_xy_valid"] = xy_valid
+            # v6: ヨー基準/移動ベースヨー列(契約 §3.3)
+            row["yaw_ref_source"] = yaw_ref_source
+            row["yaw_ref_sent_rad"] = pos_err.mocap_yaw
+            row["yaw_ref_valid"] = bool(
+                flags & proto.CmdPosErr.FLAG_MOCAP_YAW_VALID)
+            row["motion_yaw_rad"] = motion_wire
+            row["motion_yaw_J"] = motion_est["j"]
             self.logger.log_row(row)
+
+    def _update_motion_yaw(self, meta: dict,
+                           wire_sign: Optional[float]
+                           ) -> tuple[Optional[float], dict]:
+        """移動ベースヨー推定器を1 tick 進め、ワイヤ規約の推定値を返す。
+
+        入力: フィルタ済み MoCap 位置(制御座標系)+最新テレメトリ
+        roll/pitch(遅延補償は推定器内部で行う — PoC 実証 ≈90ms)。
+        位置無効・MoCap 途絶・テレメトリ非新鮮の tick はギャップとして
+        扱う(推定器がフィルタ連鎖をリセットし、窓は自然期限切れ)。
+
+        戻り値: (ワイヤ規約の移動ベースヨー [rad] または None, estimate dict)。
+        規約変換: 推定器出力 ψ̂ は PoC 規約(ψ̂ ≈ -yaw_true)。
+        yaw_true = yaw_sign*heading + offset の逆写像で heading 相当へ戻し、
+        mocap ソースと同じワイヤ変換(× machine_wire_y_sign)を適用する —
+        ソース切替でファームが見る値の規約が変わらないことを保証する。
+        """
+        filtered = meta.get("filtered_pos")
+        with self._lock:
+            tlm = self._tlm_state
+            tlm_t = self._tlm_state_t
+        tlm_fresh = (tlm is not None and tlm_t is not None
+                     and (self._clock() - tlm_t) <= self._telemetry_fresh_s)
+        sample_ok = (filtered is not None
+                     and bool(meta.get("data_valid"))
+                     and not bool(meta.get("mocap_dropout"))
+                     and tlm_fresh)
+        if sample_ok:
+            self.motion_yaw.add_sample(float(filtered[0]), float(filtered[1]),
+                                       tlm.roll, tlm.pitch)
+        else:
+            self.motion_yaw.add_gap()
+        est = self.motion_yaw.estimate()
+
+        motion_wire: Optional[float] = None
+        if est["yaw_rad"] is not None and wire_sign is not None:
+            yaw_sign, yaw_offset = self.mocap.attitude_yaw_convention
+            yaw_true_motion = -est["yaw_rad"]           # PoC 規約 → yaw_true
+            heading_motion = yaw_sign * (yaw_true_motion - yaw_offset)
+            motion_wire = wrap_pi(heading_motion * wire_sign)
+        snap = {"yaw_wire_rad": motion_wire, "j": est["j"],
+                "valid": bool(est["valid"]) and motion_wire is not None}
+        with self._lock:
+            self._motion_yaw_snap = snap
+        return motion_wire, est
 
     def _build_log_row(self, setpoint: proto.CmdSetpoint, seq: Optional[int],
                        send_success: bool, phase: str, meta: dict) -> dict:
@@ -2222,6 +2364,19 @@ class SessionManager:
                     tlm.ff_status & proto.TlmState.FF_STATUS_YAW_CTRL_ACTIVE),
                 "mag_fresh": bool(tlm.ff_status
                                   & proto.TlmState.FF_STATUS_MAG_FRESH),
+                # v6: 磁気オートチューン/フロー拡張(契約 §1.1。角度は deg)
+                "est_mode_ekf2": bool(tlm.ff_status
+                                      & proto.TlmState.FF_STATUS_EST_EKF2),
+                "ekf2_yaw": tlm.ekf2_yaw_rad * RAD_TO_DEG,
+                "ekf2_bm_x_ut": tlm.ekf2_bm_x_ut,
+                "ekf2_bm_y_ut": tlm.ekf2_bm_y_ut,
+                "ekf2_yaw_innov": tlm.ekf2_yaw_innov_rad * RAD_TO_DEG,
+                "ekf2_status": tlm.ekf2_status,
+                "ekf2_gate": tlm.ekf2_gate,
+                "flow_vx_mps": tlm.flow_vx_mps,
+                "flow_vy_mps": tlm.flow_vy_mps,
+                "flow_squal": tlm.flow_squal,
+                "flow_status": tlm.flow_status,
             }
 
         # mocap: Position モード時のみ(リジッドボディ未検出なら null)
@@ -2287,6 +2442,8 @@ class SessionManager:
                             and (now - rly_stats_t) <= self._relay_stats_fresh_s),
             "link_stats": self.serial.stats(),
             "mocap_dropout": mocap_warned,
+            # ヨー基準ソース+移動ベースヨー現況(契約 §3.1-2。UI トグル用)
+            "yaw_ref": self.yaw_ref_status(),
         }
 
         # 実験モードの状態(UI の Experiment タブが 20Hz で参照)

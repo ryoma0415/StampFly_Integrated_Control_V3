@@ -1,17 +1,21 @@
 # data_analysis — FF 係数抽出・計測データ解析ツール
 
-pc_server が取得したスイープ結果 / Experiment 計測ログをオフラインで解析する
-独立 venv のツール群。スクリプトは 3 本のみで、いずれも**引数なしで起動すると
-番号選択の対話モード**、引数を渡すと CLI として動く(`--help` あり、`q` で中止)。
+pc_server が取得したスイープ結果 / Experiment 計測ログ / 飛行ログをオフラインで
+解析する独立 venv のツール群。plot_sweep / make_ff_profile / plot_explog は
+**引数なしで起動すると番号選択の対話モード**、引数を渡すと CLI として動く
+(`--help` あり、`q` で中止)。
 
 | スクリプト | 役割 | 入力 | 出力 |
 |---|---|---|---|
 | `plot_sweep.py` | スイープ 1 本の校正解析(図12枚)+加算性シーケンス検証 | `sweep_*_samples.csv` / `sequence_*_meta.json` | `graphs/sweep_<stamp>/`・`graphs/additivity_<stem>/` |
 | `make_ff_profile.py` | スイープ結果 → FF プロファイル JSON 抽出 | スイープ 8 本(または全機 4 本+sequence meta) | `../pc_server/data/ff_profiles/<name>.json` |
 | `plot_explog.py` | Experiment 計測ログのグラフ化(図6枚+summary.txt)+アニメ MP4(スマホ動画同期可)+全期間俯瞰ボード PNG | `../pc_server/data/exp_logs/explog_*.csv`(+`exp_logs/videos/*.mp4`) | `graphs/explog_<stamp>/` |
+| `magbias_learn.py` | 飛行ログ → magbias プロファイル JSON(ハードアイアン残差 Δb / ホバ点残差 / FF電圧・duty回帰。`docs/MAG_AUTOTUNE_DESIGN.md` §3-§4) | `../logs/flight_logs/*.csv`(v6推奨、v5は縮退) | `../pc_server/data/magbias_profiles/<name>.json`(+`--plots` で `graphs/magbias_<name>/`) |
+| `replay/ekf2_replay.py` | EKF2(est_mode=2)の Python リプレイ — ヨー観測あり/なしの A/B・ゲート挙動検証(契約 §2.1/§4) | 飛行ログ CSV(v6=フル再構成 / v5=制限モード) | `graphs/ekf2_replay_<stem>/`(ψ軌跡CSV+比較図) |
 
 `graphs/` は出力専用ディレクトリ(生成物)。数値ロジック本体は `ff_params/core.py`
-(純粋関数ライブラリ)にあり、`tests/test_ff_extraction.py` が受入テスト。
+(純粋関数ライブラリ)にあり、`tests/test_ff_extraction.py` /
+`tests/test_magbias_learn.py` / `tests/test_ekf2_replay.py` が受入テスト。
 
 ## セットアップ
 
@@ -148,11 +152,46 @@ pc_server の UI「FF 抽出」からサブプロセスとして呼ばれるの�
 - 動画なし(`--animation` / メニュー[3])は 20fps・①枠は「動画なし」表示。
 - 依存: ffmpeg(必須)、opencv-python(動画同期時のみ)。
 
+## ④ magbias_learn.py — 飛行中磁気チューニング学習(契約 §3-§4)
+
+pc_server の `/api/magbias extract` からサブプロセスとして呼ばれるのと同じ CLI。
+
+```sh
+.venv/bin/python magbias_learn.py ../logs/flight_logs/<log>.csv \
+    [-o out.json] [--name NAME] [--plots] [--yaw-source auto|mocap|ekf2]
+```
+
+- **ハードアイアン残差 Δb**: ヨー励振区間のベクトルフィット
+  `z_k = R_z(ψ_k)·B0h' + Δb`(mag_lev + mocap真値 or ekf2_yaw、磁気EMA遅れ
+  τ≈0.456s をヨーの時間シフトで補償)。励振 <45° なら `delta_b=null`。
+- **hover_residual**: EKF2 b_m の安定ホバ窓中央値。**ff_supplement**: b_m ×
+  (電圧, duty4本, 電流)の線形回帰+R²。
+- v5 ログ(7/27 以前、mag_lev/ekf2 列なし)では EKF1 tlm_bm 代用の縮退動作
+  (warnings 明記)。出力スキーマは `stampfly_magbias_profile` v1(契約 §3)。
+
+## ⑤ replay/ekf2_replay.py — EKF2 リプレイ(契約 §2.1/§4)
+
+```sh
+.venv/bin/python replay/ekf2_replay.py ../logs/flight_logs/<log>.csv \
+    [--ff-profile ff.json] [--magbias magbias.json] \
+    [--yaw-obs none|mocap|<列名>] [--low-trust] [--ekf1-mode] [-o dir]
+```
+
+- v6 ログ: b_cal + FFプロファイル + magbias から `b_corr→EMA→レベル化→EKF2`
+  をフル再構成。ヨー擬似観測・τ_bm適応・飛行状態再アンカー(契約 §2.1)込み。
+- v5 ログ: 制限モード(EKF1 ログ状態からの合成観測+受理マスク)。
+  実観測イノベーション履歴が無いため ψ/b_m 配分は再現対象外(軌跡クラスと
+  ゲート挙動のみ)。`--ekf1-mode` で現行 EKF1 の τ_bm 意味論に戻して比較可。
+- 姿勢・レートはテレメトリ 25Hz 補間の近似(ファームは 400Hz)。
+
 ## テスト
 
 ```sh
 .venv/bin/python tests/test_ff_extraction.py   # EXIT=0 で全合格
+.venv/bin/python tests/test_magbias_learn.py   # 既知Δb注入の回復精度ほか
+.venv/bin/python tests/test_ekf2_replay.py     # EKF2数式・パイプライン検証
 ```
 
-6/12 実測 8 本と `tests/fixtures/results.json`(真値)の照合、付録 A 再現、
-sequence meta 展開の検証を含む。数値挙動を変える変更をしたら必ず実行すること。
+test_ff_extraction は 6/12 実測 8 本と `tests/fixtures/results.json`(真値)の
+照合、付録 A 再現、sequence meta 展開の検証を含む。数値挙動を変える変更を
+したら必ず実行すること。

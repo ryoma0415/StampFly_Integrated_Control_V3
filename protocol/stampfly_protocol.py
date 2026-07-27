@@ -44,7 +44,7 @@ RLY_MAX_PEERS = 4              # RLY_SET_PEERS の最大登録数(=同時制御�
 RLY_PEER_ENTRY_SIZE = 7        # mac(6) + tlm_state_div(1)
 MUX_HEADER_SIZE = 1            # RLY_MUX_UP/DOWN の node_id(1B)
 # エンベロープに収まる内側フレームの最大ペイロード長(= 200 - 1 - 9 = 190)。
-# 既存の全メッセージ(最大 TLM_STATE 135B)が収まる。
+# 既存の全メッセージ(最大 TLM_STATE 184B)が収まる。
 MAX_MUX_INNER_PAYLOAD = MAX_PAYLOAD_SIZE - MUX_HEADER_SIZE - FRAME_OVERHEAD
 
 
@@ -76,6 +76,12 @@ class MsgType(IntEnum):
     CMD_FF_ANCHOR = 0x23
     CMD_POS_ERR = 0x24
     CMD_LED_MODE = 0x25
+    # 磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.4。追加のみ・
+    # ver=0x02 のまま。契約書記載の 0x24-0x26 は既存 CMD_POS_ERR / CMD_LED_MODE
+    # と衝突するため、空きの 0x26-0x28 を同順で割当)
+    CMD_MAGBIAS_SET = 0x26
+    CMD_FLOWCAL_SET = 0x27
+    CMD_FLOW_PROBE = 0x28
     # 下り(ドローン -> PC): 0x30–0x4F
     TLM_STATE = 0x30
     TLM_EVENT = 0x31
@@ -315,11 +321,14 @@ _CMD_FF_AUX_FMT = "<f"
 _CMD_FF_COMMIT_FMT = "<I"
 _CMD_FF_MODE_FMT = "<BB"
 _CMD_LED_MODE_FMT = "<B"
+_CMD_MAGBIAS_SET_FMT = "<B3f"
+_CMD_FLOWCAL_SET_FMT = "<Bff"
+_CMD_FLOW_PROBE_FMT = "<B"
 _TLM_EVENT_FMT = "<BBBBf"
-_TLM_STATE_FMT = "<IIBBB21fH9fBB"
+_TLM_STATE_FMT = "<IIBBB21fH9fBB9fBB2fBBB"
 _TLM_ACK_FMT = "<BIB"
 _TLM_EXP_FMT = "<I20fBB"
-_TLM_CAL_DATA_FMT = "<B26fBIBB"
+_TLM_CAL_DATA_FMT = "<B26fBIBB5f"
 _TLM_CTRL_FMT = "<I21fB"
 _RLY_SET_TARGET_FMT = "<6sB"
 _RLY_TARGET_ACK_FMT = "<B6sB"
@@ -345,11 +354,14 @@ assert struct.calcsize(_CMD_FF_AUX_FMT) == 4
 assert struct.calcsize(_CMD_FF_COMMIT_FMT) == 4
 assert struct.calcsize(_CMD_FF_MODE_FMT) == 2
 assert struct.calcsize(_CMD_LED_MODE_FMT) == 1
+assert struct.calcsize(_CMD_MAGBIAS_SET_FMT) == 13
+assert struct.calcsize(_CMD_FLOWCAL_SET_FMT) == 9
+assert struct.calcsize(_CMD_FLOW_PROBE_FMT) == 1
 assert struct.calcsize(_TLM_EVENT_FMT) == 8
-assert struct.calcsize(_TLM_STATE_FMT) == 135
+assert struct.calcsize(_TLM_STATE_FMT) == 184
 assert struct.calcsize(_TLM_ACK_FMT) == 6
 assert struct.calcsize(_TLM_EXP_FMT) == 86
-assert struct.calcsize(_TLM_CAL_DATA_FMT) == 112
+assert struct.calcsize(_TLM_CAL_DATA_FMT) == 132
 assert struct.calcsize(_TLM_CTRL_FMT) == 89
 assert struct.calcsize(_RLY_SET_TARGET_FMT) == 7
 assert struct.calcsize(_RLY_TARGET_ACK_FMT) == 8
@@ -400,23 +412,28 @@ class CmdPosErr:
     してから XY PID を回す。alt_ref / yaw_ref / flags bit0-1 の意味は
     CMD_SETPOINT と同一。
 
-    mocap_yaw は MoCap 実測の制御座標系ヨー(リジッドボディ前方軸の方位、
-    ±π)。機体側のヨー推定とのフレーム整合検証・ログ用途で、bit3 が立って
-    いる場合のみ有効(機体制御は自身のヨー推定を用いる)。
+    mocap_yaw は**外部ヨー基準**(制御座標系ヨー、±π。ソースは PC 側設定:
+    MoCap 実測ヨー or MoCap 位置から計算する移動ベースヨー。名称は互換のため
+    維持)。ファームはソース非依存に消費し、EKF2(est_mode=2)のヨー擬似観測
+    ・フレーム整合検証・ログに用いる。bit3 が立っている場合のみ有効。
+    bit4(FLAG_YAW_REF_LOW_TRUST)は基準ヨーの信頼度低(移動ベースヨー時に
+    PC が立てる)→ファームは R_ψ を低信頼プリセットへ切替(MAG_AUTOTUNE_
+    DESIGN.md §1.2)。
     """
     err_x: float = 0.0      # m(制御座標系。target - filtered)
     err_y: float = 0.0      # m
     alt_ref: float = 0.0    # m
     yaw_ref: float = 0.0    # rad(±π、機体ヨー角目標)
-    mocap_yaw: float = 0.0  # rad(±π、MoCap 実測ヨー。bit3 有効時のみ)
+    mocap_yaw: float = 0.0  # rad(±π、外部ヨー基準。bit3 有効時のみ)
     flags: int = 0
 
     TYPE = MsgType.CMD_POS_ERR
     PAYLOAD_SIZE = 21
-    FLAG_ALT_REF_VALID = 0x01    # bit0(CMD_SETPOINT と同義)
-    FLAG_YAW_REF_VALID = 0x02    # bit1(同上)
-    FLAG_XY_ERR_VALID = 0x04     # bit2: err_x/err_y 有効(MoCap 新鮮+閉ループ有効)
-    FLAG_MOCAP_YAW_VALID = 0x08  # bit3: mocap_yaw 有効
+    FLAG_ALT_REF_VALID = 0x01      # bit0(CMD_SETPOINT と同義)
+    FLAG_YAW_REF_VALID = 0x02      # bit1(同上)
+    FLAG_XY_ERR_VALID = 0x04       # bit2: err_x/err_y 有効(MoCap 新鮮+閉ループ有効)
+    FLAG_MOCAP_YAW_VALID = 0x08    # bit3: mocap_yaw(外部ヨー基準)有効
+    FLAG_YAW_REF_LOW_TRUST = 0x10  # bit4: 基準ヨー低信頼(R_ψ 低信頼プリセット)
 
     def to_payload(self) -> bytes:
         return struct.pack(_CMD_POS_ERR_FMT, self.err_x, self.err_y,
@@ -694,9 +711,14 @@ class CmdFfCommit:
 
 @dataclass
 class CmdFfMode:
-    """0x22 CMD_FF_MODE(2B)— ff_mode / est_mode の実行時切替(NVS 永続化)。"""
+    """0x22 CMD_FF_MODE(2B)— ff_mode / est_mode の実行時切替(NVS 永続化)。
+
+    est_mode の受理範囲は 0..2(2=EKF2、MAG_AUTOTUNE_DESIGN.md §1.3。
+    NVS `ffcal/est` に 2 を保存可)。切替時の再シード規約は既存と同じ
+    (EKF2 はアクティブ化時、直近のアクティブ推定器ヨーで reseedYaw)。
+    """
     ff_mode: int = 0    # 0=off, 1=A, 2=B
-    est_mode: int = 0   # 0=補正相補フィルタ, 1=EKF
+    est_mode: int = 0   # 0=補正相補フィルタ, 1=EKF, 2=EKF2(ヨー擬似観測付き)
 
     TYPE = MsgType.CMD_FF_MODE
     PAYLOAD_SIZE = 2
@@ -705,6 +727,7 @@ class CmdFfMode:
     FF_MODE_B = 2
     EST_MODE_COMPLEMENTARY = 0
     EST_MODE_EKF = 1
+    EST_MODE_EKF2 = 2
 
     def to_payload(self) -> bytes:
         return struct.pack(_CMD_FF_MODE_FMT, self.ff_mode, self.est_mode)
@@ -742,11 +765,95 @@ class CmdLedMode:
 
 
 @dataclass
+class CmdMagbiasSet:
+    """0x26 CMD_MAGBIAS_SET(13B)— 学習ハードアイアン残差 Δb の適用/クリア。
+
+    Δb [µT, b_cal 空間] を NVS `magbias` へ保存し即適用する(mode=0 でクリア)。
+    **ff_mode は降格しない**(FF 係数は b_cal 空間のまま有効)。適用時:
+    アンカー無効化+窓リセット+補正系再シード(mag3d 変更時と同パターン、
+    ff_mode 降格だけしない)。mag3d 変更時は旧 b_cal 空間で無効になるため
+    機体側で連動クリアされる。WAIT / COMPLETE / MOTOR_TEST 状態でのみ受理
+    (飛行中 NVS 書込み禁止。TLM_ACK 応答)。MAG_AUTOTUNE_DESIGN.md §1.4。
+    """
+    mode: int = 0    # 0=clear, 1=set
+    dx: float = 0.0  # µT(b_cal 空間の Δb x)
+    dy: float = 0.0  # µT(同 y)
+    dz: float = 0.0  # µT(同 z)
+
+    TYPE = MsgType.CMD_MAGBIAS_SET
+    PAYLOAD_SIZE = 13
+    MODE_CLEAR = 0
+    MODE_SET = 1
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_MAGBIAS_SET_FMT, self.mode,
+                           self.dx, self.dy, self.dz)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdMagbiasSet":
+        _check_len("CMD_MAGBIAS_SET", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_MAGBIAS_SET_FMT, data))
+
+
+@dataclass
+class CmdFlowcalSet:
+    """0x27 CMD_FLOWCAL_SET(9B)— フロースケールの適用/クリア。
+
+    kx / ky [counts/rad] を NVS `flowcal` へ保存する(mode=0 でクリア=
+    既定 450.0 に戻る)。WAIT / COMPLETE / MOTOR_TEST 状態でのみ受理
+    (TLM_ACK 応答)。MAG_AUTOTUNE_DESIGN.md §1.4。
+    """
+    mode: int = 0    # 0=clear, 1=set
+    kx: float = 0.0  # counts/rad
+    ky: float = 0.0  # counts/rad
+
+    TYPE = MsgType.CMD_FLOWCAL_SET
+    PAYLOAD_SIZE = 9
+    MODE_CLEAR = 0
+    MODE_SET = 1
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_FLOWCAL_SET_FMT, self.mode, self.kx, self.ky)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFlowcalSet":
+        _check_len("CMD_FLOWCAL_SET", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_FLOWCAL_SET_FMT, data))
+
+
+@dataclass
+class CmdFlowProbe:
+    """0x28 CMD_FLOW_PROBE(1B)— PMW3901 burst プローブ実行。
+
+    モーター停止時のみ(回転中は status=busy で拒否)。結果は LOG_TEXT
+    複数行(agree_ratio 等の要約)で返し、probe 成功で burst_ok ラッチを
+    更新する。n_cycles=0 は既定 200 サイクル。WAIT / COMPLETE / MOTOR_TEST
+    状態でのみ受理(TLM_ACK 応答)。MAG_AUTOTUNE_DESIGN.md §1.4。
+    """
+    n_cycles: int = 0  # プローブサイクル数(0=既定 200)
+
+    TYPE = MsgType.CMD_FLOW_PROBE
+    PAYLOAD_SIZE = 1
+    DEFAULT_CYCLES = 200
+
+    def to_payload(self) -> bytes:
+        return struct.pack(_CMD_FLOW_PROBE_FMT, self.n_cycles)
+
+    @classmethod
+    def from_payload(cls, data: bytes) -> "CmdFlowProbe":
+        _check_len("CMD_FLOW_PROBE", data, cls.PAYLOAD_SIZE)
+        return cls(*struct.unpack(_CMD_FLOW_PROBE_FMT, data))
+
+
+@dataclass
 class TlmState:
-    """0x30 TLM_STATE(135B)— フル状態テレメトリ(25Hz)。
+    """0x30 TLM_STATE(184B)— フル状態テレメトリ(25Hz)。
 
     v2: 末尾追加のみ(既存オフセット 0–96 は v1 と不変。serial_link.py が
     seq_echo を先頭オフセット直読みするため末尾追加限定)。
+    磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.1):
+    オフセット 135 以降を末尾追加して 135B → 184B。長さ検査は厳格のまま
+    (旧 135B フレームは受理しない)。
     """
     seq_echo: int = 0        # 最後に適用した CMD_SETPOINT / CMD_POS_ERR の seq(未受信なら0)
     elapsed_ms: int = 0      # 起動からの経過 [ms]
@@ -787,19 +894,54 @@ class TlmState:
     nis: float = 0.0               # 直近 EKF 更新の NIS
     ffg: int = 0                   # EKF ゲート/健全性ビット(yaw側 ffg 定義踏襲)
     ff_status: int = 0             # FF_STATUS_* ビット
+    # --- 磁気オートチューン/フロー拡張(オフセット 135 以降。契約 §1.1)---
+    mag_cal_x_ut: float = 0.0      # µT(b_cal = mag3d 適用後・FF 補正前、機体系 x)
+    mag_cal_y_ut: float = 0.0      # µT(同 y)
+    mag_cal_z_ut: float = 0.0      # µT(同 z)
+    mag_lev_x_ut: float = 0.0      # µT(FF補正+magbias+EMA後レベル化水平 x = EKF観測 zx)
+    mag_lev_y_ut: float = 0.0      # µT(同 y = zy)
+    ekf2_yaw_rad: float = 0.0      # rad(EKF2 の ψ。シャドー中も常時)
+    ekf2_bm_x_ut: float = 0.0      # µT(EKF2 の b_mx)
+    ekf2_bm_y_ut: float = 0.0      # µT(同 b_my)
+    ekf2_yaw_innov_rad: float = 0.0  # rad(直近ヨー観測イノベーション。未受信時 0)
+    ekf2_status: int = 0           # EKF2_STATUS_* ビット
+    ekf2_gate: int = 0             # EKF2 のゲートビット(ffg と同一ビット定義)
+    flow_vx_mps: float = 0.0       # m/s(フロー機体系 x 速度。無効時 0)
+    flow_vy_mps: float = 0.0       # m/s(同 y)
+    flow_squal: int = 0            # SQUAL 生値
+    flow_status: int = 0           # FLOW_STATUS_* ビット
+    flow_dt_ms: int = 0            # ms(フロー読み実測 dt。0-255 クランプ)
 
     TYPE = MsgType.TLM_STATE
-    PAYLOAD_SIZE = 135
+    PAYLOAD_SIZE = 184
     FLAG_LOW_VOLTAGE = 0x01
     FLAG_SETPOINT_FRESH = 0x02
     FLAG_FLYING = 0x04
     # ff_status ビット定義(v2)
     FF_STATUS_FF_MODE_MASK = 0x03     # bit0-1: ff_mode(0-2)
-    FF_STATUS_EST_EKF = 0x04          # bit2: est_mode(1=EKF)
+    FF_STATUS_EST_EKF = 0x04          # bit2: est_mode==1(EKF)
     FF_STATUS_ANCHOR_VALID = 0x08     # bit3
     FF_STATUS_FFCAL_LOADED = 0x10     # bit4
     FF_STATUS_YAW_CTRL_ACTIVE = 0x20  # bit5
     FF_STATUS_MAG_FRESH = 0x40        # bit6
+    FF_STATUS_EST_EKF2 = 0x80         # bit7: est_mode==2(EKF2。bit2/bit7 とも 0 なら相補CF)
+    # ekf2_status ビット定義(契約 §1.1)
+    EKF2_STATUS_YAW_OBS_FRESH = 0x01      # bit0: ヨー観測受信 <1s
+    EKF2_STATUS_YAW_OBS_FUSED = 0x02      # bit1: 直近 0.5s 内に受理
+    EKF2_STATUS_FLIGHT_ANCHOR_DONE = 0x04 # bit2: 飛行状態再アンカー実施済み
+    EKF2_STATUS_TAU_RW_MODE = 0x08        # bit3: q_bm ランダムウォークモード
+    EKF2_STATUS_BM_FROZEN = 0x10          # bit4
+    EKF2_STATUS_HEALTHY2 = 0x20           # bit5
+    EKF2_STATUS_YAW_OBS_LOW_TRUST = 0x40  # bit6
+    # bit7 予約
+    # flow_status ビット定義(契約 §1.1)
+    FLOW_STATUS_SENSOR_OK = 0x01    # bit0
+    FLOW_STATUS_BURST_OK = 0x02     # bit1
+    FLOW_STATUS_VEL_VALID = 0x04    # bit2
+    FLOW_STATUS_RANGE_VALID = 0x08  # bit3
+    FLOW_STATUS_SQUAL_OK = 0x10     # bit4
+    FLOW_STATUS_INIT_RETRY = 0x20   # bit5
+    # bit6-7 予約
 
     def to_payload(self) -> bytes:
         return struct.pack(
@@ -818,7 +960,15 @@ class TlmState:
             self.db_hat_x_ut, self.db_hat_y_ut,
             self.bm_x_ut, self.bm_y_ut,
             self.nis,
-            self.ffg, self.ff_status)
+            self.ffg, self.ff_status,
+            self.mag_cal_x_ut, self.mag_cal_y_ut, self.mag_cal_z_ut,
+            self.mag_lev_x_ut, self.mag_lev_y_ut,
+            self.ekf2_yaw_rad,
+            self.ekf2_bm_x_ut, self.ekf2_bm_y_ut,
+            self.ekf2_yaw_innov_rad,
+            self.ekf2_status, self.ekf2_gate,
+            self.flow_vx_mps, self.flow_vy_mps,
+            self.flow_squal, self.flow_status, self.flow_dt_ms)
 
     @classmethod
     def from_payload(cls, data: bytes) -> "TlmState":
@@ -850,7 +1000,7 @@ class TlmEvent:
 
 @dataclass
 class TlmAck:
-    """0x32 TLM_ACK(6B)— 0x14–0x23, 0x25 コマンドへの応答。"""
+    """0x32 TLM_ACK(6B)— 0x14–0x23, 0x25–0x28 コマンドへの応答。"""
     acked_type: int = 0   # 応答対象のメッセージ型
     acked_seq: int = 0    # 応答対象フレームの seq
     status: int = 0       # STATUS_*
@@ -930,7 +1080,12 @@ class TlmExp:
 
 @dataclass
 class TlmCalData:
-    """0x34 TLM_CAL_DATA(112B)— CMD_CAL_GET への応答(キャリブ一括データ)。"""
+    """0x34 TLM_CAL_DATA(132B)— CMD_CAL_GET への応答(キャリブ一括データ)。
+
+    磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.5):
+    magbias(Δb [µT])と flowcal(kx, ky [counts/rad])を末尾追加して
+    112B → 132B。valid_flags bit6=magbias 有効、bit7=flowcal 有効。
+    """
     valid_flags: int = 0
     mag3d_offset: tuple = (0.0, 0.0, 0.0)
     mag3d_matrix: tuple = (0.0,) * 9   # 行優先
@@ -944,20 +1099,25 @@ class TlmCalData:
     ff_crc32: int = 0
     ff_mode: int = 0
     est_mode: int = 0
+    magbias: tuple = (0.0, 0.0, 0.0)   # Δb dx, dy, dz [µT, b_cal 空間]
+    flowcal: tuple = (0.0, 0.0)        # kx, ky [counts/rad]
 
     TYPE = MsgType.TLM_CAL_DATA
-    PAYLOAD_SIZE = 112
+    PAYLOAD_SIZE = 132
     VALID_MAG3D = 0x01
     VALID_ACCEL6 = 0x02
     VALID_ATTMOUNT = 0x04
     VALID_YAWZERO = 0x08
     VALID_GEOMAG = 0x10
     VALID_FFCAL = 0x20
+    VALID_MAGBIAS = 0x40   # bit6: magbias 有効(契約 §1.5)
+    VALID_FLOWCAL = 0x80   # bit7: flowcal 有効(同上)
 
     def to_payload(self) -> bytes:
         if (len(self.mag3d_offset) != 3 or len(self.mag3d_matrix) != 9 or
                 len(self.accel6_offset) != 3 or len(self.accel6_scale) != 3 or
-                len(self.geomag) != 5):
+                len(self.geomag) != 5 or len(self.magbias) != 3 or
+                len(self.flowcal) != 2):
             raise ValueError("TLM_CAL_DATA: 配列フィールドの要素数が不正")
         return struct.pack(
             _TLM_CAL_DATA_FMT,
@@ -967,7 +1127,8 @@ class TlmCalData:
             self.attmount_roll_rad, self.attmount_pitch_rad,
             self.yawzero_offset_rad,
             *self.geomag,
-            self.ff_nlut, self.ff_crc32, self.ff_mode, self.est_mode)
+            self.ff_nlut, self.ff_crc32, self.ff_mode, self.est_mode,
+            *self.magbias, *self.flowcal)
 
     @classmethod
     def from_payload(cls, data: bytes) -> "TlmCalData":
@@ -986,7 +1147,9 @@ class TlmCalData:
             ff_nlut=vals[27],
             ff_crc32=vals[28],
             ff_mode=vals[29],
-            est_mode=vals[30])
+            est_mode=vals[30],
+            magbias=tuple(vals[31:34]),
+            flowcal=tuple(vals[34:36]))
 
 
 @dataclass
@@ -1354,6 +1517,9 @@ PAYLOAD_CLASSES = {
     MsgType.CMD_FF_COMMIT: CmdFfCommit,
     MsgType.CMD_FF_MODE: CmdFfMode,
     MsgType.CMD_LED_MODE: CmdLedMode,
+    MsgType.CMD_MAGBIAS_SET: CmdMagbiasSet,
+    MsgType.CMD_FLOWCAL_SET: CmdFlowcalSet,
+    MsgType.CMD_FLOW_PROBE: CmdFlowProbe,
     MsgType.TLM_STATE: TlmState,
     MsgType.TLM_EVENT: TlmEvent,
     MsgType.TLM_ACK: TlmAck,
@@ -1396,6 +1562,9 @@ EXPECTED_PAYLOAD_SIZE: dict[MsgType, Optional[int]] = {
     MsgType.CMD_FF_MODE: CmdFfMode.PAYLOAD_SIZE,
     MsgType.CMD_FF_ANCHOR: 0,
     MsgType.CMD_LED_MODE: CmdLedMode.PAYLOAD_SIZE,
+    MsgType.CMD_MAGBIAS_SET: CmdMagbiasSet.PAYLOAD_SIZE,
+    MsgType.CMD_FLOWCAL_SET: CmdFlowcalSet.PAYLOAD_SIZE,
+    MsgType.CMD_FLOW_PROBE: CmdFlowProbe.PAYLOAD_SIZE,
     MsgType.TLM_STATE: TlmState.PAYLOAD_SIZE,
     MsgType.TLM_EVENT: TlmEvent.PAYLOAD_SIZE,
     MsgType.TLM_ACK: TlmAck.PAYLOAD_SIZE,

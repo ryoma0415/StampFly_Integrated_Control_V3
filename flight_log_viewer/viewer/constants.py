@@ -80,12 +80,31 @@ V5_APPENDED_COLUMNS: tuple[str, ...] = (
 V5_COLUMNS: tuple[str, ...] = V4_COLUMNS + V5_APPENDED_COLUMNS
 assert len(V5_COLUMNS) == 115, f"列数が契約(115列)と不一致: {len(V5_COLUMNS)}"
 
+# v6 で末尾に追加された列(2026-07: 磁気オートチューン/EKF2/フロー。
+# 契約は docs/MAG_AUTOTUNE_DESIGN.md §1.1(TLM_STATE 184B 拡張)+§3
+# (PC 側列)。TLM 由来列は protocol のフィールド名に tlm_ prefix。
+# v5 以前のログでは列が無く、対応する系統・図が自動スキップされる。
+V6_APPENDED_COLUMNS: tuple[str, ...] = (
+    # --- TLM_STATE v6 拡張(契約 §1.1 のワイヤ順)(16) ---
+    "tlm_mag_cal_x_ut", "tlm_mag_cal_y_ut", "tlm_mag_cal_z_ut",
+    "tlm_mag_lev_x_ut", "tlm_mag_lev_y_ut",
+    "tlm_ekf2_yaw_rad", "tlm_ekf2_bm_x_ut", "tlm_ekf2_bm_y_ut",
+    "tlm_ekf2_yaw_innov_rad", "tlm_ekf2_status", "tlm_ekf2_gate",
+    "tlm_flow_vx_mps", "tlm_flow_vy_mps",
+    "tlm_flow_squal", "tlm_flow_status", "tlm_flow_dt_ms",
+    # --- PC 側列(契約 §3: ヨー基準ソース/移動ベースヨー)(5) ---
+    "yaw_ref_source", "yaw_ref_sent_rad", "yaw_ref_valid",
+    "motion_yaw_rad", "motion_yaw_J",
+)
+V6_COLUMNS: tuple[str, ...] = V5_COLUMNS + V6_APPENDED_COLUMNS
+assert len(V6_COLUMNS) == 136, f"列数が契約(136列)と不一致: {len(V6_COLUMNS)}"
+
 # 数値変換しない(文字列のままにする)列
 # (tlm_state_name / tlm_reason_name / xy_cmd_mode は v4 で廃止された列だが、
 #  旧ログ v1〜v3 の読み込み互換のため文字列扱いを維持する)
 TEXT_COLUMNS: frozenset[str] = frozenset(
     {"timestamp", "mode", "phase", "tlm_state_name", "tlm_reason_name",
-     "data_source", "xy_cmd_mode"}
+     "data_source", "xy_cmd_mode", "yaw_ref_source"}
 )
 
 # ログの行レート [Hz](CMD_SETPOINT 送信ごとに1行)
@@ -125,6 +144,7 @@ FF_STATUS_ANCHOR_VALID = 1 << 3   # bit3: アンカー有効
 FF_STATUS_FFCAL_LOADED = 1 << 4   # bit4: FF 係数ロード済み
 FF_STATUS_YAW_CTRL_ACTIVE = 1 << 5  # bit5: ヨー角制御アクティブ
 FF_STATUS_MAG_FRESH = 1 << 6      # bit6: 磁気サンプル新鮮
+FF_STATUS_EST_EKF2 = 1 << 7       # bit7: est_mode==2(EKF2。契約 §1.1)
 
 # ff_status のフラグビット(表示名, ビット位置, 描画色)。ff_mode は別途値表示。
 FF_STATUS_FLAG_BITS: tuple[tuple[str, int, str], ...] = (
@@ -133,6 +153,34 @@ FF_STATUS_FLAG_BITS: tuple[tuple[str, int, str], ...] = (
     ("ffcal_loaded", 4, "#a855f7"),
     ("yaw_ctrl_active", 5, "#f59e0b"),
     ("mag_fresh", 6, "#64748b"),
+    ("est_mode=EKF2", 7, "#9333ea"),
+)
+
+# tlm_ekf2_status(v6・契約 §1.1)のビット
+EKF2_STATUS_YAW_OBS_FRESH = 1 << 0  # ヨー観測受信 <1s
+EKF2_STATUS_YAW_OBS_FUSED = 1 << 1  # 直近 0.5s 内に受理
+
+# tlm_ekf2_status のビット(表示名, 説明, 描画色)を
+# bit0 から順に並べる(bit7 は予約)
+EKF2_STATUS_BITS: tuple[tuple[str, str, str], ...] = (
+    ("yaw_obs_fresh", "ヨー観測受信 <1s", "#22c55e"),
+    ("yaw_obs_fused", "直近 0.5s 内に受理", "#0ea5e9"),
+    ("flight_anchor", "飛行状態再アンカー実施済み", "#a855f7"),
+    ("tau_rw_mode", "q_bm ランダムウォークモード", "#f59e0b"),
+    ("bm_frozen", "b_m 凍結", "#dc2626"),
+    ("healthy2", "EKF2 健全", "#16a34a"),
+    ("low_trust", "ヨー観測低信頼(R_ψ 低信頼プリセット)", "#64748b"),
+)
+
+# tlm_flow_status(v6・契約 §1.1)のビット(表示名, 説明, 描画色)。
+# bit6-7 は予約
+FLOW_STATUS_BITS: tuple[tuple[str, str, str], ...] = (
+    ("sensor_ok", "PMW3901 応答あり", "#22c55e"),
+    ("burst_ok", "burst 読み成立(不成立ならフロー恒久無効)", "#0ea5e9"),
+    ("vel_valid", "速度有効", "#16a34a"),
+    ("range_valid", "レンジ有効", "#a855f7"),
+    ("squal_ok", "SQUAL 良好", "#f59e0b"),
+    ("init_retry", "初期化リトライ中", "#ef4444"),
 )
 
 # ---------------------------------------------------------------------------
@@ -210,6 +258,18 @@ COLORS: dict[str, str] = {
     "latency": "#0284c7",
     "loop_dt": "#d97706",
     "marker": "#16a34a",
+    # v6: EKF2 / 磁気観測 / フロー
+    "yaw_ekf2": "#9333ea",       # EKF2 シャドーヨー(tlm_ekf2_yaw_rad)
+    "ekf2_innov": "#db2777",     # EKF2 ヨー観測イノベーション
+    "mag_cal_x": "#dc2626",      # b_cal 機体系 X
+    "mag_cal_y": "#0d9488",      # 同 Y
+    "mag_cal_z": "#2563eb",      # 同 Z
+    "mag_lev_x": "#d97706",      # レベル化観測 zx
+    "mag_lev_y": "#db2777",      # 同 zy
+    "flow_vx": "#dc2626",        # フロー機体系 X 速度
+    "flow_vy": "#0d9488",        # 同 Y
+    "flow_squal": "#7c3aed",     # SQUAL
+    "flow_dt": "#64748b",        # フロー読み実測 dt
 }
 
 # 複数機同時制御(multi)の機体別カラー(最大4機。M01 共有 XY 図などで
@@ -221,15 +281,17 @@ MULTI_DRONE_COLORS: tuple[str, ...] = (
     "#ca8a04",  # 機体4: 黄(白背景で読める濃色の黄)
 )
 
-# ヨー4系統の (キー名, 列名(rad or deg), 表示名, 色, 単位が deg か)
+# ヨー5系統の (キー名, 列名(rad or deg), 表示名, 色, 単位が deg か)
 # mocap は v5 の mocap_yaw_true_deg(符号/オフセット/フリップ補正済みの
 # 正解ヨー)。旧列 mocap_yaw_deg は Z-up 前提オイラー分解で Motive(Y-up)
 # では機首方位でないことが 2026-07-27 実測で確定したため使わない
 # (v4 以前のログでは mocap 系統は自動的に非表示となり、基準は Madgwick に
-# フォールバックする)。
+# フォールバックする)。ekf2 は v6 の EKF2 シャドー推定
+# (tlm_ekf2_yaw_rad。契約 §1.1)— v5 以前のログでは自動スキップ。
 YAW_SOURCES: tuple[tuple[str, str, str, str, bool], ...] = (
     ("madgwick", "tlm_yaw_rad", "Madgwick", COLORS["yaw_madgwick"], False),
     ("ekf", "tlm_yaw_est_rad", "EKF (アクティブ推定器)", COLORS["yaw_ekf"], False),
+    ("ekf2", "tlm_ekf2_yaw_rad", "EKF2 (シャドー)", COLORS["yaw_ekf2"], False),
     ("gyro_int", "tlm_yaw_gyro_int_rad", "ジャイロ積算", COLORS["yaw_gyro"], False),
     ("mocap", "mocap_yaw_true_deg", "MoCap 正解Yaw", COLORS["yaw_mocap"], True),
 )

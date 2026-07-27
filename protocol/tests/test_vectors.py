@@ -64,6 +64,12 @@ def _build_message(kind: str, fields: dict):
         return sp.CmdFfMode(**fields)
     if kind == "CMD_LED_MODE":
         return sp.CmdLedMode(**fields)
+    if kind == "CMD_MAGBIAS_SET":
+        return sp.CmdMagbiasSet(**fields)
+    if kind == "CMD_FLOWCAL_SET":
+        return sp.CmdFlowcalSet(**fields)
+    if kind == "CMD_FLOW_PROBE":
+        return sp.CmdFlowProbe(**fields)
     if kind == "TLM_STATE":
         return sp.TlmState(**fields)
     if kind == "TLM_EVENT":
@@ -86,7 +92,9 @@ def _build_message(kind: str, fields: dict):
             ff_nlut=fields["ff_nlut"],
             ff_crc32=fields["ff_crc32"],
             ff_mode=fields["ff_mode"],
-            est_mode=fields["est_mode"])
+            est_mode=fields["est_mode"],
+            magbias=tuple(fields["magbias"]),
+            flowcal=tuple(fields["flowcal"]))
     if kind == "TLM_CTRL":
         return sp.TlmCtrl(
             elapsed_ms=fields["elapsed_ms"],
@@ -153,6 +161,10 @@ def test_vector_file_metadata(vectors):
                      "tlm_ack_ff_commit_ok", "tlm_exp_full", "tlm_cal_data_full",
                      "tlm_ctrl_full"):
         assert required in names, required
+    # 磁気オートチューン/フロー拡張(0x26-0x28+CMD_POS_ERR bit4)のベクタ
+    for required in ("cmd_pos_err_low_trust", "cmd_magbias_set",
+                     "cmd_magbias_clear", "cmd_flowcal_set", "cmd_flow_probe"):
+        assert required in names, required
     # マルチ機体拡張(0x55-0x58)のベクタが揃っていること
     for required in ("rly_set_peers_two", "rly_set_peers_clear",
                      "rly_peers_ack_ok",
@@ -216,7 +228,7 @@ def test_tlm_state_field_offsets(vectors):
     vec = next(f for f in vectors["frames"] if f["name"] == "tlm_state_full")
     payload = bytes.fromhex(vec["payload_hex"])
     f = vec["fields"]
-    assert len(payload) == 135
+    assert len(payload) == 184
     assert struct.unpack_from("<I", payload, 0)[0] == f["seq_echo"]
     assert struct.unpack_from("<I", payload, 4)[0] == f["elapsed_ms"]
     assert payload[8] == f["state"]
@@ -239,6 +251,13 @@ def test_tlm_state_field_offsets(vectors):
         113: "db_hat_x_ut", 117: "db_hat_y_ut",
         121: "bm_x_ut", 125: "bm_y_ut",
         129: "nis",
+        # 磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.1)
+        135: "mag_cal_x_ut", 139: "mag_cal_y_ut", 143: "mag_cal_z_ut",
+        147: "mag_lev_x_ut", 151: "mag_lev_y_ut",
+        155: "ekf2_yaw_rad",
+        159: "ekf2_bm_x_ut", 163: "ekf2_bm_y_ut",
+        167: "ekf2_yaw_innov_rad",
+        173: "flow_vx_mps", 177: "flow_vy_mps",
     }
     for off, key in offsets.items():
         got = struct.unpack_from("<f", payload, off)[0]
@@ -247,6 +266,11 @@ def test_tlm_state_field_offsets(vectors):
     assert struct.unpack_from("<H", payload, 95)[0] == f["loop_dt_us"]
     assert payload[133] == f["ffg"]
     assert payload[134] == f["ff_status"]
+    assert payload[171] == f["ekf2_status"]
+    assert payload[172] == f["ekf2_gate"]
+    assert payload[181] == f["flow_squal"]
+    assert payload[182] == f["flow_status"]
+    assert payload[183] == f["flow_dt_ms"]
 
 
 def test_cmd_setpoint_field_offsets(vectors):
@@ -267,13 +291,16 @@ def test_cmd_setpoint_field_offsets(vectors):
 
 
 def test_tlm_cal_data_field_offsets(vectors):
-    """TLM_CAL_DATA(112B)のオフセットが契約どおりであること(v2)。"""
+    """TLM_CAL_DATA(132B)のオフセットが契約どおりであること(v2+磁気オートチューン拡張)。"""
     import struct
     vec = next(f for f in vectors["frames"] if f["name"] == "tlm_cal_data_full")
     payload = bytes.fromhex(vec["payload_hex"])
     f = vec["fields"]
-    assert len(payload) == 112
+    assert len(payload) == 132
     assert payload[0] == f["valid_flags"]
+    # bit6=magbias / bit7=flowcal(MAG_AUTOTUNE_DESIGN.md §1.5)
+    assert f["valid_flags"] & sp.TlmCalData.VALID_MAGBIAS
+    assert f["valid_flags"] & sp.TlmCalData.VALID_FLOWCAL
 
     def f32s(offset: int, count: int) -> tuple:
         return struct.unpack_from(f"<{count}f", payload, offset)
@@ -293,6 +320,8 @@ def test_tlm_cal_data_field_offsets(vectors):
     assert struct.unpack_from("<I", payload, 106)[0] == f["ff_crc32"]
     assert payload[110] == f["ff_mode"]
     assert payload[111] == f["est_mode"]
+    assert f32s(112, 3) == want32(f["magbias"])
+    assert f32s(124, 2) == want32(f["flowcal"])
 
 
 def test_tlm_ctrl_field_offsets(vectors):

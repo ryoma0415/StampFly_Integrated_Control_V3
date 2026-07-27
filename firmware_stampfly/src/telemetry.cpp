@@ -8,6 +8,7 @@
 #include "comm.hpp"
 #include "config.hpp"
 #include "flight_control.hpp"
+#include "flow/flow_hub.hpp"
 #include "imu.hpp"
 #include "sensor.hpp"
 #include "stampfly_protocol.hpp"
@@ -119,11 +120,34 @@ void send_state_frame(void) {
     uint8_t ff_status =
         static_cast<uint8_t>(sensor_state.Ff_mode & stampfly::TlmState::FF_STATUS_FF_MODE_MASK);
     if (sensor_state.Est_mode == 1) ff_status |= stampfly::TlmState::FF_STATUS_EST_EKF;
+    // bit7 = est_mode==2(EKF2)。bit2/bit7 とも 0 なら相補CF
+    // (MAG_AUTOTUNE_DESIGN.md §1.1)
+    if (sensor_state.Est_mode == 2) ff_status |= stampfly::TlmState::FF_STATUS_EST_EKF2;
     if (sensor_state.Ff_anchor_valid) ff_status |= stampfly::TlmState::FF_STATUS_ANCHOR_VALID;
     if (sensor_state.Ff_cal_loaded) ff_status |= stampfly::TlmState::FF_STATUS_FFCAL_LOADED;
     if (fc.output.Yaw_ctrl_active) ff_status |= stampfly::TlmState::FF_STATUS_YAW_CTRL_ACTIVE;
     if (sensor_state.Mag_fresh) ff_status |= stampfly::TlmState::FF_STATUS_MAG_FRESH;
     m.ff_status = ff_status;
+
+    // --- 磁気オートチューン/フロー拡張(オフセット135-183。MAG_AUTOTUNE_DESIGN.md §1.1) ---
+    m.mag_cal_x_ut = sensor_state.Mag_cal_x_ut;          // b_cal(FF補正前)
+    m.mag_cal_y_ut = sensor_state.Mag_cal_y_ut;
+    m.mag_cal_z_ut = sensor_state.Mag_cal_z_ut;
+    m.mag_lev_x_ut = sensor_state.Mag_lev_x_ut;          // レベル化観測 z(=EKF観測)
+    m.mag_lev_y_ut = sensor_state.Mag_lev_y_ut;
+    m.ekf2_yaw_rad = sensor_state.Ekf2_yaw_rad;          // EKF2 ψ(シャドー中も常時)
+    m.ekf2_bm_x_ut = sensor_state.Ekf2_bm_x_ut;          // EKF2 磁気バイアス状態
+    m.ekf2_bm_y_ut = sensor_state.Ekf2_bm_y_ut;
+    m.ekf2_yaw_innov_rad = sensor_state.Ekf2_yaw_innov_rad;  // 直近ヨー観測イノベーション
+    m.ekf2_status = sensor_state.Ekf2_status;            // EKF2_STATUS_* ビット
+    m.ekf2_gate = sensor_state.Ekf2_gate;                // EKF2 ゲート(ffg と同一定義)
+    // flow_*(オフセット173-183): sensor.cpp が flow/ の出力から毎tick転記した
+    // 公開値(契約 §1.1/§2.4。burst 不成立時は vx/vy=0・status に sensor_ok のみ)
+    m.flow_vx_mps = sensor_state.Flow_vx_mps;
+    m.flow_vy_mps = sensor_state.Flow_vy_mps;
+    m.flow_squal = sensor_state.Flow_squal;
+    m.flow_status = sensor_state.Flow_status;
+    m.flow_dt_ms = sensor_state.Flow_dt_ms;
 
     uint8_t payload[stampfly::TlmState::PAYLOAD_SIZE];
     if (!stampfly::serialize(m, payload, sizeof(payload))) return;
@@ -272,6 +296,10 @@ void telemetry_send_cal_data(void) {
     if (ye.yawZeroOffsetValid()) valid |= stampfly::TlmCalData::VALID_YAWZERO;
     if (gm.valid) valid |= stampfly::TlmCalData::VALID_GEOMAG;
     if (ffc.valid()) valid |= stampfly::TlmCalData::VALID_FFCAL;
+    if (g_yaw_est.magbias_valid) valid |= stampfly::TlmCalData::VALID_MAGBIAS;
+    // VALID_FLOWCAL(bit7)= NVS `flowcal` 較正済み(契約 §1.5)
+    const FlowCalibration& fcal = flowHubCalibration();
+    if (fcal.valid) valid |= stampfly::TlmCalData::VALID_FLOWCAL;
     m.valid_flags = valid;
 
     const MagVector m3_off = m3.offset();
@@ -305,6 +333,16 @@ void telemetry_send_cal_data(void) {
     m.ff_crc32 = ffc.crc();
     m.ff_mode = g_yaw_est.ff.ff_mode;
     m.est_mode = g_yaw_est.ff.est_mode;
+
+    // 磁気オートチューン拡張(オフセット112-131。MAG_AUTOTUNE_DESIGN.md §1.5):
+    // magbias Δb [µT, b_cal 空間](無効時は0ベクトルを保証済み)。
+    m.magbias[0] = g_yaw_est.magbias.x;
+    m.magbias[1] = g_yaw_est.magbias.y;
+    m.magbias[2] = g_yaw_est.magbias.z;
+    // flowcal kx/ky [counts/rad]: 適用中の実スケールを送る(未較正時は既定
+    // 450.0 が載り、bit7=0 で「既定値のまま」と読み分けられる。契約 §2.5)
+    m.flowcal[0] = fcal.x_scale;
+    m.flowcal[1] = fcal.y_scale;
 
     uint8_t payload[stampfly::TlmCalData::PAYLOAD_SIZE];
     if (!stampfly::serialize(m, payload, sizeof(payload))) return;

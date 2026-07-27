@@ -1,10 +1,14 @@
-# StampFly Integrated Control — フライトログ形式(v5・115列)
+# StampFly Integrated Control — フライトログ形式(v6・136列)
 
 本書は `pc_server/core/logger.py` が生成する CSV の列構成を定義する。
 列定義の実体は `logger.py` の `COLUMNS` であり、本書と1対1で対応させること。
-flight_log_viewer(`viewer/constants.py` の `V5_COLUMNS` = `V4_COLUMNS` +
-`V5_APPENDED_COLUMNS`)も同一の 115 列契約を正として読み込む
-(旧ログ v1〜v4 との互換は「旧版からの変更履歴」参照)。
+flight_log_viewer も同一の 136 列契約を正として読み込む
+(旧ログ v1〜v5 との互換は「旧版からの変更履歴」参照)。
+
+v6 は v5 の 115 列を**不変のまま**、末尾に磁気オートチューン/フロー拡張
+21 列を追加した(§15-16。MAG_AUTOTUNE_DESIGN.md §1.1 / §3)。
+`*.meta.json` の `log_columns_version` は 6 になり、ログ開始時点の
+ヨー基準ソース(`yaw_ref_source`)も記録する。
 
 v5 は v4 の 109 列を**不変のまま**、末尾に MoCap 正解ヨー/生クォータニオン
 6 列を追加した(§14)。合わせてログファイルと同名の `*.meta.json`
@@ -38,7 +42,7 @@ PROTOCOL.md 0x35)由来の 23 列を追加、全列を論理グループ順に�
 
 ## 書式と書き込み挙動(`logger.py` 実装)
 
-- 列数は 115(1行目がヘッダ)。順序は `COLUMNS` の宣言順(下の列リファレンスの
+- 列数は 136(1行目がヘッダ)。順序は `COLUMNS` の宣言順(下の列リファレンスの
   掲載順と同一)。
 - float は小数 6 桁の固定表記(`FLOAT_DECIMALS = 6`)。bool は `"1"`/`"0"`、
   `None`(未取得)は空文字で出力される。
@@ -72,7 +76,7 @@ PROTOCOL.md 0x35)由来の 23 列を追加、全列を論理グループ順に�
 - 時間系(`*_ms`)はミリ秒。`elapsed_time` は秒(time.monotonic 基準)。
 - 0/1 フラグは文字列 `"0"`/`"1"`。値が未取得の列は空文字。
 
-## 列リファレンス(v5・115列。ファイル上の並び順)
+## 列リファレンス(v6・136列。ファイル上の並び順)
 
 各グループ見出しの「出所」は値の生成元:
 **PC** = pc_server(session / multi の送信・ログ組み立て)、
@@ -240,6 +244,39 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
 | `mocap_qz` | float | - | 同 z。 |
 | `mocap_qw` | float | - | 同 w。**生クォータニオンがあれば任意のマッピングを事後再計算できる**(軸ずれ調査の再発防止)。 |
 
+### 15. 磁気オートチューン/フロー拡張(16列、出所: TLM_STATE。v6 追加)
+
+TLM_STATE 135B→184B 拡張(MAG_AUTOTUNE_DESIGN.md §1.1 / PROTOCOL.md)の
+全フィールド。旧ファーム(135B TLM_STATE)との組み合わせでは受信自体が
+拒否されるため、これらの列は空にならない(v6 ログ = 184B ファーム)。
+
+| 列 | 型 | 単位 | 説明 |
+| --- | --- | --- | --- |
+| `tlm_mag_cal_x_ut`, `tlm_mag_cal_y_ut`, `tlm_mag_cal_z_ut` | float | µT | b_cal(mag3d 適用後・FF 補正**前**)機体系磁場。リプレイ・バッチ較正の入力。 |
+| `tlm_mag_lev_x_ut`, `tlm_mag_lev_y_ut` | float | µT | FF補正+magbias+EMA 後のレベル化水平磁場(= EKF 観測 zx, zy)。 |
+| `tlm_ekf2_yaw_rad` | float | rad | EKF2 の ψ(est_mode≠2 のシャドー実行中も常時)。 |
+| `tlm_ekf2_bm_x_ut`, `tlm_ekf2_bm_y_ut` | float | µT | EKF2 の磁気バイアス状態 b_m。 |
+| `tlm_ekf2_yaw_innov_rad` | float | rad | 直近ヨー観測イノベーション(未受信時 0)。 |
+| `tlm_ekf2_status` | u8 | bit | bit0 yaw_obs_fresh / bit1 yaw_obs_fused / bit2 flight_anchor_done / bit3 tau_rw_mode / bit4 bm_frozen / bit5 healthy2 / bit6 yaw_obs_low_trust。 |
+| `tlm_ekf2_gate` | u8 | bit | EKF2 のゲートビット(`tlm_ffg` と同一ビット定義)。 |
+| `tlm_flow_vx_mps`, `tlm_flow_vy_mps` | float | m/s | フロー機体系速度(無効時 0。ride-along — 制御未接続)。 |
+| `tlm_flow_squal` | u8 | - | PMW3901 SQUAL 生値。 |
+| `tlm_flow_status` | u8 | bit | bit0 sensor_ok / bit1 burst_ok / bit2 vel_valid / bit3 range_valid / bit4 squal_ok / bit5 init_retry。 |
+| `tlm_flow_dt_ms` | u8 | ms | フロー読み実測 dt(0-255 クランプ)。 |
+
+### 16. ヨー基準ソース・移動ベースヨー(5列、出所: PC。v6 追加。Position のみ)
+
+CMD_POS_ERR の `mocap_yaw`(外部ヨー基準)欄の供給状態と、PC 側で常時計算
+している移動ベースヨー(`core/motion_yaw.py`。MAG_AUTOTUNE_DESIGN.md §3.1-2)。
+
+| 列 | 型 | 単位 | 説明 |
+| --- | --- | --- | --- |
+| `yaw_ref_source` | string | - | ヨー基準ソース(`off` / `mocap` / `motion`。行単位 — 飛行中の切替も追える)。 |
+| `yaw_ref_sent_rad` | float | rad | CMD_POS_ERR の `mocap_yaw` 欄に実際に送った値(ワイヤ規約)。bit3=0 のときは 0。 |
+| `yaw_ref_valid` | 0/1 | - | flags bit3(FLAG_MOCAP_YAW_VALID)を立てて送信したか。 |
+| `motion_yaw_rad` | float | rad | 移動ベースヨー推定(ワイヤ規約変換済み — `yaw_ref_sent_rad` と直接比較可能)。ソースが mocap の間も常時記録する(切替前の妥当性検証用)。推定 invalid(励振不足)時は空。 |
+| `motion_yaw_J` | float | (m/s²)²·samples | Fisher情報 Σ\|u_B\|²(8s 窓)。ゲート閾値は `control.json` の `motion_yaw.j_min`。 |
+
 ## TLM_CTRL スナップショットの注意(25Hz)
 
 - TLM_CTRL は 25Hz(400Hz ループの 16 分周、TLM_STATE から 4 tick 位相ずらし)
@@ -279,11 +316,17 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
   - **並び替え**: 追記順を廃し、セッション → 目標/位置 → 送信指令 → 機体実測 →
     機体計算指令 → PID 成分 → 高度 → ヨー推定 → モータ/電源 → 状態 →
     MoCap/軌道 → フィルタ → RB 診断 の論理順にした。
-- **v5(115列、本版)**: 末尾追加のみ — MoCap 正解ヨー・生クォータニオン
+- **v5(115列)**: 末尾追加のみ — MoCap 正解ヨー・生クォータニオン
   6 列(`mocap_yaw_true_deg` / `mocap_flip` / `mocap_qx/qy/qz/qw`、§14)。
   同時にログと同名の `*.meta.json` サイドカー(適用中 MoCap マッピングの
   記録)を導入。v4 の 109 列は順序・意味とも不変のため、旧ツールは先頭
   109 列をそのまま読める。
+- **v6(136列、本版)**: 末尾追加のみ — 磁気オートチューン/フロー拡張
+  21 列(TLM_STATE 184B 拡張の `tlm_*` 16 列 §15+PC 側ヨー基準/
+  移動ベースヨー 5 列 §16。MAG_AUTOTUNE_DESIGN.md §1.1 / §3)。
+  `*.meta.json` の `log_columns_version` は 6、ログ開始時点の
+  `yaw_ref_source` も記録する。v5 の 115 列は順序・意味とも不変のため、
+  旧ツールは先頭 115 列をそのまま読める。
 - **旧ログ互換(flight_log_viewer)**: `viewer/loader.py` は列の過不足を警告のみで
   続行する(必須列は `elapsed_time` のみ)。加えて v4 で廃止された
   `roll_ref_deg` / `pitch_ref_deg` / `cmd_yaw_ref_deg` は「CSV に列があれば

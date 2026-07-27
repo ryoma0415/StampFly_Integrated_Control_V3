@@ -1,11 +1,16 @@
 """ヨー解析(本プロジェクトの主目的)。
 
 - ヨー比較図: tlm_yaw_rad(Madgwick)/ tlm_yaw_est_rad(EKF)/
+  tlm_ekf2_yaw_rad(EKF2 シャドー、v6 ログのみ)/
   mocap_yaw_true_deg(MoCap 正解Yaw、v5 ログのみ)/ ヨー指令
   (ジャイロ積算は図から除外。統計 compute_yaw_stats は全系統で計算し
   レポートに使う。旧 mocap_yaw_deg は軸違いのため全面的に不使用)
 - 対基準誤差の統計(RMS / ドリフト率 [°/min])— レポート・2ログ比較用
 - EKF 診断: NIS・磁気バイアス b_m・FF 補正 db_hat・ffg ゲートタイムライン
+- EKF2 診断(v6): ヨー観測イノベーション・b_m(EKF1 vs EKF2)・
+  ekf2_status / ekf2_gate タイムライン(契約 docs/MAG_AUTOTUNE_DESIGN.md §1.1)
+- 磁気観測(v6): b_cal 3軸・レベル化観測 z の時系列
+- フロー(v6): flow_vx/vy・SQUAL・flow_status タイムライン(ride-along)
 - ヨー指令追従: cmd_yaw_ref vs 機体適用目標 vs 実測
 """
 
@@ -24,9 +29,12 @@ jp_font.setup_japanese_font()
 from .constants import (  # noqa: E402
     BM_FREEZE_THRESHOLD_UT,
     COLORS,
+    EKF2_STATUS_BITS,
+    EKF2_STATUS_YAW_OBS_FUSED,
     FF_STATUS_FF_MODE_MASK,
     FF_STATUS_FLAG_BITS,
     FFG_GATE_BITS,
+    FLOW_STATUS_BITS,
     NIS_EXPECTED,
     NIS_R_INFLATE_THRESHOLD,
     NIS_REJECT_THRESHOLD,
@@ -79,9 +87,11 @@ def compute_yaw_stats(log: FlightLog) -> dict:
 
     返り値のキー:
       reference: 基準系統キー(mocap / madgwick / None)
-      errors: list[YawErrorStat]
+      errors: list[YawErrorStat](ekf2 は v6 ログのみ含まれる)
       tracking_rms_deg / tracking_max_deg: ヨー指令追従誤差(ON 区間)
       nis_mean / nis_p95 / nis_max, bm_max_ut, gate_rates(名前→(回数, %))
+      bm2_max_ut / ekf2_innov_rms_deg / ekf2_innov_max_deg /
+      ekf2_fused_rate / gate2_rates: EKF2 診断(v6 ログのみ有効値)
     """
     df = log.df
     result: dict = {
@@ -94,6 +104,12 @@ def compute_yaw_stats(log: FlightLog) -> dict:
         "nis_max": math.nan,
         "bm_max_ut": math.nan,
         "gate_rates": {},
+        # EKF2 診断(v6)
+        "bm2_max_ut": math.nan,
+        "ekf2_innov_rms_deg": math.nan,
+        "ekf2_innov_max_deg": math.nan,
+        "ekf2_fused_rate": math.nan,
+        "gate2_rates": {},
     }
 
     ref = log.yaw_reference()
@@ -152,6 +168,45 @@ def compute_yaw_stats(log: FlightLog) -> dict:
             rate = 100.0 * count / n_total if n_total else 0.0
             result["gate_rates"][name] = (count, rate)
 
+    # EKF2 診断(v6 のみ。契約 §1.1)
+    if log.has("tlm_ekf2_bm_x_ut") and log.has("tlm_ekf2_bm_y_ut"):
+        bm2_norm = np.hypot(df["tlm_ekf2_bm_x_ut"].to_numpy(dtype=float),
+                            df["tlm_ekf2_bm_y_ut"].to_numpy(dtype=float))
+        if np.isfinite(bm2_norm).any():
+            result["bm2_max_ut"] = float(np.nanmax(bm2_norm))
+    if log.has("tlm_ekf2_yaw_innov_rad"):
+        innov_deg = np.degrees(
+            df["tlm_ekf2_yaw_innov_rad"].to_numpy(dtype=float))
+        # 未受信時は 0 が入る仕様のため、受理区間(status bit1)があれば
+        # そこだけで集計する(無ければ非ゼロ有限値で代用)
+        mask = np.isfinite(innov_deg)
+        if log.has("tlm_ekf2_status"):
+            status = df["tlm_ekf2_status"].to_numpy(dtype=float)
+            fused = np.zeros(len(status), dtype=bool)
+            finite = np.isfinite(status)
+            fused[finite] = (status[finite].astype(int)
+                             & EKF2_STATUS_YAW_OBS_FUSED) != 0
+            if fused.any():
+                mask &= fused
+            n_status = int(finite.sum())
+            if n_status:
+                result["ekf2_fused_rate"] = 100.0 * int(fused.sum()) / n_status
+        else:
+            mask &= innov_deg != 0.0
+        if mask.any():
+            result["ekf2_innov_rms_deg"] = float(
+                np.sqrt(np.mean(innov_deg[mask] ** 2)))
+            result["ekf2_innov_max_deg"] = float(np.max(np.abs(innov_deg[mask])))
+    if log.has("tlm_ekf2_gate"):
+        gate2 = df["tlm_ekf2_gate"].to_numpy(dtype=float)
+        finite = np.isfinite(gate2)
+        n_total = int(finite.sum())
+        gate2_int = gate2[finite].astype(int)
+        for bit, (name, _desc, _color) in enumerate(FFG_GATE_BITS):
+            count = int((((gate2_int >> bit) & 1)).sum())
+            rate = 100.0 * count / n_total if n_total else 0.0
+            result["gate2_rates"][name] = (count, rate)
+
     return result
 
 
@@ -160,17 +215,19 @@ def compute_yaw_stats(log: FlightLog) -> dict:
 # ---------------------------------------------------------------------------
 
 def _fig_yaw_comparison(log: FlightLog, out_dir: Path) -> Path | None:
-    """10: ヨー比較(Madgwick / EKF / MoCap 正解Yaw / 指令)。
+    """10: ヨー比較(Madgwick / EKF / EKF2 / MoCap 正解Yaw / 指令)。
 
     MoCap は v5 の正解Yaw(mocap_yaw_true_deg: 符号/オフセット/フリップ
     補正済み)のみ表示する。旧列 mocap_yaw_deg による「MoCap 真値」は
     軸違いのため 2026-07 に除外し、正解Yaw の導入で復帰した。
+    EKF2(tlm_ekf2_yaw_rad、シャドー実行)は v6 ログのみ表示される。
     ジャイロ積算は表示しない(参考値のため。統計には含む)。
     """
     available = [
         (key, label, color)
         for key, _col, label, color, _deg in YAW_SOURCES
-        if key in ("madgwick", "ekf", "mocap") and log.has(f"yaw_{key}_deg")
+        if key in ("madgwick", "ekf", "ekf2", "mocap")
+        and log.has(f"yaw_{key}_deg")
     ]
     if not available:
         return None
@@ -186,8 +243,8 @@ def _fig_yaw_comparison(log: FlightLog, out_dir: Path) -> Path | None:
         ax.plot(t, unwrap_deg(df["cmd_yaw_ref_deg"].to_numpy(dtype=float)),
                 color=COLORS["yaw_cmd"], linewidth=1.0, linestyle="--", alpha=0.8,
                 label="ヨー指令(PC)")
-    ax.set_title("ヨー比較: Madgwick / EKF / MoCap 正解Yaw / 指令(アンラップ)",
-                 fontsize=14)
+    ax.set_title("ヨー比較: Madgwick / EKF / EKF2 / MoCap 正解Yaw / 指令"
+                 "(アンラップ)", fontsize=14)
     ax.set_ylabel("ヨー角 [deg](連続)", fontsize=10)
     styled_legend(ax, ncol=2)
 
@@ -307,6 +364,188 @@ def _fig_ff_status(log: FlightLog, out_dir: Path) -> Path | None:
     return save_fig(fig, out_dir, "13_ff_status.png")
 
 
+def _bit_raster(ax, t: np.ndarray, values: np.ndarray,
+                bits: tuple[tuple[str, str, str], ...]) -> None:
+    """ビットフィールド時系列をラスタ表示する(帯 = ビットが立っている区間)。
+
+    bits は (表示名, 説明, 描画色) を bit0 から順に並べたタプル
+    (FFG_GATE_BITS / EKF2_STATUS_BITS / FLOW_STATUS_BITS と同形式)。
+    """
+    values_int = np.where(np.isfinite(values), values, 0).astype(int)
+    for bit, (name, _desc, color) in enumerate(bits):
+        active = ((values_int >> bit) & 1).astype(bool)
+        ax.fill_between(t, bit, bit + 0.8, where=active, color=color, step="mid")
+    ax.set_yticks([bit + 0.4 for bit in range(len(bits))])
+    ax.set_yticklabels([b[0] for b in bits], fontsize=8)
+    ax.set_ylim(0, len(bits))
+
+
+def _fig_ekf2_diagnostics(log: FlightLog, out_dir: Path) -> Path | None:
+    """21: EKF2 診断(v6 のみ。契約 §1.1 / §2.1)。
+
+    - ヨー観測イノベーション(未受信時は 0 が入る仕様)
+    - 磁気バイアス b_m: EKF1(破線)vs EKF2(実線)— FF 残差の吸収比較
+    - ekf2_status ビットラスタ(観測鮮度/再アンカー/τモード/凍結/健全性)
+    - ekf2_gate ビットラスタ(ffg と同一ビット定義)
+    """
+    if not (log.has("tlm_ekf2_yaw_rad") or log.has("tlm_ekf2_bm_x_ut")
+            or log.has("tlm_ekf2_status")):
+        return None
+    t = log.t
+    df = log.df
+    fig, axes = new_fig(4, 1, figsize=(13.0, 12.0), sharex=True,
+                        height_ratios=[2.0, 2.0, 1.8, 2.0])
+
+    # ヨー観測イノベーション
+    ax = axes[0]
+    if log.has("tlm_ekf2_yaw_innov_rad"):
+        innov_deg = np.degrees(
+            df["tlm_ekf2_yaw_innov_rad"].to_numpy(dtype=float))
+        ax.plot(t, innov_deg, color=COLORS["ekf2_innov"], linewidth=0.9,
+                label="ヨー観測イノベーション")
+        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+    ax.set_title("EKF2 診断: ヨー観測イノベーション(未受信時 0)", fontsize=13)
+    ax.set_ylabel("イノベーション [deg]", fontsize=10)
+    styled_legend(ax)
+
+    # b_m: EKF1 vs EKF2
+    ax = axes[1]
+    if log.has("tlm_bm_x_ut") and log.has("tlm_bm_y_ut"):
+        ax.plot(t, df["tlm_bm_x_ut"], color=COLORS["bm_x"], linewidth=0.9,
+                linestyle="--", alpha=0.7, label="b_mx (EKF1)")
+        ax.plot(t, df["tlm_bm_y_ut"], color=COLORS["bm_y"], linewidth=0.9,
+                linestyle="--", alpha=0.7, label="b_my (EKF1)")
+    if log.has("tlm_ekf2_bm_x_ut") and log.has("tlm_ekf2_bm_y_ut"):
+        bm2_x = df["tlm_ekf2_bm_x_ut"].to_numpy(dtype=float)
+        bm2_y = df["tlm_ekf2_bm_y_ut"].to_numpy(dtype=float)
+        ax.plot(t, bm2_x, color=COLORS["bm_x"], linewidth=1.2,
+                label="b_mx (EKF2)")
+        ax.plot(t, bm2_y, color=COLORS["bm_y"], linewidth=1.2,
+                label="b_my (EKF2)")
+        ax.plot(t, np.hypot(bm2_x, bm2_y), color=COLORS["bm_norm"],
+                linewidth=1.2, label="‖b_m‖ (EKF2)")
+    ax.axhline(BM_FREEZE_THRESHOLD_UT, ls="--", color="#ef4444", lw=1,
+               label=f"凍結しきい値 {BM_FREEZE_THRESHOLD_UT:.0f}µT")
+    ax.set_ylabel("b_m [µT]", fontsize=10)
+    ax.set_title("磁気バイアス状態 b_m: EKF1(破線)vs EKF2(実線)", fontsize=12)
+    styled_legend(ax, ncol=2)
+
+    # ekf2_status ラスタ
+    ax = axes[2]
+    if log.has("tlm_ekf2_status"):
+        _bit_raster(ax, t, df["tlm_ekf2_status"].to_numpy(dtype=float),
+                    EKF2_STATUS_BITS)
+    ax.set_title("ekf2_status(帯 = そのビットが立っている区間)", fontsize=12)
+
+    # ekf2_gate ラスタ(ffg と同一ビット定義)
+    ax = axes[3]
+    if log.has("tlm_ekf2_gate"):
+        _bit_raster(ax, t, df["tlm_ekf2_gate"].to_numpy(dtype=float),
+                    FFG_GATE_BITS)
+    ax.set_title("ekf2_gate ゲート発火(ffg と同一ビット定義)", fontsize=12)
+    ax.set_xlabel("時間 [s]", fontsize=11)
+    return save_fig(fig, out_dir, "21_ekf2_diagnostics.png")
+
+
+def _fig_mag_observation(log: FlightLog, out_dir: Path) -> Path | None:
+    """22: 磁気観測時系列(v6 のみ。契約 §1.1)。
+
+    - b_cal(mag3d 適用後・FF 補正前、機体系 3軸)+ ノルム
+    - レベル化観測 z(FF補正+magbias+EMA 後の水平 2軸 = EKF 観測)
+    """
+    if not (log.has("tlm_mag_cal_x_ut") or log.has("tlm_mag_lev_x_ut")):
+        return None
+    t = log.t
+    df = log.df
+    fig, axes = new_fig(2, 1, figsize=(13.0, 8.0), sharex=True)
+
+    # b_cal 3軸
+    ax = axes[0]
+    if (log.has("tlm_mag_cal_x_ut") and log.has("tlm_mag_cal_y_ut")
+            and log.has("tlm_mag_cal_z_ut")):
+        cal_x = df["tlm_mag_cal_x_ut"].to_numpy(dtype=float)
+        cal_y = df["tlm_mag_cal_y_ut"].to_numpy(dtype=float)
+        cal_z = df["tlm_mag_cal_z_ut"].to_numpy(dtype=float)
+        ax.plot(t, cal_x, color=COLORS["mag_cal_x"], linewidth=0.9,
+                label="b_cal.x")
+        ax.plot(t, cal_y, color=COLORS["mag_cal_y"], linewidth=0.9,
+                label="b_cal.y")
+        ax.plot(t, cal_z, color=COLORS["mag_cal_z"], linewidth=0.9,
+                label="b_cal.z")
+        ax.plot(t, np.sqrt(cal_x ** 2 + cal_y ** 2 + cal_z ** 2),
+                color="#111111", linewidth=1.1, alpha=0.8, label="‖b_cal‖")
+    ax.set_title("磁気観測: b_cal(mag3d 適用後・FF 補正前、機体系)", fontsize=13)
+    ax.set_ylabel("b_cal [µT]", fontsize=10)
+    styled_legend(ax, ncol=2)
+
+    # レベル化観測 z
+    ax = axes[1]
+    if log.has("tlm_mag_lev_x_ut") and log.has("tlm_mag_lev_y_ut"):
+        lev_x = df["tlm_mag_lev_x_ut"].to_numpy(dtype=float)
+        lev_y = df["tlm_mag_lev_y_ut"].to_numpy(dtype=float)
+        ax.plot(t, lev_x, color=COLORS["mag_lev_x"], linewidth=0.9,
+                label="z_x(レベル化水平X)")
+        ax.plot(t, lev_y, color=COLORS["mag_lev_y"], linewidth=0.9,
+                label="z_y(レベル化水平Y)")
+        ax.plot(t, np.hypot(lev_x, lev_y), color="#111111", linewidth=1.1,
+                alpha=0.8, label="‖z‖(水平ノルム)")
+    ax.set_title("レベル化観測 z(FF補正+magbias+EMA 後 = EKF 観測)", fontsize=12)
+    ax.set_ylabel("z [µT]", fontsize=10)
+    ax.set_xlabel("時間 [s]", fontsize=11)
+    styled_legend(ax, ncol=2)
+    return save_fig(fig, out_dir, "22_mag_observation.png")
+
+
+def _fig_flow(log: FlightLog, out_dir: Path) -> Path | None:
+    """23: オプティカルフロー(v6 のみ・ride-along。契約 §1.1 / §2.4)。
+
+    - flow_vx/vy(機体系速度。無効時は 0 が入る仕様)
+    - SQUAL 生値+読み実測 dt [ms](同一スケール 0-255)
+    - flow_status ビットラスタ(burst_ok=0 ならフロー恒久無効)
+    """
+    if not (log.has("tlm_flow_vx_mps") or log.has("tlm_flow_status")):
+        return None
+    t = log.t
+    df = log.df
+    fig, axes = new_fig(3, 1, figsize=(13.0, 10.0), sharex=True,
+                        height_ratios=[2.0, 1.5, 1.8])
+
+    # 速度
+    ax = axes[0]
+    if log.has("tlm_flow_vx_mps"):
+        ax.plot(t, df["tlm_flow_vx_mps"], color=COLORS["flow_vx"],
+                linewidth=0.9, label="flow_vx(機体系X)")
+    if log.has("tlm_flow_vy_mps"):
+        ax.plot(t, df["tlm_flow_vy_mps"], color=COLORS["flow_vy"],
+                linewidth=0.9, label="flow_vy(機体系Y)")
+    ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+    ax.set_title("オプティカルフロー(ride-along: 制御・EKF 観測には未接続)",
+                 fontsize=13)
+    ax.set_ylabel("速度 [m/s]", fontsize=10)
+    styled_legend(ax)
+
+    # SQUAL / dt
+    ax = axes[1]
+    if log.has("tlm_flow_squal"):
+        ax.plot(t, df["tlm_flow_squal"], color=COLORS["flow_squal"],
+                linewidth=0.9, label="SQUAL 生値")
+    if log.has("tlm_flow_dt_ms"):
+        ax.plot(t, df["tlm_flow_dt_ms"], color=COLORS["flow_dt"],
+                linewidth=0.9, alpha=0.8, label="読み実測 dt [ms]")
+    ax.set_ylabel("SQUAL / dt [ms]", fontsize=10)
+    ax.set_ylim(bottom=0)
+    styled_legend(ax)
+
+    # flow_status ラスタ
+    ax = axes[2]
+    if log.has("tlm_flow_status"):
+        _bit_raster(ax, t, df["tlm_flow_status"].to_numpy(dtype=float),
+                    FLOW_STATUS_BITS)
+    ax.set_title("flow_status(帯 = そのビットが立っている区間)", fontsize=12)
+    ax.set_xlabel("時間 [s]", fontsize=11)
+    return save_fig(fig, out_dir, "23_flow.png")
+
+
 def _fig_yaw_tracking(log: FlightLog, out_dir: Path, stats: dict) -> Path | None:
     """14: ヨー指令追従(PC 指令 / 機体適用目標 / 実測 / 追従誤差)。"""
     if not (log.has("cmd_yaw_ref_deg") or log.has("tlm_yaw_ref_deg")):
@@ -367,6 +606,9 @@ def generate_yaw_figures(log: FlightLog, out_dir: str | Path,
         _fig_ekf_diagnostics(log, out_dir),
         _fig_ff_status(log, out_dir),
         _fig_yaw_tracking(log, out_dir, stats),
+        _fig_ekf2_diagnostics(log, out_dir),
+        _fig_mag_observation(log, out_dir),
+        _fig_flow(log, out_dir),
     ):
         if path is not None:
             saved.append(path)

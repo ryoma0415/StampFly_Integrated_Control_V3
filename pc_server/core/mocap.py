@@ -303,6 +303,16 @@ class AttitudeMapper:
         """設定ファイル形式(control.json "attitude_transform")の記述を返す。"""
         return dict(self._config)
 
+    @property
+    def yaw_sign(self) -> float:
+        """yaw_true = yaw_sign*heading + offset の符号(±1)。"""
+        return self._yaw_sign
+
+    @property
+    def yaw_offset_rad(self) -> float:
+        """yaw_true = yaw_sign*heading + offset のオフセット [rad]。"""
+        return self._yaw_offset_rad
+
     @staticmethod
     def new_state() -> dict:
         """リジッドボディ1体ぶんのフリップ判定状態を生成する。"""
@@ -809,6 +819,18 @@ class MocapSource:
         符号反転して送る)/ None = 未対応マッピング(位置制御飛行不可)。
         """
         return self._mapping[0].machine_wire_y_sign
+
+    @property
+    def attitude_yaw_convention(self) -> tuple[float, float]:
+        """適用中の姿勢マッピングの (yaw_sign, yaw_offset_rad)。
+
+        移動ベースヨー(PoC 規約 ψ̂ ≈ -yaw_true)をワイヤ規約へ変換する
+        session 層が使う: heading 相当 = yaw_sign*(yaw_true - offset)
+        (yaw_true = yaw_sign*heading + offset の逆写像)。
+        タプル読みはアトミック(set_mapping と競合しても新旧いずれか一貫)。
+        """
+        mapper = self._mapping[1]
+        return mapper.yaw_sign, mapper.yaw_offset_rad
 
     @property
     def mapping_generation(self) -> int:

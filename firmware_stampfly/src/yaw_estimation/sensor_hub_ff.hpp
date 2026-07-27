@@ -31,14 +31,19 @@
 #include "mag_calibration.hpp"
 #include "yaw_estimator.hpp"
 #include "yaw_estimator_kf.hpp"
+#include "yaw_estimator_kf2.hpp"
 
 // 1tick分の磁気フレーム(本モジュールが唯一のライター)
 struct YawFfMagFrame {
     MagVector mag_raw_body;            // RHALL補償+軸変換後・mag3D前 [µT]
     MagVector mag_cal_body;            // mag3D適用直後の b_cal(アンカー窓・FF補正の入力)
     MagVector mag_filtered_body;       // 非補正系EMA出力(リファレンスCF入力)
-    MagVector mag_corr_filtered_body;  // b_corr = b_cal − ΔB̂ の補正系EMA出力
+    MagVector mag_corr_filtered_body;  // b_corr = b_cal − ΔB̂ − Δb_magbias の補正系EMA出力
     float yaw_mag_level_rad = 0.0f;    // 非補正EMA磁場の水平ヨー [rad]
+    // 補正系EMAのレベル化水平成分(=EKF観測 zx/zy。fresh 磁気 tick でその時の
+    // 姿勢で更新。TLM_STATE mag_lev_x/y_ut。MAG_AUTOTUNE_DESIGN.md §1.1/§2.2)
+    float mag_lev_x_ut = 0.0f;
+    float mag_lev_y_ut = 0.0f;
     float mag_dt_s = 0.0f;             // fresh サンプル間隔 [s](今tickが fresh のときのみ有効)
     bool mag_sample_fresh = false;     // 今tickで fresh な磁気サンプルを得たか
     uint32_t last_mag_fresh_ms = 0;    // 直近 fresh サンプル時刻 [ms](鮮度判定用)
@@ -48,7 +53,7 @@ struct YawFfMagFrame {
 // 本モジュールが毎tick更新し、telemetry/command(次ステージ)が読む。
 struct FfState {
     uint8_t ff_mode = 0;   // 0=補正off, 1=方式A, 2=方式B (NVS永続)
-    uint8_t est_mode = 0;  // 0=相補フィルタ, 1=EKF (NVS永続)
+    uint8_t est_mode = 0;  // 0=相補フィルタ, 1=EKF, 2=EKF2 (NVS永続)
 
     // アイドルアンカー: モーター始動遷移で凍結される基準
     bool anchor_valid = false;
@@ -78,6 +83,9 @@ struct SensorHubFfInputs {
     bool in_flight = false;           // 飛行状態(TAKEOFF/HOVER/LANDING)。true の間は
                                       // ブロッキングし得る BMM150 再初期化リトライを
                                       // 保留する(400Hzループの 2.5ms 予算保護)
+    // EKF2 飛行状態再アンカー(MAG_AUTOTUNE_DESIGN.md §2.1-3)の条件判定用
+    float alt_est_m = 0.0f;           // 高度推定 Altitude2 [m]
+    float alt_ref_m = 0.0f;           // 適用中の目標高度 Alt_ref [m]
     bool motors_running = false;      // PWM実出力あり(ランプダウン中も true にすること)
     float duty[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // 実効duty。順序は FL,FR,RL,RR(FF係数の順)
     uint8_t motor_mask = 0x0F;        // bit0=FL,1=FR,2=RL,3=RR
@@ -94,8 +102,15 @@ struct YawEstimationState {
     YawEstimator yaw_estimator;         // リファレンスCF(非補正mag、既存挙動不変)
     YawEstimator yaw_estimator_corr;    // 補正CF(アンカー/モード切替で再シード)
     YawEstimatorKf yaw_kf;              // 4状態EKF(補正mag)
+    YawEstimatorKf2 yaw_kf2;            // EKF2(ヨー擬似観測付き。常時シャドー実行。
+                                        // MAG_AUTOTUNE_DESIGN.md §2.2)
     FfCalibration ff_calibration;
     FfState ff;
+    // 学習ハードアイアン残差 Δb(NVS "magbias"。b_cal 空間 [µT]。補正系のみに
+    // 適用: b_corr = b_cal − ΔB̂ − Δb_magbias。無効時は0ベクトルを保証する。
+    // MAG_AUTOTUNE_DESIGN.md §2.2/§2.5)
+    bool magbias_valid = false;
+    MagVector magbias;
     YawFfMagFrame frame;
     CurrentSample current_sample;       // 直近の 20Hz 電流/電圧サンプル
     bool current_slot_fired = false;    // 今tickで 20Hz 電流スロットが発火したか
@@ -122,8 +137,9 @@ struct YawEstimationState {
 extern YawEstimationState g_yaw_est;
 
 // 初期化: BMM150 / INA3221 を(begin済みの)I2Cバス上で初期化し、NVSから
-// mag3d → accel6 → attmount → geomag → yawzero → ffcal の順で復元する
-// (V2契約 §2.5 のブート復元順)。ベースの sensor_init() から呼ぶ。
+// mag3d → accel6 → attmount → geomag → yawzero → ffcal → magbias の順で
+// 復元する(MAG_AUTOTUNE_DESIGN.md §2.5 のブートロード順。flowcal はフロー
+// 移植 §2.4 側が追加する)。ベースの sensor_init() から呼ぶ。
 void sensorHubFfInit(TwoWire& wire);
 
 // 400Hz tick: ベース sensor.cpp の Yaw_rate 確定後に毎tick呼ぶ。
@@ -153,5 +169,28 @@ bool sensorHubFfEkfHealthy();
 // fresh 磁気サンプルの鮮度(ff_status bit6 用): 直近 fresh から
 // YAW_MAG_FRESH_TIMEOUT_MS 以内なら true。
 bool sensorHubFfMagFresh(uint32_t now_ms);
+
+// ---- EKF2 / magbias(MAG_AUTOTUNE_DESIGN.md §2.1-§2.3, §2.5) ----
+
+// 外部ヨー基準(CMD_POS_ERR bit3 有効時の mocap_yaw)を1件ステージする。
+// flight_control の apply_pos_err が受信 tick に呼び、次の sensorHubFfUpdate が
+// consume-once で取り出し、age < FF_EKF2_YAW_OBS_MAX_AGE_MS のときのみ
+// EKF2 のヨー擬似観測(updateYawObs)へ回す(契約 §2.1-1 / §2.3)。
+// low_trust は flags bit4(FLAG_YAW_REF_LOW_TRUST)。rx_ms は受信時刻 millis()。
+void sensorHubFfStageYawObs(float psi_meas_rad, bool low_trust, uint32_t rx_ms);
+
+// magbias の適用/クリア(CMD_MAGBIAS_SET。契約 §1.4): Δb を即適用し、
+// mag3d 変更時と同パターンでアンカー無効化+窓リセット+補正系再シードを行う。
+// **ff_mode は降格しない**(FF 係数は b_cal 空間のまま有効)。NVS 保存
+// (saveMagbias)は呼び出し側の責務。
+void sensorHubFfApplyMagbias(bool valid, const MagVector& delta_b_ut);
+
+// EKF2 が角度制御のヨーソースとして健全か(healthy2。契約 §2.2):
+// 判定は sensorHubFfEkfHealthy() と同等(FF有効 ∧ アンカー有効 ∧ 非凍結)。
+// yaw_obs 鮮度は含めない(MoCap 途絶でヨー角制御を落とさない — コースト)。
+bool sensorHubFfEkf2Healthy();
+
+// TLM_STATE ekf2_status バイトの合成(契約 §1.1 のビット定義)。
+uint8_t sensorHubFfEkf2Status(uint32_t now_ms);
 
 #endif

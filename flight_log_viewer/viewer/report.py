@@ -2,7 +2,8 @@
 
 - 単一ログ: 飛行時間・位置 RMS 誤差・ヨー RMS/最大誤差・ドリフト率・電圧推移
   などの統計をテキストと HTML(図の index)で出力する。
-- 比較モード: 2 本のログのヨー安定性(RMS / ドリフト率 / NIS / ゲート発火)を
+- 比較モード: 2 本のログのヨー安定性(RMS / ドリフト率 / NIS / ゲート発火)と
+  位置保持XY統計(RMS X/Y/2D・最大2D)を
   並べて比較する HTML と重ね描き図を出力する。
 """
 
@@ -38,7 +39,7 @@ _FIGURE_CAPTIONS: dict[str, str] = {
     "07_power.png": "電源(電圧 / 電流)",
     "08_latency_loop_dt.png": "通信レイテンシ / 制御周期",
     "09_mocap_diagnostics.png": "MoCap 診断",
-    "10_yaw_comparison.png": "ヨー比較(Madgwick / EKF / 指令)",
+    "10_yaw_comparison.png": "ヨー比較(Madgwick / EKF / EKF2(v6 のみ) / 指令)",
     "12_ekf_diagnostics.png": "EKF 診断(NIS / b_m / db̂ / ゲート)",
     "13_ff_status.png": "ff_status タイムライン",
     "14_yaw_tracking.png": "ヨー指令追従",
@@ -48,6 +49,10 @@ _FIGURE_CAPTIONS: dict[str, str] = {
     "18_pid_ang_components.png": "角度ループ PID 成分(P+I+D=指令角速度)",
     "19_pid_rate_components.png": "角速度ループ PID 成分",
     "20_rate_tracking.png": "角速度追従(指令 vs 実測)",
+    "21_ekf2_diagnostics.png": "EKF2 診断(イノベーション / b_m 比較 / "
+                               "status / gate。v6 のみ)",
+    "22_mag_observation.png": "磁気観測(b_cal / レベル化観測 z。v6 のみ)",
+    "23_flow.png": "オプティカルフロー(vx/vy / SQUAL / status。v6 のみ)",
     "M01_multi_xy.png": "複数機 XY 軌跡(共有)",
 }
 
@@ -62,6 +67,36 @@ def _fmt(value: float, digits: int = 2, unit: str = "") -> str:
 # ---------------------------------------------------------------------------
 # サマリ統計
 # ---------------------------------------------------------------------------
+
+def compute_position_stats(log: FlightLog) -> dict:
+    """位置保持(XY)統計を計算する(単一レポート・2ログ比較で共用)。
+
+    error_x/error_y = 目標 − フィルタ済み実位置(制御座標系, m)を、
+    閉ループ制御中(control_active=1)の行だけで集計する。
+    離陸直後の過渡も含まれる点に注意(区間は START〜制御停止)。
+    """
+    df = log.df
+    stats = {
+        "pos_rms_x_m": math.nan,
+        "pos_rms_y_m": math.nan,
+        "pos_rms_2d_m": math.nan,
+        "pos_max_2d_m": math.nan,
+    }
+    if log.has("error_x") and log.has("error_y"):
+        ex = df["error_x"].to_numpy(dtype=float)
+        ey = df["error_y"].to_numpy(dtype=float)
+        mask = np.isfinite(ex) & np.isfinite(ey)
+        if log.has("control_active"):
+            active = df["control_active"].to_numpy(dtype=float)
+            mask &= np.isfinite(active) & (active > 0)
+        if mask.any():
+            stats["pos_rms_x_m"] = float(np.sqrt(np.mean(ex[mask] ** 2)))
+            stats["pos_rms_y_m"] = float(np.sqrt(np.mean(ey[mask] ** 2)))
+            e2d = np.hypot(ex[mask], ey[mask])
+            stats["pos_rms_2d_m"] = float(np.sqrt(np.mean(e2d ** 2)))
+            stats["pos_max_2d_m"] = float(np.max(e2d))
+    return stats
+
 
 def compute_summary(log: FlightLog) -> dict:
     """レポートに載せる統計一式を計算して辞書で返す。"""
@@ -92,20 +127,8 @@ def compute_summary(log: FlightLog) -> dict:
         "loop_dt_max_us": math.nan,
     }
 
-    # 位置 RMS(閉ループ制御中の行のみ)
-    if log.has("error_x") and log.has("error_y"):
-        ex = df["error_x"].to_numpy(dtype=float)
-        ey = df["error_y"].to_numpy(dtype=float)
-        mask = np.isfinite(ex) & np.isfinite(ey)
-        if log.has("control_active"):
-            active = df["control_active"].to_numpy(dtype=float)
-            mask &= np.isfinite(active) & (active > 0)
-        if mask.any():
-            summary["pos_rms_x_m"] = float(np.sqrt(np.mean(ex[mask] ** 2)))
-            summary["pos_rms_y_m"] = float(np.sqrt(np.mean(ey[mask] ** 2)))
-            e2d = np.hypot(ex[mask], ey[mask])
-            summary["pos_rms_2d_m"] = float(np.sqrt(np.mean(e2d ** 2)))
-            summary["pos_max_2d_m"] = float(np.max(e2d))
+    # 位置 RMS(閉ループ制御中の行のみ。compute_position_stats と共用)
+    summary.update(compute_position_stats(log))
 
     # 電圧推移
     if log.has("tlm_voltage_v"):
@@ -196,6 +219,21 @@ def _summary_lines(summary: dict) -> list[str]:
                      f" {_fmt(yaw['nis_p95'])} / {_fmt(yaw['nis_max'])}")
         lines.append(f"  ‖b_m‖ 最大            : {_fmt(yaw['bm_max_ut'], 2, ' µT')}")
         for name, (count, rate) in yaw.get("gate_rates", {}).items():
+            if count > 0:
+                lines.append(f"  ゲート {name:<12}: {count} 行 ({rate:.1f}%)")
+        lines.append("")
+
+    # EKF2 健全性(v6 ログのみ有効値。契約 docs/MAG_AUTOTUNE_DESIGN.md §1.1)
+    if (math.isfinite(yaw.get("bm2_max_ut", math.nan))
+            or math.isfinite(yaw.get("ekf2_innov_rms_deg", math.nan))):
+        lines.append("【EKF2 健全性(v6・シャドー)】")
+        lines.append(f"  ‖b_m‖ 最大            : {_fmt(yaw['bm2_max_ut'], 2, ' µT')}")
+        lines.append(f"  ヨー観測イノベーション RMS / 最大 :"
+                     f" {_fmt(yaw['ekf2_innov_rms_deg'], 2, '°')} /"
+                     f" {_fmt(yaw['ekf2_innov_max_deg'], 2, '°')}")
+        lines.append(f"  ヨー観測受理率        :"
+                     f" {_fmt(yaw['ekf2_fused_rate'], 1, ' %')}")
+        for name, (count, rate) in yaw.get("gate2_rates", {}).items():
             if count > 0:
                 lines.append(f"  ゲート {name:<12}: {count} 行 ({rate:.1f}%)")
         lines.append("")
@@ -327,6 +365,32 @@ def _stats_table_html(summary: dict) -> str:
         else:
             parts.append("<p>ゲート発火なし(全区間で磁気更新が正常採用)。</p>")
 
+    # EKF2 健全性(v6 ログのみ有効値)
+    if (math.isfinite(yaw.get("bm2_max_ut", math.nan))
+            or math.isfinite(yaw.get("ekf2_innov_rms_deg", math.nan))):
+        parts.append("<h2>EKF2 健全性(v6・シャドー)</h2><table>")
+        parts.append(
+            f"<tr><th>‖b_m‖ 最大</th><td class='num'>"
+            f"{_fmt(yaw['bm2_max_ut'], 2, ' µT')}</td></tr>")
+        parts.append(
+            f"<tr><th>ヨー観測イノベーション RMS / 最大</th><td class='num'>"
+            f"{_fmt(yaw['ekf2_innov_rms_deg'], 2, '°')} / "
+            f"{_fmt(yaw['ekf2_innov_max_deg'], 2, '°')}</td></tr>")
+        parts.append(
+            f"<tr><th>ヨー観測受理率</th><td class='num'>"
+            f"{_fmt(yaw['ekf2_fused_rate'], 1, ' %')}</td></tr>")
+        parts.append("</table>")
+        fired2 = {k: v for k, v in yaw.get("gate2_rates", {}).items()
+                  if v[0] > 0}
+        if fired2:
+            parts.append("<table><tr><th>EKF2 ゲート</th><th>行数</th>"
+                         "<th>割合</th></tr>")
+            for name, (count, rate) in fired2.items():
+                parts.append(f"<tr><td>{html.escape(name)}</td>"
+                             f"<td class='num'>{count}</td>"
+                             f"<td class='num'>{rate:.1f}%</td></tr>")
+            parts.append("</table>")
+
     return "\n".join(parts)
 
 
@@ -457,19 +521,28 @@ def generate_multi_report(logs: list[FlightLog], out_dir: str | Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def _fig_compare_yaw(log_a: FlightLog, log_b: FlightLog, out_dir: Path) -> Path | None:
-    """比較図: 両ログのヨー誤差を重ね描き(A=実線 / B=破線)。"""
-    keys = ("madgwick", "ekf", "gyro_int")
+    """比較図: 両ログのヨー誤差を重ね描き(A=細実線 / B=太破線)。
+
+    実線と破線が重なると区別しづらいため、B は太線+高不透明度+
+    短めのダッシュで強調し、A は細実線・低不透明度で下に敷く
+    (描画順も A → B とし、B が上に乗る)。
+    """
+    keys = ("madgwick", "ekf", "ekf2", "gyro_int")
     has_any = False
     fig, ax = new_fig(figsize=(13.0, 6.0))
-    for log, suffix, linestyle in ((log_a, "A", "-"), (log_b, "B", "--")):
+    styles = (
+        (log_a, "A", {"linestyle": "-", "linewidth": 0.9, "alpha": 0.55}),
+        (log_b, "B", {"linestyle": (0, (4, 1.5)), "linewidth": 1.8,
+                      "alpha": 0.95}),
+    )
+    for log, suffix, style in styles:
         for key in keys:
             col = f"yaw_err_{key}_deg"
             if col not in log.df.columns or not log.df[col].notna().any():
                 continue
             label_name, color = _SOURCE_INFO[key]
-            ax.plot(log.t, log.df[col], color=color, linewidth=0.9,
-                    linestyle=linestyle, alpha=0.85,
-                    label=f"[{suffix}] {label_name}")
+            ax.plot(log.t, log.df[col], color=color,
+                    label=f"[{suffix}] {label_name}", **style)
             has_any = True
     if not has_any:
         import matplotlib.pyplot as plt  # noqa: PLC0415
@@ -485,7 +558,7 @@ def _fig_compare_yaw(log_a: FlightLog, log_b: FlightLog, out_dir: Path) -> Path 
 
 def generate_comparison(log_a: FlightLog, log_b: FlightLog,
                         out_dir: str | Path) -> Path:
-    """2 ログのヨー安定性比較レポート(comparison.html)を生成する。"""
+    """2 ログの比較レポート(ヨー安定性+位置保持XY。comparison.html)を生成する。"""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n比較レポートを生成します: A={log_a.name} / B={log_b.name}")
@@ -498,7 +571,8 @@ def generate_comparison(log_a: FlightLog, log_b: FlightLog,
         return {s.key: s for s in stats["errors"]}
 
     map_a, map_b = _stat_map(stats_a), _stat_map(stats_b)
-    keys = [k for k in ("madgwick", "ekf", "gyro_int") if k in map_a or k in map_b]
+    keys = [k for k in ("madgwick", "ekf", "ekf2", "gyro_int")
+            if k in map_a or k in map_b]
 
     body: list[str] = []
     body.append("<h1>ヨー安定性比較レポート</h1>")
@@ -538,14 +612,53 @@ def generate_comparison(log_a: FlightLog, log_b: FlightLog,
         body.append("<tr>" + "".join(cells) + "</tr>")
     body.append("</table>")
 
-    body.append("<h2>EKF 健全性</h2><table>")
-    body.append("<tr><th>指標</th><th>A</th><th>B</th></tr>")
-    for label, key, digits, unit in (
+    # 位置保持(XY)統計 — ヨー制御あり/なしの位置保持品質比較用。
+    # どちらのログにも位置データが無い(Posture 等)場合は表を出さない
+    pos_a = compute_position_stats(log_a)
+    pos_b = compute_position_stats(log_b)
+    if any(math.isfinite(v) for v in (*pos_a.values(), *pos_b.values())):
+        body.append("<h2>位置保持(XY)統計</h2><table>")
+        body.append("<tr><th>指標</th><th>A</th><th>B</th></tr>")
+        body.append(
+            f"<tr><td>飛行時間 [s]</td>"
+            f"<td class='num'>{_fmt(log_a.flight_time_s(), 1)}</td>"
+            f"<td class='num'>{_fmt(log_b.flight_time_s(), 1)}</td></tr>")
+        for label, key in (
+            ("RMS 誤差 X [m]", "pos_rms_x_m"),
+            ("RMS 誤差 Y [m]", "pos_rms_y_m"),
+            ("RMS 誤差 2D [m]", "pos_rms_2d_m"),
+            ("最大 2D [m]", "pos_max_2d_m"),
+        ):
+            body.append(
+                f"<tr><td>{html.escape(label)}</td>"
+                f"<td class='num'>{_fmt(pos_a[key], 3)}</td>"
+                f"<td class='num'>{_fmt(pos_b[key], 3)}</td></tr>")
+        body.append("</table>")
+        body.append("<p class='meta'>位置統計は閉ループ制御中の全行"
+                    "(離陸過渡を含む)。誤差 = 目標 − フィルタ済み実位置。"
+                    "飛行時間・目標・ヨー以外の操作を揃えた飛行同士で"
+                    "比較すること。</p>")
+
+    # EKF2 行(bm2 等)は少なくとも一方のログが v6 のときのみ載せる
+    has_ekf2 = any(
+        math.isfinite(s.get("bm2_max_ut", math.nan))
+        or math.isfinite(s.get("ekf2_innov_rms_deg", math.nan))
+        for s in (stats_a, stats_b))
+    ekf_rows: list[tuple[str, str, int, str]] = [
         ("NIS 平均", "nis_mean", 2, ""),
         ("NIS p95", "nis_p95", 2, ""),
         ("‖b_m‖ 最大", "bm_max_ut", 2, " µT"),
         ("ヨー追従 RMS", "tracking_rms_deg", 2, "°"),
-    ):
+    ]
+    if has_ekf2:
+        ekf_rows += [
+            ("‖b_m‖ 最大(EKF2)", "bm2_max_ut", 2, " µT"),
+            ("EKF2 イノベーション RMS", "ekf2_innov_rms_deg", 2, "°"),
+            ("EKF2 ヨー観測受理率", "ekf2_fused_rate", 1, " %"),
+        ]
+    body.append("<h2>EKF 健全性</h2><table>")
+    body.append("<tr><th>指標</th><th>A</th><th>B</th></tr>")
+    for label, key, digits, unit in ekf_rows:
         body.append(
             f"<tr><td>{html.escape(label)}</td>"
             f"<td class='num'>{_fmt(stats_a.get(key, math.nan), digits, unit)}</td>"

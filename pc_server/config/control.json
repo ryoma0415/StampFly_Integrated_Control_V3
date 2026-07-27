@@ -47,6 +47,14 @@
     "y": 0.0,
     "z": 0.3
   },
+  "motion_yaw": {
+    "lpf_cutoff_hz": 2.0,
+    "hp_window_s": 2.0,
+    "window_s": 8.0,
+    "delay_s": 0.09,
+    "j_min": 9.0,
+    "warmup_s": 0.5
+  },
   "trajectory": {
     "radius_min_m": 0.05,
     "radius_max_m": 1.5,

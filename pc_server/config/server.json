@@ -77,5 +77,8 @@
   },
   "logging": {
     "flush_every_rows": 50
+  },
+  "yaw_ref": {
+    "source": "mocap"
   }
 }

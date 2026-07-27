@@ -417,6 +417,7 @@
             <select id="ffEstSelect" title="ヨー推定器">
               <option value="0">相補フィルタ</option>
               <option value="1" selected>EKF</option>
+              <option value="2">EKF2(ヨー擬似観測)</option>
             </select>
             <button id="btnFfApply" class="btn btn-small btn-primary">適用</button>
             <button id="btnFfMode" class="btn btn-small">モードのみ変更</button>
@@ -424,6 +425,37 @@
           </div>
           <div class="ff-banner" id="ffAppliedExp">FF: 未適用</div>
           <div class="exp-msg" id="ffApplyMsg">--</div>
+        </div>
+
+        <div class="exp-card">
+          <h3>磁気オートチューン(EKF2)</h3>
+          <div class="ff-quick-row">
+            <span class="mlabel">ヨー基準</span>
+            <select id="yawRefSelect" title="CMD_POS_ERR の外部ヨー基準ソース(飛行中も切替可)">
+              <option value="off">off(コースト)</option>
+              <option value="mocap" selected>MoCap 実測ヨー</option>
+              <option value="motion">移動ベースヨー(低信頼)</option>
+            </select>
+            <span class="mono" id="yawRefMotionInfo">motion: --</span>
+          </div>
+          <div class="kv-list mono">
+            <span>EKF2 &psi; / innov</span><span id="ekf2YawInfo">--</span>
+            <span>EKF2 b_m [&micro;T]</span><span id="ekf2BmInfo">--</span>
+            <span>EKF2 status / gate</span><span id="ekf2StatusInfo">--</span>
+          </div>
+          <hr class="exp-sep">
+          <div class="ff-quick-row">
+            <span class="mlabel">抽出元ログ</span>
+            <select id="magbiasLogSelect"></select>
+            <button id="btnMagbiasExtract" class="btn btn-small">抽出実行</button>
+          </div>
+          <div class="ff-quick-row">
+            <select id="magbiasSelect"></select>
+            <button id="btnMagbiasApply" class="btn btn-small btn-primary">適用(NVS書込)</button>
+            <button id="btnMagbiasClear" class="btn btn-small">クリア</button>
+          </div>
+          <div class="ff-banner" id="magbiasApplied">magbias: 未適用</div>
+          <div class="exp-msg" id="magbiasMsg">v6 飛行ログから学習した Δb を機体 NVS(magbias)へ加算適用します(地上でのみ)</div>
         </div>
 
       </div>

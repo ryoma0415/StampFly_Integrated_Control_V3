@@ -24,6 +24,17 @@ RLY_MUX_DOWN)を追加し、1台のリレーで最大4機を多重制御する�
 (角度・角速度)の PID 成分 18 個と指令角速度 3 個を常時テレメトリ化する。
 型レンジ 0x30–0x4F 内の追加のため**リレーは無改修で転送する**。
 
+磁気オートチューン/フロー拡張(追加のみ、PROTOCOL_VERSION は **0x02 のまま**。
+設計根拠: `MAG_AUTOTUNE_DESIGN.md` §1):
+TLM_STATE を **135B → 184B** に末尾拡張(b_cal/レベル化観測・EKF2 状態・
+オプティカルフロー)、TLM_CAL_DATA を **112B → 132B** に末尾拡張
+(magbias / flowcal)。上りコマンド **0x26 CMD_MAGBIAS_SET / 0x27
+CMD_FLOWCAL_SET / 0x28 CMD_FLOW_PROBE** を追加。CMD_POS_ERR に flags
+bit4(基準ヨー低信頼)を新設し、mocap_yaw の意味を「外部ヨー基準」
+(ソースは PC 側設定: MoCap 実測 or 移動ベースヨー)へ一般化。CMD_FF_MODE の
+est_mode 受理範囲を 0..2(2=EKF2)へ拡大。長さ検査は厳格のままのため、
+**旧 135B / 112B フレームは受理しない**(新旧ファーム混在は不可)。
+
 ## 設計原則(旧システムの教訓)
 
 旧プロトコルは「ヘッダバイト走査+固定長+8bit加算和」で、ペイロード内の 0x41 を
@@ -87,12 +98,13 @@ type値の範囲でルーティングする(リレーは中身を解釈せず型
 | 0x11 | CMD_STOP | なし(0B) | 即時着陸。**全飛行状態で受理**(TAKEOFF/LANDING中含む)。MOTOR_TEST 中はモーター停止→WAIT |
 | 0x12 | CMD_SETPOINT | `f32 roll_ref(rad), f32 pitch_ref(rad), f32 alt_ref(m), f32 yaw_ref(rad ±π), u8 flags` =**17B**(v2) | 姿勢+高度+ヨー角目標。flags bit0=alt_ref有効(0なら現在のalt_ref維持)、**bit1=yaw_ref有効(=ヨー角制御ON)**。bit1=0 のとき機体は v1 と同一動作(Yaw_rate_reference=0 のレートダンピングのみ)。**ハートビートを兼ねる**。PCは飛行の有無に関わらずセッション中50Hzで送信 |
 | 0x13 | CMD_RESET | なし(0B) | COMPLETE(OverG後)からの復帰。COMPLETE かつ altitude_est<0.15m でのみ受理 → AUTO_WAIT |
-| 0x24 | CMD_POS_ERR | `f32 err_x(m), f32 err_y(m), f32 alt_ref(m), f32 yaw_ref(rad ±π), f32 mocap_yaw(rad ±π), u8 flags` =**21B**(v2.1) | **機上XY制御**(Position / Multi モードの唯一の水平指令経路)の CMD_SETPOINT 代替ストリーム。PC は制御座標系の XY 位置誤差(目標−フィルタ済み現在位置)を送り、機体側が自身のヨー推定で誤差を機体座標系へ回転(**ヨー回転補償**)して XY PID → roll/pitch 指令を計算する。flags bit0=alt_ref有効、bit1=yaw_ref有効(CMD_SETPOINT と同義)、**bit2=err_x/err_y有効**(MoCap新鮮+閉ループ有効。0なら機体は水平指令+PID減衰)、**bit3=mocap_yaw有効**(MoCap実測の制御座標系ヨー。フレーム整合検証・ログ用で制御には未使用)。**ハートビートを兼ねる**(受信時刻・seq_echo は CMD_SETPOINT と共有し、途絶フェイルセーフ >200ms/>500ms がそのまま適用される)。機上XY PID のゲイン・クランプ・スルーレートはファーム config.hpp の `pos_*`(旧 PC 側 XY PID の実績値と同値で初期化) |
+| 0x24 | CMD_POS_ERR | `f32 err_x(m), f32 err_y(m), f32 alt_ref(m), f32 yaw_ref(rad ±π), f32 mocap_yaw(rad ±π), u8 flags` =**21B**(v2.1) | **機上XY制御**(Position / Multi モードの唯一の水平指令経路)の CMD_SETPOINT 代替ストリーム。PC は制御座標系の XY 位置誤差(目標−フィルタ済み現在位置)を送り、機体側が自身のヨー推定で誤差を機体座標系へ回転(**ヨー回転補償**)して XY PID → roll/pitch 指令を計算する。flags bit0=alt_ref有効、bit1=yaw_ref有効(CMD_SETPOINT と同義)、**bit2=err_x/err_y有効**(MoCap新鮮+閉ループ有効。0なら機体は水平指令+PID減衰)、**bit3=mocap_yaw有効**(mocap_yaw は**外部ヨー基準** — 制御座標系ヨー、ソースは PC 側設定: MoCap 実測 or 移動ベースヨー。名称は互換のため維持。EKF2(est_mode=2)のヨー擬似観測・フレーム整合検証・ログに使用)、**bit4=FLAG_YAW_REF_LOW_TRUST**(基準ヨー低信頼 — 移動ベースヨー時に PC が立てる。ファームは R_ψ を低信頼プリセットへ切替。`MAG_AUTOTUNE_DESIGN.md` §1.2)。**ハートビートを兼ねる**(受信時刻・seq_echo は CMD_SETPOINT と共有し、途絶フェイルセーフ >200ms/>500ms がそのまま適用される)。機上XY PID のゲイン・クランプ・スルーレートはファーム config.hpp の `pos_*`(旧 PC 側 XY PID の実績値と同値で初期化) |
 
-#### v2 実験・キャリブレーション系(0x14–0x23, 0x25)
+#### v2 実験・キャリブレーション系(0x14–0x23, 0x25–0x28)
 
 すべて TLM_ACK(0x32)で応答する。キャリブ/FF系(0x17–0x23)と
-CMD_LED_MODE(0x25)は **WAIT / COMPLETE / MOTOR_TEST 状態でのみ受理**
+CMD_LED_MODE(0x25)、磁気オートチューン/フロー系(0x26–0x28)は
+**WAIT / COMPLETE / MOTOR_TEST 状態でのみ受理**
 (飛行中の NVS 書込み禁止)。それ以外の状態では status=bad_state。
 
 | type | 名前 | payload | 意味 |
@@ -111,25 +123,30 @@ CMD_LED_MODE(0x25)は **WAIT / COMPLETE / MOTOR_TEST 状態でのみ受理**
 | 0x1F | CMD_FF_MOT | `u8 idx(0=FL,1=FR,2=RL,3=RR), f32 a_tilde[3], f32 c2, c1, c0` =25B | モーター係数 |
 | 0x20 | CMD_FF_AUX | `f32 iid_a` =4B | ベンチ参考アイドル電流 |
 | 0x21 | CMD_FF_COMMIT | `u32 crc32` =4B | CRC-32(IEEE, zlib 互換、float32 LE 連結)照合 → NVS 永続化。冪等 |
-| 0x22 | CMD_FF_MODE | `u8 ff_mode(0=off,1=A,2=B), u8 est_mode(0=相補,1=EKF)` =2B | 実行時切替。NVS 永続化 |
+| 0x22 | CMD_FF_MODE | `u8 ff_mode(0=off,1=A,2=B), u8 est_mode(0=相補,1=EKF,**2=EKF2**)` =2B | 実行時切替。NVS 永続化(`ffcal/est` に 2 を保存可)。est_mode 切替時の再シード規約は既存と同じ(EKF2 はアクティブ化時、直近のアクティブ推定器ヨーで reseedYaw。`MAG_AUTOTUNE_DESIGN.md` §1.3) |
 | 0x23 | CMD_FF_ANCHOR | なし(0B) | アンカー再取得要求(モーター停止中のみ。回転中/窓未充足は status=busy) |
 | 0x25 | CMD_LED_MODE | `u8 mode(0=AUTO,1=RECORDING)` =1B(v2.2) | LED 表示モード切替(**計測中インジケータ**)。mode=1 で **MOTOR_TEST 中のみ LED をマゼンタ(0xff00ff)常灯**にする(スマホ動画のカット点検出用。**同期規約: マゼンタに変わった瞬間 = 計測開始 t_s=0 = 動画カット位置**)。フェイルセーフ: 最後の mode=1 から **3 秒で AUTO へ自動復帰**(PC は計測中約 1 秒間隔で再送=キープアライブ)。**MOTOR_TEST 離脱でも即 AUTO**。受理状態はキャリブ系と同じ(WAIT/COMPLETE/MOTOR_TEST。表示効果は MOTOR_TEST のみ)。マゼンタは INIT/CALIBRATION と同値だが起動直後の状態と MOTOR_TEST は同時に成立しないため計測ウィンドウ内で一意 |
+| 0x26 | CMD_MAGBIAS_SET | `u8 mode(0=clear,1=set), f32 dx, dy, dz(µT)` =**13B** | 学習ハードアイアン残差 Δb [µT, **b_cal 空間**] を NVS `magbias` へ保存+即適用(mode=0 でクリア)。**ff_mode は降格しない**(FF 係数は b_cal 空間のまま有効)。適用時: アンカー無効化+窓リセット+補正系再シード(mag3d 変更時と同パターン、ff_mode 降格だけしない)。mag3d 変更時は旧 b_cal 空間で無効になるため機体側で**連動クリア**(`MAG_AUTOTUNE_DESIGN.md` §1.4, §2.5) |
+| 0x27 | CMD_FLOWCAL_SET | `u8 mode(0=clear,1=set), f32 kx, ky(counts/rad)` =**9B** | フロースケールを NVS `flowcal` へ保存(mode=0 でクリア=既定 450.0) |
+| 0x28 | CMD_FLOW_PROBE | `u8 n_cycles(0=既定200)` =**1B** | PMW3901 burst プローブ実行(**モーター停止時のみ**、回転中は status=busy で拒否)。結果は LOG_TEXT 複数行(agree_ratio 等の要約)+ probe 成功で burst_ok ラッチ更新 |
 
 ### 下り(ドローン → PC)
 
 | type | 名前 | payload | 意味 |
 |------|------|---------|------|
-| 0x30 | TLM_STATE | 下表 **135B**(v2) | フル状態テレメトリ。**25Hz**(40ms周期、400Hzループの16分周) |
+| 0x30 | TLM_STATE | 下表 **184B**(v2+磁気オートチューン拡張) | フル状態テレメトリ。**25Hz**(40ms周期、400Hzループの16分周) |
 | 0x31 | TLM_EVENT | `u8 state, u8 prev_state, u8 reason, u8 flags, f32 voltage` =8B | 状態遷移時に即時送信+2Hzで定期再送 |
-| 0x32 | TLM_ACK | `u8 acked_type, u32 acked_seq, u8 status` =6B(v2) | 0x14–0x23, 0x25 への応答。status: 0=ok, 1=bad_state, 2=invalid_arg, 3=crc_mismatch, 4=busy, 5=incomplete |
+| 0x32 | TLM_ACK | `u8 acked_type, u32 acked_seq, u8 status` =6B(v2) | 0x14–0x23, 0x25–0x28 への応答。status: 0=ok, 1=bad_state, 2=invalid_arg, 3=crc_mismatch, 4=busy, 5=incomplete |
 | 0x33 | TLM_EXP | 下表 86B(v2) | 実験テレメトリ。**MOTOR_TEST 状態でのみ 25Hz** 送出(TLM_STATE と 8tick 位相をずらす) |
-| 0x34 | TLM_CAL_DATA | 下表 112B(v2) | CMD_CAL_GET への応答(キャリブ一括データ) |
+| 0x34 | TLM_CAL_DATA | 下表 **132B**(v2+磁気オートチューン拡張) | CMD_CAL_GET への応答(キャリブ一括データ) |
 | 0x35 | TLM_CTRL | 下表 **89B** | 制御ループ診断テレメトリ。**25Hz**(400Hzループの16分周、TLM_STATE から 4tick 位相ずらし)。**全飛行状態で常時送出**(MOTOR_TEST 中も含む) |
 
-#### TLM_STATE payload(135B、宣言順に隙間なくパック)
+#### TLM_STATE payload(184B、宣言順に隙間なくパック)
 
 v2 は**末尾追加のみ**: 既存オフセット 0–96 は v1 と不変
 (pc_server の serial_link.py が seq_echo を先頭オフセット直読みするため)。
+磁気オートチューン/フロー拡張はオフセット 135 以降を末尾追加(既存
+オフセット 0–134 は不変。`MAG_AUTOTUNE_DESIGN.md` §1.1)。
 
 | オフセット | 型 | フィールド | 単位 |
 |---|---|---|---|
@@ -160,6 +177,22 @@ v2 は**末尾追加のみ**: 既存オフセット 0–96 は v1 と不変
 | 129 | f32 | nis — 直近 EKF 更新の NIS | — |
 | 133 | u8 | ffg — EKF ゲート/健全性ビット(下記) | — |
 | 134 | u8 | ff_status — FF/ヨー制御状態ビット(下記) | — |
+| 135 | f32 | mag_cal_x_ut — b_cal(mag3d 適用後・FF 補正**前**)機体系 X | µT |
+| 139 | f32 | mag_cal_y_ut — 同 Y | µT |
+| 143 | f32 | mag_cal_z_ut — 同 Z | µT |
+| 147 | f32 | mag_lev_x_ut — FF補正+magbias+EMA後レベル化水平 X(=EKF観測 zx) | µT |
+| 151 | f32 | mag_lev_y_ut — 同 Y(=zy) | µT |
+| 155 | f32 | ekf2_yaw_rad — EKF2 の ψ(シャドー中も常時) | rad |
+| 159 | f32 | ekf2_bm_x_ut — EKF2 の b_mx | µT |
+| 163 | f32 | ekf2_bm_y_ut — 同 b_my | µT |
+| 167 | f32 | ekf2_yaw_innov_rad — 直近ヨー観測イノベーション(未受信時 0) | rad |
+| 171 | u8 | ekf2_status — EKF2 状態ビット(下記) | — |
+| 172 | u8 | ekf2_gate — EKF2 のゲートビット(ffg と同一ビット定義) | — |
+| 173 | f32 | flow_vx_mps — フロー機体系 X 速度(無効時 0) | m/s |
+| 177 | f32 | flow_vy_mps — 同 Y | m/s |
+| 181 | u8 | flow_squal — SQUAL 生値 | — |
+| 182 | u8 | flow_status — フロー状態ビット(下記) | — |
+| 183 | u8 | flow_dt_ms — フロー読み実測 dt(0-255 クランプ) | ms |
 
 `ffg` ビット(yaw側 ff_pipeline_design.md §5.5 の定義踏襲):
 bit0 R_INFLATED(NIS>5.99 → R 膨張適用中)、bit1 NIS_REJECT(NIS>13.8 棄却)、
@@ -170,8 +203,19 @@ bit7 RECAPTURE(NIS 棄却が 5s 超継続 → 制限付き更新=ソフト再捕
 FF_PIPELINE.md §5.5 改修B-1。ワイヤ形式は不変 — 既存の予約 bit を使用)。
 
 `ff_status` ビット:
-bit0-1 ff_mode(0-2)、bit2 est_mode(1=EKF)、bit3 anchor_valid、
-bit4 ffcal_loaded、bit5 yaw_ctrl_active、bit6 mag_fresh。
+bit0-1 ff_mode(0-2)、bit2 est_mode==1(EKF)、bit3 anchor_valid、
+bit4 ffcal_loaded、bit5 yaw_ctrl_active、bit6 mag_fresh、
+**bit7 est_mode==2(EKF2)**。bit2/bit7 とも 0 なら相補CF。
+
+`ekf2_status` ビット(`MAG_AUTOTUNE_DESIGN.md` §1.1):
+bit0 yaw_obs_fresh(ヨー観測受信 <1s)、bit1 yaw_obs_fused(直近 0.5s 内に
+受理)、bit2 flight_anchor_done(飛行状態再アンカー実施済み)、
+bit3 tau_rw_mode(q_bm ランダムウォークモード)、bit4 bm_frozen、
+bit5 healthy2、bit6 yaw_obs_low_trust、bit7 予約。
+
+`flow_status` ビット(同上):
+bit0 sensor_ok、bit1 burst_ok、bit2 vel_valid、bit3 range_valid、
+bit4 squal_ok、bit5 init_retry、bit6-7 予約。
 
 #### TLM_EXP payload(86B、隙間なくパック)
 
@@ -191,11 +235,14 @@ bit4 ffcal_loaded、bit5 yaw_ctrl_active、bit6 mag_fresh。
 | 84 | u8 | motors_mask(CMD_MOTOR_RUN の mask と同ビット割り) |
 | 85 | u8 | flags: bit0 current_valid, bit1 mag_fresh, bit2 motors_running |
 
-#### TLM_CAL_DATA payload(112B)
+#### TLM_CAL_DATA payload(132B)
+
+磁気オートチューン/フロー拡張はオフセット 112 以降を末尾追加
+(`MAG_AUTOTUNE_DESIGN.md` §1.5)。
 
 | オフセット | 型 | フィールド |
 |---|---|---|
-| 0 | u8 | valid_flags: bit0 mag3d, bit1 accel6, bit2 attmount, bit3 yawzero, bit4 geomag, bit5 ffcal |
+| 0 | u8 | valid_flags: bit0 mag3d, bit1 accel6, bit2 attmount, bit3 yawzero, bit4 geomag, bit5 ffcal, **bit6 magbias, bit7 flowcal** |
 | 1 | f32×3 | mag3d_offset |
 | 13 | f32×9 | mag3d_matrix(行優先) |
 | 49 | f32×3 | accel6_offset |
@@ -208,6 +255,8 @@ bit4 ffcal_loaded、bit5 yaw_ctrl_active、bit6 mag_fresh。
 | 106 | u32 | ff_crc32 |
 | 110 | u8 | ff_mode |
 | 111 | u8 | est_mode |
+| 112 | f32×3 | magbias dx, dy, dz [µT, b_cal 空間] |
+| 124 | f32×2 | flowcal kx, ky [counts/rad] |
 
 #### TLM_CTRL payload(89B、隙間なくパック)
 
@@ -231,10 +280,10 @@ yaw の角度ループ成分は**クランプ前**の値を記録する(yaw_rate
 → 差でクランプ発動が分かる)。PID リセット中(非飛行時や、ヨー制御OFF時の
 psi_pid 毎tickリセット等)は成分が 0 になるため、flags で有効区間を判別する。
 
-帯域: TLM_STATE 論理144B → COBS+デリミタ ≈146B × 25Hz ≈ 3.7KB/s、
-TLM_CTRL 論理98B → ≈100B × 25Hz ≈ 2.5KB/s(常時)の合計 ≈6.2KB/s
-(既定 460800bps の約13%、旧 115200bps では約53%)。MOTOR_TEST 中は
-TLM_EXP ≈97B × 25Hz ≈ 2.4KB/s が加わる(合計 ≈8.6KB/s、460800 の約19%で
+帯域: TLM_STATE 論理193B → COBS+デリミタ ≈195B × 25Hz ≈ 4.9KB/s、
+TLM_CTRL 論理98B → ≈100B × 25Hz ≈ 2.5KB/s(常時)の合計 ≈7.4KB/s
+(既定 460800bps の約16%、旧 115200bps では約64%)。MOTOR_TEST 中は
+TLM_EXP ≈97B × 25Hz ≈ 2.4KB/s が加わる(合計 ≈9.8KB/s、460800 の約21%で
 問題なし)。マルチ機体時の合算は「帯域予算」参照。
 
 ### ログ(双方向: リレー/ドローン → PC)
@@ -317,7 +366,7 @@ count / wifi_channel 一致まで最大3回再送**(初回送信+最大3回再�
 | 1 | — | inner | **完全な内側論理フレーム**(ver..crc16、COBSなし)をそのまま格納 |
 
 内側フレームの最大ペイロードは `MAX_MUX_INNER_PAYLOAD` = 200−1−9 = **190B**
-(既存最大の TLM_STATE 135B が収まる)。PC 実装は外側エンベロープと内側フレームで
+(既存最大の TLM_STATE 184B が収まる)。PC 実装は外側エンベロープと内側フレームで
 **同一 seq を共有**する(採番は1回。機体がエコーする seq_echo / acked_seq は
 内側 seq — ノード別レイテンシ計測の対応付けに使う)。
 
@@ -385,9 +434,9 @@ CMD_MOTOR_RUN 0.4s キープアライブ / RLY_STATS 1Hz。
 ### 帯域予算(規範)
 
 ワイヤ長の内訳(COBS は 254B 以下の入力に対し +1B、デリミタ +1B):
-TLM_STATE = 135B payload + 9B フレーム + 2B ≈ **146B**。マルチ機体時は
+TLM_STATE = 184B payload + 9B フレーム + 2B ≈ **195B**。マルチ機体時は
 MUX エンベロープ(node_id 1B + 外側フレーム 9B + COBS/デリミタ増分)で
-**156B**。TLM_CTRL = 89B payload → **100B**、MUX 時 **110B**。
+**205B**。TLM_CTRL = 89B payload → **100B**、MUX 時 **110B**。
 CMD_SETPOINT = 17B payload → **28B**、MUX 時 **38B**。
 CMD_POS_ERR = 21B payload → **32B**、MUX 時 **42B**。
 UART は全二重のため上り/下りは方向別に評価する
@@ -398,17 +447,17 @@ TLM_STATE + TLM_CTRL(各 25Hz、常時)、上りは大きい方の CMD_POS_ERR
 
 | 構成 | 下り(TLM_STATE+TLM_CTRL 25Hz/機) | @115200 | @460800 | 上り(CMD_POS_ERR 50Hz/機) | @115200 | @460800 |
 |---|---|---|---|---|---|---|
-| 単機(非MUX) | ≈6.2KB/s | 53% | 13% | ≈1.6KB/s | 14% | 3% |
-| 2機(MUX) | ≈13.3KB/s | **115%(不可)** | 29% | ≈4.2KB/s | 36% | 9% |
-| 3機(MUX) | ≈20.0KB/s | **173%(不可)** | 43% | ≈6.3KB/s | 55% | 14% |
-| 4機(MUX) | ≈26.6KB/s | **231%(不可)** | 58% | ≈8.4KB/s | 73% | 18% |
+| 単機(非MUX) | ≈7.4KB/s | 64% | 16% | ≈1.6KB/s | 14% | 3% |
+| 2機(MUX) | ≈15.8KB/s | **137%(不可)** | 34% | ≈4.2KB/s | 36% | 9% |
+| 3機(MUX) | ≈23.6KB/s | **205%(不可)** | 51% | ≈6.3KB/s | 55% | 14% |
+| 4機(MUX) | ≈31.5KB/s | **273%(不可)** | 68% | ≈8.4KB/s | 73% | 18% |
 
 TLM_EVENT / RLY_STATS / LOG_TEXT の寄与は 0.1KB/s 未満で無視できる。
-既定 460800 では 4機でも下り約58%・上り約18%と余裕がある。
+既定 460800 では 4機でも下り約68%・上り約18%と収まる。
 460800 非対応ハードウェア(`release-115200`)は**単機のみ**を推奨する
-(下り≈53%)。リレーの間引きは TLM_STATE のみで TLM_CTRL は対象外のため、
+(下り≈64%)。リレーの間引きは TLM_STATE のみで TLM_CTRL は対象外のため、
 2機は `tlm_state_div=2`(server.json `multi.tlm_state_div`)で TLM_STATE を
-半減しても下り ≈9.4KB/s ≈82% と余裕がなく、3機以上は 115200 では下りが
+半減しても下り ≈10.6KB/s ≈92% と余裕がなく、3機以上は 115200 では下りが
 破綻する。
 
 ## ドローン側の受理規則
@@ -417,10 +466,11 @@ TLM_EVENT / RLY_STATS / LOG_TEXT の寄与は 0.1KB/s 未満で無視できる�
 - ブート後最初の有効上りフレームの送信元MACをリレーピアとして学習(以後不変)。
 - 受信コールバック(WiFiタスク)は検証+portMUXクリティカルセクションでメールボックスに
   格納するだけ。400Hzループがスナップショットを取り出して消費。優先度 STOP > START >
-  RESET > SETPOINT。0x14–0x23 のコマンドは専用リングバッファに積み、400Hz ループが
-  順に処理して TLM_ACK を返す。
-- キャリブ/FF系(0x17–0x23)と CMD_LED_MODE(0x25)は WAIT / COMPLETE / MOTOR_TEST
-  でのみ受理(NVS 書込みは非飛行状態限定)。CMD_MOTOR_RUN / CMD_MOTOR_STOP は MOTOR_TEST 限定。
+  RESET > SETPOINT。0x14–0x23, 0x25–0x28 のコマンドは専用リングバッファに積み、
+  400Hz ループが順に処理して TLM_ACK を返す。
+- キャリブ/FF系(0x17–0x23)と CMD_LED_MODE(0x25)、磁気オートチューン/フロー系
+  (0x26–0x28)は WAIT / COMPLETE / MOTOR_TEST でのみ受理(NVS 書込みは非飛行状態
+  限定)。CMD_MOTOR_RUN / CMD_MOTOR_STOP は MOTOR_TEST 限定。
 - WiFiチャネルはファームconfigの固定値(既定1)に `esp_wifi_set_channel` でピン留めする。
   機体プロファイル(PC側)のチャネルと一致させる。製品版ジョイスティック(CH3)とは別チャネル。
 
@@ -432,7 +482,8 @@ TLM_EVENT / RLY_STATS / LOG_TEXT の寄与は 0.1KB/s 未満で無視できる�
    alt=0.30 を含む 17B ペイロードの論理フレーム全バイトとCOBS後ワイヤバイト
    (yaw_ref 有効/無効の両方)。
 3. payload に 0x00 を多数含むフレーム(alt_ref=0.0 等)の COBS 往復。
-4. TLM_STATE: 全フィールド既知値の135Bペイロード+フレーム全バイト。
+4. TLM_STATE: 全フィールド既知値の184Bペイロード+フレーム全バイト
+   (拡張フィールドのオフセットもアサートする)。
 5. v2 新規メッセージ全型: CMD_MODE / CMD_MOTOR_RUN / CMD_MOTOR_STOP / CMD_CAL_GET /
    CMD_MAG3D_SET / CMD_ACCEL6_SET / CMD_ATTMOUNT_SET / CMD_YAWZERO_SET /
    CMD_GEOMAG_SET / CMD_FF_BEGIN / CMD_FF_LUT / CMD_FF_MOT / CMD_FF_AUX /
@@ -455,3 +506,8 @@ TLM_EVENT / RLY_STATS / LOG_TEXT の寄与は 0.1KB/s 未満で無視できる�
 9. 制御診断拡張(名前固定): `tlm_ctrl_full`(全フィールド既知値の 89B
    TLM_CTRL ペイロード+フレーム全バイト。全フィールドのオフセットも
    アサートする)。
+10. 磁気オートチューン/フロー拡張(名前固定): `cmd_pos_err_low_trust`
+    (flags bit3+bit4)/ `cmd_magbias_set` / `cmd_magbias_clear` /
+    `cmd_flowcal_set` / `cmd_flow_probe`。`tlm_state_full` は 184B、
+    `tlm_cal_data_full` は 132B(magbias / flowcal のオフセット 112 / 124 も
+    アサートする)。

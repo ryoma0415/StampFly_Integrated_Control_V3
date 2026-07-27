@@ -543,7 +543,7 @@ class MultiControlManager:
         names: list[str] = []
         # 全機共通のマッピング情報(MocapSource は全スロット共有)
         metadata = {
-            "log_columns_version": 5,
+            "log_columns_version": 6,
             "mocap_mapping": self._mocap.mapping_snapshot(),
         }
         for slot in slots:

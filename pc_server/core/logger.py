@@ -7,7 +7,7 @@
   MultiControlManager(open_flight_logs / close_flight_logs)が管理する。
 - 50Hz の制御行(CMD_POS_ERR / CMD_SETPOINT 送信ごとに1行)+最新テレメトリ
   (TLM_STATE / TLM_CTRL とも 25Hz)/mocap スナップショットの結合。
-  列定義は docs/LOG_STRUCTURE.md v4(109列)と1対1で対応させること。
+  列定義は docs/LOG_STRUCTURE.md(現行 v6 = 136列)と1対1で対応させること。
 - 値が未取得の列は空文字。0/1 フラグは文字列 "0"/"1"。
 - 経過時間は time.monotonic() 基準。timestamp 列のみ壁時計(ISO8601)。
 """
@@ -26,7 +26,9 @@ import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from .config import LOGS_DIR
 
-# 列定義 v5(115列 = v4 の109列+MoCap 正解ヨー/生クォータニオン6列。
+# 列定義 v6(136列 = v5 の115列+磁気オートチューン/フロー拡張21列。
+# 末尾追加のみ: TLM_STATE 184B 拡張の tlm_* 16列(MAG_AUTOTUNE_DESIGN.md
+# §1.1)+PC側ヨー基準/移動ベースヨー5列(同 §3)。
 # docs/LOG_STRUCTURE.md と1対1で対応させること)
 COLUMNS: tuple[str, ...] = (
     # --- セッション / タイミング(7) ---
@@ -91,6 +93,22 @@ COLUMNS: tuple[str, ...] = (
     # mocap_q*: Motive 生クォータニオン — 任意のマッピングを事後再計算できる
     "mocap_yaw_true_deg", "mocap_flip",
     "mocap_qx", "mocap_qy", "mocap_qz", "mocap_qw",
+    # --- v6: 磁気オートチューン/フロー拡張(2026-07 追加。末尾追加のみ)---
+    # TLM_STATE 135B→184B 拡張(契約 §1.1)の全フィールド(16)
+    "tlm_mag_cal_x_ut", "tlm_mag_cal_y_ut", "tlm_mag_cal_z_ut",
+    "tlm_mag_lev_x_ut", "tlm_mag_lev_y_ut",
+    "tlm_ekf2_yaw_rad", "tlm_ekf2_bm_x_ut", "tlm_ekf2_bm_y_ut",
+    "tlm_ekf2_yaw_innov_rad", "tlm_ekf2_status", "tlm_ekf2_gate",
+    "tlm_flow_vx_mps", "tlm_flow_vy_mps",
+    "tlm_flow_squal", "tlm_flow_status", "tlm_flow_dt_ms",
+    # PC側: ヨー基準ソース/送信値/有効+移動ベースヨー(契約 §3)(5)
+    # yaw_ref_source: off|mocap|motion。yaw_ref_sent_rad: CMD_POS_ERR の
+    #   mocap_yaw 欄に実際に送った値(ワイヤ規約)。yaw_ref_valid: bit3。
+    # motion_yaw_rad: 移動ベースヨー(ワイヤ規約変換済み。ソースが mocap の
+    #   間も常時計算・記録する — 切替前の妥当性検証用)。motion_yaw_J:
+    #   Fisher情報 Σ|u_B|²(ゲート判定値)。
+    "yaw_ref_source", "yaw_ref_sent_rad", "yaw_ref_valid",
+    "motion_yaw_rad", "motion_yaw_J",
 )
 
 FLOAT_DECIMALS = 6   # CSV 上の float 桁数
@@ -177,6 +195,23 @@ def tlm_state_to_row(tlm: proto.TlmState, age_s: float) -> dict:
         "tlm_nis": tlm.nis,
         "tlm_ffg": tlm.ffg,
         "tlm_ff_status": tlm.ff_status,
+        # v6: 磁気オートチューン/フロー拡張(TLM_STATE 184B。契約 §1.1)
+        "tlm_mag_cal_x_ut": tlm.mag_cal_x_ut,
+        "tlm_mag_cal_y_ut": tlm.mag_cal_y_ut,
+        "tlm_mag_cal_z_ut": tlm.mag_cal_z_ut,
+        "tlm_mag_lev_x_ut": tlm.mag_lev_x_ut,
+        "tlm_mag_lev_y_ut": tlm.mag_lev_y_ut,
+        "tlm_ekf2_yaw_rad": tlm.ekf2_yaw_rad,
+        "tlm_ekf2_bm_x_ut": tlm.ekf2_bm_x_ut,
+        "tlm_ekf2_bm_y_ut": tlm.ekf2_bm_y_ut,
+        "tlm_ekf2_yaw_innov_rad": tlm.ekf2_yaw_innov_rad,
+        "tlm_ekf2_status": tlm.ekf2_status,
+        "tlm_ekf2_gate": tlm.ekf2_gate,
+        "tlm_flow_vx_mps": tlm.flow_vx_mps,
+        "tlm_flow_vy_mps": tlm.flow_vy_mps,
+        "tlm_flow_squal": tlm.flow_squal,
+        "tlm_flow_status": tlm.flow_status,
+        "tlm_flow_dt_ms": tlm.flow_dt_ms,
     }
 
 

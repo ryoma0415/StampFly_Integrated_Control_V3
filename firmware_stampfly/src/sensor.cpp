@@ -27,6 +27,7 @@
 #include "imu.hpp"
 #include "tof.hpp"
 #include "flight_control.hpp"
+#include "flow/flow_hub.hpp"
 #include "yaw_estimation/angle_utils.hpp"
 #include "yaw_estimation/sensor_hub_ff.hpp"
 
@@ -117,6 +118,12 @@ void sensor_init() {
     // NVS 復元(mag3d → accel6 → attmount → geomag → yawzero → ffcal)。
     // 旧 ina3221.begin + 毎tick getVoltage は current_sensor の 20Hz 読みへ統一。
     sensorHubFfInit(Wire1);
+
+    // オプティカルフロー初期化(MAG_AUTOTUNE_DESIGN.md §2.4/§2.5):
+    // PMW3901(BMI270 と SPI2_HOST 共有。imu_init 済みが前提)+ NVS `flowcal`
+    // ロード(ブートロード順の最後 = magbias の後)+ 起動時 burst セルフテスト。
+    // burst 不成立ならフロー恒久無効(飛行挙動は完全に従来どおり)。
+    flowHubInit();
 
     uint16_t cnt = 0;
     while (cnt < 10) {
@@ -360,6 +367,9 @@ float sensor_read(void) {
         const bool in_flight =
             (ast == AUTO_TAKEOFF || ast == AUTO_HOVER || ast == AUTO_LANDING);
         ff_in.in_flight = in_flight;
+        // EKF2 飛行状態再アンカー(MAG_AUTOTUNE_DESIGN.md §2.1-3)の条件判定用
+        ff_in.alt_est_m = sensor_state.Altitude2;
+        ff_in.alt_ref_m = fout.Alt_ref;
         if (ast == AUTO_MOTOR_TEST) {
             // MOTOR_TEST 中: テスト duty×mask を FF へ配線(V2契約 §2.3)。
             // ランプダウン中の実出力>0 も「回転中」として扱う(アンカー窓の汚染防止)。
@@ -385,6 +395,20 @@ float sensor_read(void) {
             ff_in.motor_mask = 0x0F;
         }
         sensorHubFfUpdate(ff_in);
+    }
+
+    // ---- オプティカルフロー 50Hz スロット(MAG_AUTOTUNE_DESIGN.md §2.4) ----
+    // 既存 20Hz 低速スロットと同居しない独立 20ms 周期(flow_hub 内で自己
+    // スロットル)。SPI(BMI270 共有)なので ToF/磁気の I2C とはバスが別だが、
+    // 重量級読みの発生した tick(ToF 読み・20Hz 電流/磁気スロット)では次 tick
+    // へ繰延べて tick 予算(2500µs)を保護する(位相スタガと同方針)。
+    // 回転補償の p,q・ToF 生スラント距離・ヨーは既存 sensor_state / hub から。
+    // burst 不成立時は flowHubUpdate が即 return(飛行挙動不変)。
+    if (!tof_read_this_tick && !g_yaw_est.current_slot_fired) {
+        flowHubUpdate(sensor_state.Roll_rate, sensor_state.Pitch_rate,
+                      static_cast<float>(sensor_state.Range) * 1.0e-3f,
+                      sensor_state.RawRange > 20,
+                      g_yaw_est.ff.yaw_active_rad);
     }
 
     // Battery voltage check
@@ -422,6 +446,33 @@ float sensor_read(void) {
     sensor_state.Ff_anchor_valid = g_yaw_est.ff.anchor_valid ? 1 : 0;
     sensor_state.Ff_cal_loaded   = g_yaw_est.ff_calibration.valid() ? 1 : 0;
     sensor_state.Mag_fresh       = sensorHubFfMagFresh(millis()) ? 1 : 0;
+
+    // 磁気オートチューン拡張(TLM_STATE 135-172。MAG_AUTOTUNE_DESIGN.md §1.1/§2.2):
+    // b_cal・レベル化観測 z・EKF2 の公開値を転記(EKF2 はシャドー中も常時)
+    sensor_state.Mag_cal_x_ut       = g_yaw_est.frame.mag_cal_body.x;
+    sensor_state.Mag_cal_y_ut       = g_yaw_est.frame.mag_cal_body.y;
+    sensor_state.Mag_cal_z_ut       = g_yaw_est.frame.mag_cal_body.z;
+    sensor_state.Mag_lev_x_ut       = g_yaw_est.frame.mag_lev_x_ut;
+    sensor_state.Mag_lev_y_ut       = g_yaw_est.frame.mag_lev_y_ut;
+    sensor_state.Ekf2_yaw_rad       = g_yaw_est.yaw_kf2.yaw();
+    sensor_state.Ekf2_bm_x_ut       = g_yaw_est.yaw_kf2.bmx();
+    sensor_state.Ekf2_bm_y_ut       = g_yaw_est.yaw_kf2.bmy();
+    sensor_state.Ekf2_yaw_innov_rad = g_yaw_est.yaw_kf2.yawInnov();
+    sensor_state.Ekf2_status        = sensorHubFfEkf2Status(millis());
+    sensor_state.Ekf2_gate          = g_yaw_est.yaw_kf2.gateBits();
+
+    // オプティカルフロー公開値の転記(TLM_STATE 173-183。契約 §1.1/§2.4)
+    {
+        const FlowState& fs = flowHubState();
+        sensor_state.Flow_vx_mps = fs.vx;
+        sensor_state.Flow_vy_mps = fs.vy;
+        sensor_state.Flow_squal  = fs.squal;
+        sensor_state.Flow_status = flowHubStatusByte();
+        float flow_dt_ms = fs.read_dt_s * 1000.0f;
+        if (flow_dt_ms < 0.0f) flow_dt_ms = 0.0f;
+        if (flow_dt_ms > 255.0f) flow_dt_ms = 255.0f;
+        sensor_state.Flow_dt_ms = static_cast<uint8_t>(flow_dt_ms);
+    }
 
     preAutoState = flight_control_state.mode.auto_state;  // 今の状態を記憶
 
