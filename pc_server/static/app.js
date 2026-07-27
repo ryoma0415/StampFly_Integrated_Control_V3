@@ -168,6 +168,14 @@ const els = {
   ffModeSelect: $("ffModeSelect"), ffEstSelect: $("ffEstSelect"),
   btnFfApply: $("btnFfApply"), btnFfMode: $("btnFfMode"), btnFfAnchor: $("btnFfAnchor"),
   ffAppliedExp: $("ffAppliedExp"), ffApplyMsg: $("ffApplyMsg"),
+  // 磁気オートチューン(EKF2)パネル
+  yawRefSelect: $("yawRefSelect"), yawRefMotionInfo: $("yawRefMotionInfo"),
+  ekf2YawInfo: $("ekf2YawInfo"), ekf2BmInfo: $("ekf2BmInfo"),
+  ekf2StatusInfo: $("ekf2StatusInfo"),
+  magbiasLogSelect: $("magbiasLogSelect"), btnMagbiasExtract: $("btnMagbiasExtract"),
+  magbiasSelect: $("magbiasSelect"), btnMagbiasApply: $("btnMagbiasApply"),
+  btnMagbiasClear: $("btnMagbiasClear"),
+  magbiasApplied: $("magbiasApplied"), magbiasMsg: $("magbiasMsg"),
   // 設定タブ(UI専用: MoCap マッピング)
   tabSettings: $("tabSettings"), panelSettings: $("panelSettings"),
   mapAxisSel: { x: $("mapXAxis"), y: $("mapYAxis"), z: $("mapZAxis") },
@@ -207,6 +215,8 @@ let appliedMapping = null;         // サーバ適用済みマッピング(ゼ�
 // v2: Experiment / FF 関連の REST 状態キャッシュ
 let selectedDuty = UI.DUTY_DEFAULT;
 let ffStatus = null;               // /api/ffprofile の状態
+let magbiasStatus = null;          // /api/magbias の状態
+let yawRefSentAt = -Infinity;      // ヨー基準ソース送信時刻(echo抑制用)
 let geomagStatus = null;           // /api/geomag の状態
 let calprofStatus = null;          // /api/calprofile の状態
 let accel6Status = null;           // /api/accel6 の状態
@@ -777,6 +787,39 @@ function renderSession() {
   }
   els.btnCircleStart.disabled = !(wsOpen && uiMode === "position" && !circleRunning);
   els.btnCircleStop.disabled = !circleRunning;
+
+  // ヨー基準ソース(磁気オートチューンパネル)。サーバが正、操作直後は抑制
+  const yr = s.yaw_ref;
+  if (yr) {
+    if (now() - yawRefSentAt > UI.ECHO_SUPPRESS_MS &&
+        els.yawRefSelect.value !== yr.source) {
+      els.yawRefSelect.value = yr.source;
+    }
+    els.yawRefMotionInfo.textContent = (typeof yr.motion_yaw_deg === "number")
+      ? `motion: ${yr.motion_yaw_deg.toFixed(1)}° ` +
+        `J=${typeof yr.motion_J === "number" ? yr.motion_J.toFixed(1) : "--"}` +
+        (yr.motion_valid ? "" : "(無効)")
+      : `motion: --(励振不足)`;
+  }
+
+  // EKF2 状態表示(TLM_STATE 184B 拡張。未対応ファームでは undefined → "--")
+  const d = lastDrone;
+  if (d && typeof d.ekf2_yaw === "number") {
+    els.ekf2YawInfo.textContent =
+      `${d.ekf2_yaw.toFixed(1)}° / ${fmtNum(d.ekf2_yaw_innov, 2)}°`;
+    els.ekf2BmInfo.textContent =
+      `(${fmtNum(d.ekf2_bm_x_ut, 1)}, ${fmtNum(d.ekf2_bm_y_ut, 1)})`;
+    const st = typeof d.ekf2_status === "number"
+      ? `0x${d.ekf2_status.toString(16).padStart(2, "0")}` : "--";
+    const gate = typeof d.ekf2_gate === "number"
+      ? `0x${d.ekf2_gate.toString(16).padStart(2, "0")}` : "--";
+    els.ekf2StatusInfo.textContent =
+      `${st} / ${gate}${d.est_mode_ekf2 ? "(アクティブ)" : "(シャドー)"}`;
+  } else {
+    els.ekf2YawInfo.textContent = "--";
+    els.ekf2BmInfo.textContent = "--";
+    els.ekf2StatusInfo.textContent = "--";
+  }
 }
 
 function renderDrone() {
@@ -885,8 +928,10 @@ function renderYawMonitor() {
       d.mag_fresh ? "" : "⚠mag",
       d.ffcal_loaded ? "" : "FF係数なし",
     ].filter(Boolean).join(" ");
+    const estTxt = d.est_mode_ekf2 ? "EKF2"
+      : d.est_mode_ekf ? "EKF" : "相補CF";
     els.ffModeMon.textContent =
-      `ff=${ffName} / ${d.est_mode_ekf ? "EKF" : "相補CF"}${flagsTxt ? " " + flagsTxt : ""}`;
+      `ff=${ffName} / ${estTxt}${flagsTxt ? " " + flagsTxt : ""}`;
   } else {
     els.ffModeMon.textContent = "--";
   }
@@ -894,9 +939,10 @@ function renderYawMonitor() {
   // EKF 健全性バッジ(ffg/ff_status からの簡易判定)
   if (!d) {
     els.ekfBadge.classList.add("hidden");
-  } else if (d.est_mode_ekf) {
+  } else if (d.est_mode_ekf || d.est_mode_ekf2) {
+    const name = d.est_mode_ekf2 ? "EKF2" : "EKF";
     const healthy = !!d.anchor_valid && !!d.mag_fresh;
-    els.ekfBadge.textContent = healthy ? "EKF OK" : "EKF注意";
+    els.ekfBadge.textContent = healthy ? `${name} OK` : `${name}注意`;
     els.ekfBadge.className = `badge ${healthy ? "b-ok" : "b-warn"}`;
     els.ekfBadge.title = healthy ? ""
       : `EKF 健全性低下: ${d.anchor_valid ? "" : "アンカー無効 "}` +
@@ -2094,7 +2140,8 @@ function ffAppliedText(st) {
   if (!a) return "FF: 未適用";
   const when = a.applied_at
     ? new Date(a.applied_at * 1000).toLocaleString("ja-JP") : "-";
-  return `FF適用中: ${a.name}(ff=${ffModeLabel(a.ff)}, est=${a.est === 1 ? "EKF" : "CF"}, ` +
+  const estName = a.est === 2 ? "EKF2" : a.est === 1 ? "EKF" : "CF";
+  return `FF適用中: ${a.name}(ff=${ffModeLabel(a.ff)}, est=${estName}, ` +
          `crc=${a.crc || "-"}${a.verified ? "" : ", 未検証"})${when !== "-" ? " " + when : ""}`;
 }
 
@@ -2149,6 +2196,60 @@ function setFfStatus(resp) {
     ffStatus = resp;
     renderFfStatus();
     updateMultiFfSelects();
+  }
+}
+
+/* ---- magbias(磁気オートチューン)パネル ---- */
+
+function renderMagbias() {
+  const st = magbiasStatus;
+  if (!st) return;
+  const profileOpts = (st.profiles || []).map((p) => ({
+    value: p.name,
+    label: p.delta_b_ut ? p.name : `${p.name}(Δbなし=適用不可)`,
+    title: p.delta_b_ut
+      ? `Δb=(${p.delta_b_ut.map((v) => v.toFixed(2)).join(", ")})µT`
+      : "ヨー励振不足(hover_residual のみ)",
+  }));
+  const preferred = st.applied ? st.applied.name : null;
+  rebuildSelect(els.magbiasSelect, profileOpts, preferred);
+  if (profileOpts.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(プロファイルなし)";
+    els.magbiasSelect.appendChild(opt);
+  }
+  const logOpts = (st.logs || []).map((f) => ({ value: f, label: f }));
+  rebuildSelect(els.magbiasLogSelect, logOpts);
+  if (logOpts.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(flight_logs に CSV なし)";
+    els.magbiasLogSelect.appendChild(opt);
+  }
+  const a = st.applied;
+  const banner = a
+    ? `magbias適用中: ${a.name} Δb=(${(a.delta_b_ut || [])
+        .map((v) => v.toFixed(2)).join(", ")})µT` +
+      `${a.verified ? "" : "(未検証)"}`
+    : "magbias: 未適用";
+  els.magbiasApplied.textContent = banner + (st.busy ? "(操作中…)" : "");
+  els.magbiasApplied.classList.toggle("applied", !!a);
+  if (st.message) els.magbiasMsg.textContent = st.message;
+}
+
+async function fetchMagbias() {
+  const body = await apiGet("/api/magbias", true);
+  if (body) {
+    magbiasStatus = body;
+    renderMagbias();
+  }
+}
+
+function setMagbiasStatus(resp) {
+  if (resp && Array.isArray(resp.profiles)) {
+    magbiasStatus = resp;
+    renderMagbias();
   }
 }
 
@@ -2267,6 +2368,7 @@ function refreshExperimentPanels() {
   fetchCalprof();
   fetchAccel6();
   fetchCal3d();
+  fetchMagbias();
 }
 
 /* ---- FF 適用(共通: mag3d 不一致時は confirm で force 再適用) ---- */
@@ -2768,6 +2870,67 @@ function wireEvents() {
     const resp = await apiPost("/api/ffprofile", { action: "delete", name });
     if (resp) setFfStatus(resp);
   }));
+
+  // 磁気オートチューン(EKF2)パネル
+  els.yawRefSelect.addEventListener("change", async () => {
+    yawRefSentAt = now();
+    const source = els.yawRefSelect.value;
+    const resp = await apiPost("/api/yawref", { source });
+    appendConsole("ui", resp && resp.ok
+      ? `ヨー基準ソース: ${source}`
+      : `ヨー基準ソース切替失敗: ${(resp && resp.message) || "不明なエラー"}`);
+  });
+  els.btnMagbiasExtract.addEventListener("click", () =>
+    withBusy(els.btnMagbiasExtract, async () => {
+      const log = els.magbiasLogSelect.value;
+      if (!log) {
+        els.magbiasMsg.textContent = "抽出元ログを選択してください";
+        return;
+      }
+      els.magbiasMsg.textContent = "抽出中…(最大2分)";
+      const resp = await apiPost("/api/magbias", { action: "extract", log });
+      if (resp) {
+        els.magbiasMsg.textContent = resp.ok
+          ? `抽出完了: ${resp.name}` +
+            (resp.warnings && resp.warnings.length
+              ? `(警告: ${resp.warnings.join(" / ")})` : "")
+          : `抽出失敗: ${resp.message || "不明なエラー"}`;
+        setMagbiasStatus(resp);
+      }
+    }));
+  els.btnMagbiasApply.addEventListener("click", () =>
+    withBusy(els.btnMagbiasApply, async () => {
+      const name = els.magbiasSelect.value;
+      if (!name) {
+        appendConsole("ui", "magbias プロファイルが選択されていません");
+        return;
+      }
+      let resp = await apiPost("/api/magbias", { action: "apply", name });
+      if (resp && !resp.ok && resp.binding_mismatch
+          && Array.isArray(resp.diffs)) {
+        const detail = resp.diffs.slice(0, 4).join("\n");
+        if (window.confirm(`機体の ffcal がプロファイル取得時と一致しません:\n${detail}\n\n強制適用しますか?(Δb の意味が変わっている可能性があります)`)) {
+          resp = await apiPost("/api/magbias",
+                               { action: "apply", name, force: true });
+        }
+      }
+      if (resp) {
+        appendConsole("ui", resp.ok
+          ? `magbias を適用しました: ${name}`
+          : `magbias 適用失敗: ${resp.message || "不明なエラー"}`);
+        setMagbiasStatus(resp);
+      }
+    }));
+  els.btnMagbiasClear.addEventListener("click", () =>
+    withBusy(els.btnMagbiasClear, async () => {
+      const resp = await apiPost("/api/magbias", { action: "clear" });
+      if (resp) {
+        appendConsole("ui", resp.ok
+          ? "magbias をクリアしました"
+          : `magbias クリア失敗: ${resp.message || "不明なエラー"}`);
+        setMagbiasStatus(resp);
+      }
+    }));
 
   // SPACE = どこからでも緊急STOP(Experiment 中はモーター停止も送出)
   // 例外: テキスト入力(プロファイル名・メモ等)へのフォーカス中のみ通常入力を

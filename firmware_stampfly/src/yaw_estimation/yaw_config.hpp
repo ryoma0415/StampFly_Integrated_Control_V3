@@ -175,3 +175,39 @@ static const float FF_EKF_AUTO_REANCHOR_COOLDOWN_S = 30.0f;
 // リファレンスCF は過渡誤差 (リキャプチャ 2°/更新の引き込み遅れ、7/10 実測で
 // −15° 前後) を持ち得るため、健全な EKF を優先してスナップを防ぐ。
 static const float FF_EKF_ANCHOR_PSI0_FRESH_S = 1.0f;
+
+// ---- EKF2 (est_mode=2、ヨー擬似観測付き。MAG_AUTOTUNE_DESIGN.md §2.1) ----
+// 既存 FF_EKF_* は現行EKF(est_mode=1)と共用の無改変値。ここから下は EKF2
+// 専用の「追加」定数のみ(V2契約: 既存定数の変更禁止・追加は可)。
+
+// [§2.1-1] ヨー擬似観測の観測ノイズ R_ψ: 通常 (2°)² / 基準ヨー低信頼
+// (CMD_POS_ERR flags bit4 = FLAG_YAW_REF_LOW_TRUST) 時 (6°)²
+static const float FF_EKF2_R_PSI_RAD2 =
+    (2.0f * DEG_TO_RAD) * (2.0f * DEG_TO_RAD);
+static const float FF_EKF2_R_PSI_LOW_TRUST_RAD2 =
+    (6.0f * DEG_TO_RAD) * (6.0f * DEG_TO_RAD);
+// [§2.1-1] ヨー観測イノベーションゲート: |y| > 30° は棄却+連続棄却カウンタ
+static const float FF_EKF2_YAW_GATE_RAD = 30.0f * DEG_TO_RAD;
+// [§2.1-1] 連続棄却がこの回数 (N≥25) に達したら融合停止ラッチ
+// (イノベーション値はテレメトリに残す。解除は reanchor / reseedYaw)
+static const uint8_t FF_EKF2_YAW_GATE_STOP_COUNT = 25;
+// [§2.1-1] ヨー観測の消費許容 age: CMD_POS_ERR 受信からこの時間以内の
+// ステージ分のみ EKF2 へ融合する(consume-once の防御的鮮度検査)
+static const uint32_t FF_EKF2_YAW_OBS_MAX_AGE_MS = 100;
+// [§2.1-2] τ_bm 適応: yaw_obs 健全 (最終受理 < 1.0s) なら q_bm 現行値の
+// ランダムウォーク、喪失 (≥1.0s) なら q_bm×0.1 の準凍結ホールド
+static const float FF_EKF2_YAW_OBS_HEALTHY_S = 1.0f;
+static const float FF_EKF2_Q_BM_LOST_FACTOR = 0.1f;
+// ekf2_status bit0 (yaw_obs_fresh): 直近のヨー観測「受信」からこの時間未満
+static const float FF_EKF2_YAW_FRESH_WINDOW_S = 1.0f;
+// ekf2_status bit1 (yaw_obs_fused): 直近のヨー観測「受理」からこの時間未満
+// (飛行状態再アンカーの yaw_obs_fused 条件もこの窓を使う)
+static const float FF_EKF2_YAW_FUSED_WINDOW_S = 0.5f;
+// [§2.1-3] 飛行状態再アンカー (1フライト1回) の発動条件:
+// flying 遷移後 >5s ∧ |alt_est−alt_ref|<0.1m が 2s 継続 ∧ 電流 >1.0A ∧
+// yaw_obs_fused。実行時 P_bm ← (2µT)²(P_ψ は維持 = P0 スナップ窓を開かない)
+static const float FF_EKF2_FLIGHT_ANCHOR_MIN_FLY_S = 5.0f;
+static const float FF_EKF2_FLIGHT_ANCHOR_ALT_TOL_M = 0.1f;
+static const float FF_EKF2_FLIGHT_ANCHOR_ALT_HOLD_S = 2.0f;
+static const float FF_EKF2_FLIGHT_ANCHOR_MIN_CURRENT_A = 1.0f;
+static const float FF_EKF2_FLIGHT_ANCHOR_P_BM_UT2 = 4.0f;  // (2 µT)²

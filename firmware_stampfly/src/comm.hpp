@@ -7,9 +7,10 @@
 // - 受信コールバック(WiFiタスク)は検証+portMUXメールボックス格納のみ。
 //   出力・ブロッキングは行わない。400Hzループが comm_consume_commands() で消費。
 // - WiFiチャネルは FLIGHT_CONFIG.wifi_channel に esp_wifi_set_channel でピン留め
-// - v2: 上り 0x14-0x23, 0x25(CMD_MODE〜CMD_FF_ANCHOR, CMD_LED_MODE)は
-//   リングバッファに積み、400Hzループ側が型別に deserialize して処理・
-//   TLM_ACK 応答する(0x24 は CMD_POS_ERR ストリームで別扱い)
+// - v2: 上り 0x14-0x23, 0x25-0x28(CMD_MODE〜CMD_FF_ANCHOR, CMD_LED_MODE,
+//   CMD_MAGBIAS_SET〜CMD_FLOW_PROBE)はリングバッファに積み、400Hzループ側が
+//   型別に deserialize して処理・TLM_ACK 応答する
+//   (0x24 は CMD_POS_ERR ストリームで別扱い)
 // ===========================================================================
 #pragma once
 
@@ -18,10 +19,10 @@
 
 #include "stampfly_protocol.hpp"
 
-// v2 コマンド(0x14-0x23, 0x25)1件分。payload は parse_frame と型別期待長の
+// v2 コマンド(0x14-0x23, 0x25-0x28)1件分。payload は parse_frame と型別期待長の
 // 検証を通過した生バイト列(消費側の flight_control が型別に deserialize する)。
 struct V2Command {
-    uint8_t type = 0;    // stampfly::MsgType の数値(0x14-0x23, 0x25)
+    uint8_t type = 0;    // stampfly::MsgType の数値(0x14-0x23, 0x25-0x28)
     uint32_t seq = 0;    // 論理フレーム seq(TLM_ACK の acked_seq に使う)
     uint8_t len = 0;     // payload 長
     uint8_t payload[stampfly::CmdMag3dSet::PAYLOAD_SIZE] = {0};  // 49B = v2 コマンドの最大

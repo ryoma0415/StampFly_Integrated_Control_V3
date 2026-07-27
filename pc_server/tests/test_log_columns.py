@@ -1,16 +1,20 @@
-"""ログ列契約 v5: 115 列(順序は docs/LOG_STRUCTURE.md と 1 対 1)。
+"""ログ列契約 v6: 136 列(順序は docs/LOG_STRUCTURE.md と 1 対 1)。
 
 v3 までの「末尾追加のみ」契約は v4 で破棄し、列の削除+追加+論理的な
 並び替えを行った(TLM_CTRL 追加に伴う全面再編)。v5 は v4 の 109 列を
-不変のまま、MoCap 正解ヨー/生クォータニオン 6 列を末尾に追加した
+不変のまま、MoCap 正解ヨー/生クォータニオン 6 列を末尾に追加した。
+v6 は v5 の 115 列を不変のまま、磁気オートチューン/フロー拡張 21 列
+(TLM_STATE 184B 拡張の tlm_* 16 列+PC 側ヨー基準/移動ベースヨー 5 列。
+MAG_AUTOTUNE_DESIGN.md §1.1 / §3)を末尾に追加した
 (旧ログとは列数で判別できる)。本テストが順序の正。
 """
 
 from __future__ import annotations
 
 import pytest
+import stampfly_protocol as proto
 
-from core.logger import COLUMNS, tlm_ctrl_to_row
+from core.logger import COLUMNS, tlm_ctrl_to_row, tlm_state_to_row
 
 from fakes import make_tlm_ctrl
 
@@ -80,6 +84,20 @@ V5_APPENDED_COLUMNS = (
     "mocap_qx", "mocap_qy", "mocap_qz", "mocap_qw",
 )
 
+# v6 で末尾に追加された磁気オートチューン/フロー拡張列(21)。
+# tlm_* 16 列は TLM_STATE 135B→184B 拡張(契約 §1.1)と 1 対 1、
+# 残る 5 列は PC 側のヨー基準ソース/送信値と移動ベースヨー(契約 §3)。
+V6_APPENDED_COLUMNS = (
+    "tlm_mag_cal_x_ut", "tlm_mag_cal_y_ut", "tlm_mag_cal_z_ut",
+    "tlm_mag_lev_x_ut", "tlm_mag_lev_y_ut",
+    "tlm_ekf2_yaw_rad", "tlm_ekf2_bm_x_ut", "tlm_ekf2_bm_y_ut",
+    "tlm_ekf2_yaw_innov_rad", "tlm_ekf2_status", "tlm_ekf2_gate",
+    "tlm_flow_vx_mps", "tlm_flow_vy_mps",
+    "tlm_flow_squal", "tlm_flow_status", "tlm_flow_dt_ms",
+    "yaw_ref_source", "yaw_ref_sent_rad", "yaw_ref_valid",
+    "motion_yaw_rad", "motion_yaw_J",
+)
+
 # v4 で削除された v3 列(残存すれば契約違反)
 V3_REMOVED_COLUMNS = (
     "roll_ref_deg", "pitch_ref_deg", "cmd_yaw_ref_deg", "marker_count",
@@ -89,15 +107,16 @@ V3_REMOVED_COLUMNS = (
 )
 
 
-def test_column_count_is_115():
+def test_column_count_is_136():
     assert len(V4_COLUMNS) == 109
-    assert len(COLUMNS) == 115
+    assert len(V4_COLUMNS + V5_APPENDED_COLUMNS) == 115
+    assert len(COLUMNS) == 136
 
 
-def test_columns_match_v5_contract_order():
-    """v5 = v4 の 109 列(順序不変)+末尾6列。旧ツールは先頭 109 列を
+def test_columns_match_v6_contract_order():
+    """v6 = v5 の 115 列(順序不変)+末尾21列。旧ツールは先頭 115 列を
     そのまま読める(末尾追加のみ)。"""
-    assert COLUMNS == V4_COLUMNS + V5_APPENDED_COLUMNS
+    assert COLUMNS == V4_COLUMNS + V5_APPENDED_COLUMNS + V6_APPENDED_COLUMNS
 
 
 def test_removed_v3_columns_absent():
@@ -121,6 +140,38 @@ def test_tlm_ctrl_to_row_covers_all_ctrl_columns():
             pytest.approx(ctrl.pid_ang[i]), (axis, term)
         assert row[f"tlm_pid_{axis}_rate_{term}"] == \
             pytest.approx(ctrl.pid_rate[i]), (axis, term)
+    # 転記キーはすべて COLUMNS に存在する
+    for key in row:
+        assert key in COLUMNS, key
+
+
+def test_tlm_state_to_row_covers_v6_extension_columns():
+    """TLM_STATE 184B 拡張(契約 §1.1)の 16 フィールドが tlm_* 列へ
+    漏れなく・正しい対応で転記される。"""
+    tlm = proto.TlmState(
+        mag_cal_x_ut=1.0, mag_cal_y_ut=2.0, mag_cal_z_ut=3.0,
+        mag_lev_x_ut=4.0, mag_lev_y_ut=5.0,
+        ekf2_yaw_rad=0.6, ekf2_bm_x_ut=7.0, ekf2_bm_y_ut=8.0,
+        ekf2_yaw_innov_rad=0.09, ekf2_status=0x2B, ekf2_gate=0x05,
+        flow_vx_mps=0.10, flow_vy_mps=-0.11,
+        flow_squal=120, flow_status=0x1F, flow_dt_ms=20)
+    row = tlm_state_to_row(tlm, age_s=0.0)
+    assert row["tlm_mag_cal_x_ut"] == pytest.approx(1.0)
+    assert row["tlm_mag_cal_y_ut"] == pytest.approx(2.0)
+    assert row["tlm_mag_cal_z_ut"] == pytest.approx(3.0)
+    assert row["tlm_mag_lev_x_ut"] == pytest.approx(4.0)
+    assert row["tlm_mag_lev_y_ut"] == pytest.approx(5.0)
+    assert row["tlm_ekf2_yaw_rad"] == pytest.approx(0.6)
+    assert row["tlm_ekf2_bm_x_ut"] == pytest.approx(7.0)
+    assert row["tlm_ekf2_bm_y_ut"] == pytest.approx(8.0)
+    assert row["tlm_ekf2_yaw_innov_rad"] == pytest.approx(0.09)
+    assert row["tlm_ekf2_status"] == 0x2B
+    assert row["tlm_ekf2_gate"] == 0x05
+    assert row["tlm_flow_vx_mps"] == pytest.approx(0.10)
+    assert row["tlm_flow_vy_mps"] == pytest.approx(-0.11)
+    assert row["tlm_flow_squal"] == 120
+    assert row["tlm_flow_status"] == 0x1F
+    assert row["tlm_flow_dt_ms"] == 20
     # 転記キーはすべて COLUMNS に存在する
     for key in row:
         assert key in COLUMNS, key

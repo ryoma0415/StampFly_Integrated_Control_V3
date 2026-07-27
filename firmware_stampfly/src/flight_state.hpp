@@ -105,8 +105,11 @@ struct CommandTrackingState {
     float pos_err_x_m = 0.0f;           // 受信した位置誤差(制御座標系)[m]
     float pos_err_y_m = 0.0f;
     bool pos_err_xy_valid = false;      // flags bit2(MoCap 新鮮+閉ループ有効)
-    float pos_mocap_yaw_rad = 0.0f;     // 受信した MoCap 実測ヨー [rad](診断用)
+    float pos_mocap_yaw_rad = 0.0f;     // 受信した外部ヨー基準 [rad](MoCap実測 or
+                                        // 移動ベース。EKF2 のヨー擬似観測へ配線)
     bool pos_mocap_yaw_valid = false;   // flags bit3
+    bool pos_mocap_yaw_low_trust = false;  // flags bit4(基準ヨー低信頼 → EKF2 の
+                                           // R_ψ 低信頼プリセット。契約 §1.2)
     uint32_t last_pos_err_ms = 0;       // 最後の pos_err 受信時刻 [ms]
     uint32_t prev_pos_err_ms = 0;       // 1つ前の受信時刻(XY PID の dt 根拠)[ms]
     bool pos_err_fresh_sample = false;  // 未処理の新サンプルがあるか(XY PID が消費)
@@ -169,7 +172,7 @@ struct SensorState {
     //      出力から毎tick転記し、telemetry(TLM_STATE 97-134)と飛行制御の
     //      ヨー角制御(次ステージ)が読む) ----
     volatile float Yaw_gyro_integral = 0.0f;  // Z軸角速度の単純積算 [rad](400Hz、ahrs_resetでゼロクリア)
-    volatile float Yaw_est_rad = 0.0f;        // アクティブ推定器ヨー [rad](est_mode=1:EKF ψ / 0:補正CF、FF無効時はリファレンスCF)
+    volatile float Yaw_est_rad = 0.0f;        // アクティブ推定器ヨー [rad](est_mode=2:EKF2 ψ / 1:EKF ψ / 0:補正CF、FF無効時はリファレンスCF)
     volatile float Yaw_ekf_rad = 0.0f;        // 4状態EKF の ψ [rad]
     volatile float Current_a = 0.0f;          // INA3221 CH2 総電流 [A](20Hz更新)
     volatile float Db_hat_x_ut = 0.0f;        // FF補正ベクトル ΔB̂ x [µT]
@@ -179,8 +182,30 @@ struct SensorState {
     volatile float Ekf_nis = 0.0f;            // 直近 EKF 更新の NIS
     volatile uint8_t Ekf_ffg = 0;             // EKF ゲート/健全性ビット(yaw側 ffg 定義)
     volatile uint8_t Ff_mode = 0;             // FF補正モード(0=off,1=方式A,2=方式B)
-    volatile uint8_t Est_mode = 0;            // 推定器選択(0=相補フィルタ,1=EKF)
+    volatile uint8_t Est_mode = 0;            // 推定器選択(0=相補フィルタ,1=EKF,2=EKF2)
     volatile uint8_t Ff_anchor_valid = 0;     // アイドルアンカー有効(0/1)
     volatile uint8_t Ff_cal_loaded = 0;       // FF係数確定済み(0/1)
     volatile uint8_t Mag_fresh = 0;           // fresh磁気が鮮度タイムアウト内(0/1)
+
+    // ---- 磁気オートチューン拡張(TLM_STATE 135-172。MAG_AUTOTUNE_DESIGN.md
+    //      §1.1。sensor.cpp が yaw_estimation/ の出力から毎tick転記する) ----
+    volatile float Mag_cal_x_ut = 0.0f;       // b_cal(mag3d後・FF補正前)機体系 x [µT]
+    volatile float Mag_cal_y_ut = 0.0f;       // 同 y [µT]
+    volatile float Mag_cal_z_ut = 0.0f;       // 同 z [µT]
+    volatile float Mag_lev_x_ut = 0.0f;       // FF補正+magbias+EMA後レベル化水平 x(=EKF観測 zx)[µT]
+    volatile float Mag_lev_y_ut = 0.0f;       // 同 y(=zy)[µT]
+    volatile float Ekf2_yaw_rad = 0.0f;       // EKF2 の ψ [rad](シャドー中も常時)
+    volatile float Ekf2_bm_x_ut = 0.0f;       // EKF2 の b_m x [µT]
+    volatile float Ekf2_bm_y_ut = 0.0f;       // 同 y [µT]
+    volatile float Ekf2_yaw_innov_rad = 0.0f; // 直近ヨー観測イノベーション [rad](未受信時0)
+    volatile uint8_t Ekf2_status = 0;         // EKF2_STATUS_* ビット(契約 §1.1)
+    volatile uint8_t Ekf2_gate = 0;           // EKF2 のゲートビット(ffg と同一定義)
+
+    // ---- オプティカルフロー拡張(TLM_STATE 173-183。MAG_AUTOTUNE_DESIGN.md
+    //      §1.1/§2.4。sensor.cpp が flow/ の出力から毎tick転記する) ----
+    volatile float Flow_vx_mps = 0.0f;        // フロー機体系 x 速度 [m/s](無効時0)
+    volatile float Flow_vy_mps = 0.0f;        // 同 y [m/s]
+    volatile uint8_t Flow_squal = 0;          // SQUAL 生値
+    volatile uint8_t Flow_status = 0;         // FLOW_STATUS_* ビット(契約 §1.1)
+    volatile uint8_t Flow_dt_ms = 0;          // フロー読み実測 dt [ms](0-255クランプ)
 };

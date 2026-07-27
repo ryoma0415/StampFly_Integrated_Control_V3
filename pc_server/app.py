@@ -4,7 +4,8 @@
 - static/ の配信(ビルド不要 vanilla JS UI)
 - REST: /api/ports, /api/airframes, /api/config
 - v2 REST(Experiment タブ): /api/sweep, /api/sequence, /api/cal3d,
-  /api/accel6, /api/quickcal, /api/geomag, /api/calprofile, /api/ffprofile
+  /api/accel6, /api/quickcal, /api/geomag, /api/calprofile, /api/ffprofile,
+  /api/magbias, /api/flow, /api/yawref
   (GET=状態、POST {"action": ...}=操作。core 層の戻り値 dict をそのまま返す)
 - WebSocket /ws: UI コマンド受付 + 20Hz 状態配信 + 即時 event/log 配信
   (v2 コマンド: set_mode "experiment" / experiment_activate / set_yaw_control /
@@ -388,6 +389,59 @@ async def api_ffprofile(body: dict) -> dict:
         return await asyncio.to_thread(session.ffprofile.delete,
                                        body.get("name"))
     return _UNKNOWN_ACTION
+
+
+@app.get("/api/magbias")
+async def api_magbias_status() -> dict:
+    return await asyncio.to_thread(session.magbias.status)
+
+
+@app.post("/api/magbias")
+async def api_magbias(body: dict) -> dict:
+    """magbias プロファイル操作(MAG_AUTOTUNE_DESIGN.md §3.4。単機のみ)。"""
+    action = body.get("action")
+    if action == "extract":
+        return await asyncio.to_thread(
+            session.magbias.extract, body.get("log"), body.get("name"))
+    if action == "apply":
+        return await asyncio.to_thread(
+            session.magbias.apply, body.get("name"), bool(body.get("force")))
+    if action == "clear":
+        return await asyncio.to_thread(session.magbias.clear)
+    if action == "delete":
+        return await asyncio.to_thread(session.magbias.delete,
+                                       body.get("name"))
+    if action == "status":
+        return await asyncio.to_thread(session.magbias.status)
+    return _UNKNOWN_ACTION
+
+
+@app.post("/api/flow")
+async def api_flow(body: dict) -> dict:
+    """flowcal 適用/クリアと flow probe のパススルー(契約 §3.5)。"""
+    action = body.get("action")
+    if action == "cal_set":
+        return await asyncio.to_thread(
+            session.magbias.flowcal_set, body.get("kx"), body.get("ky"))
+    if action == "cal_clear":
+        return await asyncio.to_thread(session.magbias.flowcal_clear)
+    if action == "probe":
+        return await asyncio.to_thread(
+            session.magbias.flow_probe, body.get("n_cycles", 0))
+    return _UNKNOWN_ACTION
+
+
+@app.get("/api/yawref")
+async def api_yawref_status() -> dict:
+    """ヨー基準ソース(off|mocap|motion)と移動ベースヨーの現況。"""
+    return await asyncio.to_thread(session.yaw_ref_status)
+
+
+@app.post("/api/yawref")
+async def api_yawref(body: dict) -> dict:
+    """ヨー基準ソースの実行時切替(契約 §3.1)。body: {"source": ...}。"""
+    return await asyncio.to_thread(
+        session.set_yaw_ref_source, str(body.get("source", "")))
 
 
 # ----------------------------------------------------------------------

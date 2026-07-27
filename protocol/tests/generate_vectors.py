@@ -94,7 +94,22 @@ def build_vectors() -> dict:
          "yaw_ref": 0.0, "mocap_yaw": 0.0, "flags": 0x01},
         pe0.to_payload()))
 
-    # --- 4. TLM_STATE: 全フィールド既知値(135B、v2 末尾追加分を含む)---
+    # --- 3e. CMD_POS_ERR(低信頼外部ヨー基準: bit3+bit4。MAG_AUTOTUNE §1.2)---
+    pe_lt = sp.CmdPosErr(err_x=0.1, err_y=-0.05, alt_ref=0.3,
+                         yaw_ref=0.5, mocap_yaw=-2.8,
+                         flags=(sp.CmdPosErr.FLAG_ALT_REF_VALID |
+                                sp.CmdPosErr.FLAG_YAW_REF_VALID |
+                                sp.CmdPosErr.FLAG_XY_ERR_VALID |
+                                sp.CmdPosErr.FLAG_MOCAP_YAW_VALID |
+                                sp.CmdPosErr.FLAG_YAW_REF_LOW_TRUST))
+    frames.append(frame_vector(
+        "cmd_pos_err_low_trust", "CMD_POS_ERR",
+        sp.MsgType.CMD_POS_ERR, 5,
+        {"err_x": 0.1, "err_y": -0.05, "alt_ref": 0.3,
+         "yaw_ref": 0.5, "mocap_yaw": -2.8, "flags": 0x1F},
+        pe_lt.to_payload()))
+
+    # --- 4. TLM_STATE: 全フィールド既知値(184B、磁気オートチューン拡張分を含む)---
     tlm_fields = {
         "seq_echo": 0x01020304,
         "elapsed_ms": 123456,
@@ -127,10 +142,33 @@ def build_vectors() -> dict:
                       sp.TlmState.FF_STATUS_FFCAL_LOADED |
                       sp.TlmState.FF_STATUS_YAW_CTRL_ACTIVE |
                       sp.TlmState.FF_STATUS_MAG_FRESH),
+        # 磁気オートチューン/フロー拡張(オフセット 135 以降。MAG_AUTOTUNE §1.1)
+        "mag_cal_x_ut": 24.5,
+        "mag_cal_y_ut": -13.75,
+        "mag_cal_z_ut": 38.25,
+        "mag_lev_x_ut": 27.9,
+        "mag_lev_y_ut": -3.1,
+        "ekf2_yaw_rad": 1.5533,
+        "ekf2_bm_x_ut": 2.4,
+        "ekf2_bm_y_ut": -1.6,
+        "ekf2_yaw_innov_rad": -0.021,
+        "ekf2_status": (sp.TlmState.EKF2_STATUS_YAW_OBS_FRESH |
+                        sp.TlmState.EKF2_STATUS_YAW_OBS_FUSED |
+                        sp.TlmState.EKF2_STATUS_TAU_RW_MODE |
+                        sp.TlmState.EKF2_STATUS_HEALTHY2),
+        "ekf2_gate": 0x03,
+        "flow_vx_mps": 0.12,
+        "flow_vy_mps": -0.08,
+        "flow_squal": 84,
+        "flow_status": (sp.TlmState.FLOW_STATUS_SENSOR_OK |
+                        sp.TlmState.FLOW_STATUS_BURST_OK |
+                        sp.TlmState.FLOW_STATUS_VEL_VALID |
+                        sp.TlmState.FLOW_STATUS_SQUAL_OK),
+        "flow_dt_ms": 20,
     }
     tlm = sp.TlmState(**tlm_fields)
     payload = tlm.to_payload()
-    assert len(payload) == 135
+    assert len(payload) == 184
     frames.append(frame_vector(
         "tlm_state_full", "TLM_STATE", sp.MsgType.TLM_STATE, 1000,
         tlm_fields, payload))
@@ -331,6 +369,32 @@ def build_vectors() -> dict:
         "cmd_led_mode_recording", "CMD_LED_MODE", sp.MsgType.CMD_LED_MODE, 36,
         {"mode": 1}, led_mode.to_payload()))
 
+    # --- 磁気オートチューン/フロー拡張(0x26–0x28。MAG_AUTOTUNE §1.4)---
+    magbias = sp.CmdMagbiasSet(mode=sp.CmdMagbiasSet.MODE_SET,
+                               dx=13.2, dy=-8.4, dz=2.1)
+    frames.append(frame_vector(
+        "cmd_magbias_set", "CMD_MAGBIAS_SET", sp.MsgType.CMD_MAGBIAS_SET, 37,
+        {"mode": 1, "dx": 13.2, "dy": -8.4, "dz": 2.1},
+        magbias.to_payload()))
+
+    magbias_clear = sp.CmdMagbiasSet(mode=sp.CmdMagbiasSet.MODE_CLEAR)
+    frames.append(frame_vector(
+        "cmd_magbias_clear", "CMD_MAGBIAS_SET", sp.MsgType.CMD_MAGBIAS_SET, 38,
+        {"mode": 0, "dx": 0.0, "dy": 0.0, "dz": 0.0},
+        magbias_clear.to_payload()))
+
+    flowcal = sp.CmdFlowcalSet(mode=sp.CmdFlowcalSet.MODE_SET,
+                               kx=452.5, ky=447.25)
+    frames.append(frame_vector(
+        "cmd_flowcal_set", "CMD_FLOWCAL_SET", sp.MsgType.CMD_FLOWCAL_SET, 39,
+        {"mode": 1, "kx": 452.5, "ky": 447.25},
+        flowcal.to_payload()))
+
+    flow_probe = sp.CmdFlowProbe(n_cycles=0)  # 0=既定 200 サイクル
+    frames.append(frame_vector(
+        "cmd_flow_probe", "CMD_FLOW_PROBE", sp.MsgType.CMD_FLOW_PROBE, 40,
+        {"n_cycles": 0}, flow_probe.to_payload()))
+
     # --- v2 新規下りメッセージ(0x32–0x34)---
     ack = sp.TlmAck(acked_type=int(sp.MsgType.CMD_FF_COMMIT), acked_seq=33,
                     status=sp.TlmAck.STATUS_OK)
@@ -361,7 +425,7 @@ def build_vectors() -> dict:
         exp_fields, exp_payload))
 
     cal_fields = {
-        "valid_flags": 0x3F,
+        "valid_flags": 0xFF,   # bit6=magbias, bit7=flowcal を含む全有効
         "mag3d_offset": mag3d_offset,
         "mag3d_matrix": mag3d_matrix,
         "accel6_offset": accel6_offset,
@@ -373,7 +437,9 @@ def build_vectors() -> dict:
         "ff_nlut": 8,
         "ff_crc32": 0xDEADBEEF,
         "ff_mode": 2,
-        "est_mode": 1,
+        "est_mode": 2,
+        "magbias": [13.2, -8.4, 2.1],
+        "flowcal": [452.5, 447.25],
     }
     cal = sp.TlmCalData(
         valid_flags=cal_fields["valid_flags"],
@@ -388,9 +454,11 @@ def build_vectors() -> dict:
         ff_nlut=cal_fields["ff_nlut"],
         ff_crc32=cal_fields["ff_crc32"],
         ff_mode=cal_fields["ff_mode"],
-        est_mode=cal_fields["est_mode"])
+        est_mode=cal_fields["est_mode"],
+        magbias=tuple(cal_fields["magbias"]),
+        flowcal=tuple(cal_fields["flowcal"]))
     cal_payload = cal.to_payload()
-    assert len(cal_payload) == 112
+    assert len(cal_payload) == 132
     frames.append(frame_vector(
         "tlm_cal_data_full", "TLM_CAL_DATA", sp.MsgType.TLM_CAL_DATA, 202,
         cal_fields, cal_payload))

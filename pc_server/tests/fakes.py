@@ -118,12 +118,14 @@ class FakeDroneResponder:
     """v2 上りコマンドに TLM_ACK / TLM_CAL_DATA を返すフェイク機体。
 
     - リレー: RLY_SET_TARGET → RLY_TARGET_ACK(make_ack_responder 同等)
-    - 0x14–0x23: TLM_ACK(acked_type / acked_seq エコー、status は
-      ack_status_overrides で型ごとに上書き可)
+    - 0x14–0x23 と 0x26–0x28(MAGBIAS/FLOWCAL/FLOW_PROBE): TLM_ACK
+      (acked_type / acked_seq エコー、status は ack_status_overrides で
+      型ごとに上書き可)。0x24 CMD_POS_ERR(ストリーム)/0x25 CMD_LED_MODE
+      は従来どおり応答しない
     - CMD_CAL_GET: TLM_CAL_DATA(self.cal_data)を返す
     - CMD_MAG3D_SET / ACCEL6_SET / ATTMOUNT_SET / YAWZERO_SET / GEOMAG_SET /
-      FF_COMMIT / FF_BEGIN / FF_MODE は self.cal_data に反映する
-      (キャリブプロファイル適用の読み戻し検証・FF CRC 照合を模擬)
+      FF_COMMIT / FF_BEGIN / FF_MODE / MAGBIAS_SET / FLOWCAL_SET は
+      self.cal_data に反映する(適用の読み戻し検証・CRC 照合を模擬)
     - drop_first_ack_types に入れた型は初回だけ ACK を落とす(リトライ試験)
     """
 
@@ -197,13 +199,31 @@ class FakeDroneResponder:
             msg = proto.CmdFfMode.from_payload(frame.payload)
             cal.ff_mode = msg.ff_mode
             cal.est_mode = msg.est_mode
+        elif t == proto.MsgType.CMD_MAGBIAS_SET:
+            msg = proto.CmdMagbiasSet.from_payload(frame.payload)
+            if msg.mode == proto.CmdMagbiasSet.MODE_SET:
+                cal.valid_flags |= proto.TlmCalData.VALID_MAGBIAS
+                cal.magbias = (msg.dx, msg.dy, msg.dz)
+            else:
+                cal.valid_flags &= ~proto.TlmCalData.VALID_MAGBIAS
+                cal.magbias = (0.0, 0.0, 0.0)
+        elif t == proto.MsgType.CMD_FLOWCAL_SET:
+            msg = proto.CmdFlowcalSet.from_payload(frame.payload)
+            if msg.mode == proto.CmdFlowcalSet.MODE_SET:
+                cal.valid_flags |= proto.TlmCalData.VALID_FLOWCAL
+                cal.flowcal = (msg.kx, msg.ky)
+            else:
+                cal.valid_flags &= ~proto.TlmCalData.VALID_FLOWCAL
+                cal.flowcal = (0.0, 0.0)
 
     def __call__(self, frame: proto.Frame):
         relay = self._relay(frame)
         if relay:
             return relay
         t = frame.type
-        if not (0x14 <= t <= 0x23):
+        # ACK 対象: キャリブ/FF 系 0x14–0x23+磁気オートチューン/フロー拡張
+        # 0x26–0x28(0x24 CMD_POS_ERR / 0x25 CMD_LED_MODE は除外)
+        if not (0x14 <= t <= 0x23 or 0x26 <= t <= 0x28):
             return None
         if t in self.drop_first_ack_types and t not in self._dropped_once:
             self._dropped_once.add(t)

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""合成ダミーフライトログ(v5・115列・50Hz)の生成スクリプト。
+"""合成ダミーフライトログ(v6・136列・50Hz)の生成スクリプト。
 
 flight_log_viewer の全機能(静止画・ヨー解析・アニメーション・レポート)を
-実ログなしで検証するための CSV を生成する。列は viewer.constants.V5_COLUMNS
-(= docs/LOG_STRUCTURE.md v5 契約の 115 列。TLM_CTRL 由来の指令角速度+
-姿勢 PID 成分 23 列を含む)と同一順序で出力する。
+実ログなしで検証するための CSV を生成する。列は viewer.constants.V6_COLUMNS
+(= v5 の 115 列+docs/MAG_AUTOTUNE_DESIGN.md §1.1/§3 の EKF2・磁気観測・
+フロー・ヨー基準 21 列)と同一順序で出力する。write_csv に columns を渡すと
+旧契約(V5_COLUMNS 等)の CSV も生成できる(v5 互換の回帰テスト用)。
 出力先は新レイアウト <repo>/logs/flight_logs/。
 
 シナリオ(position / multi モード):
@@ -17,6 +18,10 @@ flight_log_viewer の全機能(静止画・ヨー解析・アニメーション�
     Madgwick / EKF / MoCap は実機同様ラップして出力する。
   - NIS スパイクと ffg ゲート発火(bit0/1/4 と bit7 再捕捉中)、
     b_m の緩慢ドリフトも合成する。
+  - v6 列: EKF2(シャドーヨー・b_m・イノベーション・status/gate)、
+    磁気観測(b_cal 3軸・レベル化 z)、フロー(vx/vy・SQUAL・status・dt)、
+    PC 側ヨー基準(yaw_ref_source="mocap" 等)を合成する。EKF2 は EKF1 より
+    小さい b_m とバイアスで真値に追従させる(EKF2 比較パネルの検証用)。
   - CMD_POS_ERR 診断列(cmd_err_*)は機上XY制御相当の値を合成する。
   - TLM_CTRL 列(指令角速度+角度/角速度ループ PID 成分+flags)は
     P+I+D=指令角速度の関係と PID リセット(非飛行・ヨー制御OFF で成分 0)、
@@ -52,6 +57,8 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 
 from viewer.constants import (  # noqa: E402
+    EKF2_STATUS_YAW_OBS_FRESH,
+    EKF2_STATUS_YAW_OBS_FUSED,
     FF_STATUS_ANCHOR_VALID,
     FF_STATUS_EST_EKF,
     FF_STATUS_FFCAL_LOADED,
@@ -63,7 +70,7 @@ from viewer.constants import (  # noqa: E402
     TLM_CTRL_FLAG_YAW_CTRL,
     TLM_FLAG_FLYING,
     TLM_FLAG_SETPOINT_FRESH,
-    V5_COLUMNS,
+    V6_COLUMNS,
 )
 
 # 新レイアウト: 飛行ログは <repo>/logs/flight_logs/ に置く
@@ -92,6 +99,27 @@ FFG_R_INFLATED = 1 << 0
 FFG_NIS_REJECT = 1 << 1
 FFG_TILT_SKIP = 1 << 4
 FFG_RECAPTURE = 1 << 7   # 再捕捉中(棄却継続後の制限付き引き込み)
+
+# ekf2_status の追加ビット(契約 §1.1。fresh/fused は viewer.constants から)
+EKF2_FLIGHT_ANCHOR_DONE = 1 << 2
+EKF2_TAU_RW_MODE = 1 << 3
+EKF2_HEALTHY2 = 1 << 5
+
+# flow_status ビット(契約 §1.1)
+FLOW_SENSOR_OK = 1 << 0
+FLOW_BURST_OK = 1 << 1
+FLOW_VEL_VALID = 1 << 2
+FLOW_RANGE_VALID = 1 << 3
+FLOW_SQUAL_OK = 1 << 4
+
+# v6 磁気観測の合成パラメータ(もっともらしい値)
+MAG_B0H_UT = 31.0        # 水平地磁気 [µT]
+MAG_B0Z_UT = -35.0       # 鉛直地磁気 [µT]
+MAG_FF_RESIDUAL_UT = 4.0  # 飛行中 FF 残差(機体固定方向)[µT]
+
+# EKF2 の合成パラメータ(EKF1 より良い追従を再現)
+EKF2_BIAS_DEG = 0.2
+EKF2_BM_FINAL_UT = 0.8   # b_m 最終値(EKF1 の 2.8µT より小さい)
 
 # シナリオの時間配分(duration=40s 基準の比率)
 PHASE_CONNECT_END = 0.05     # 接続(地上)
@@ -179,7 +207,7 @@ def generate_rows(
 
     for i in range(n_rows):
         t = i * dt
-        row: dict = {col: None for col in V5_COLUMNS}
+        row: dict = {col: None for col in V6_COLUMNS}
 
         # ---- フェーズ判定 ----
         if t < t_connect:
@@ -494,17 +522,90 @@ def generate_rows(
             for comp, value in zip(("p", "i", "d"), pid_rate[axis]):
                 row[f"tlm_pid_{axis}_rate_{comp}"] = value
 
+        # ---- v6: 磁気観測 / EKF2 / フロー(TLM は全モード常時送出) ----
+        # b_cal: 機体系 = R_z(-ψ)·B0h + FF 残差(飛行中・機体固定方向)
+        yaw_rad = math.radians(yaw_true_deg)
+        ff_res = MAG_FF_RESIDUAL_UT if flying else 0.0
+        row["tlm_mag_cal_x_ut"] = (MAG_B0H_UT * math.cos(yaw_rad)
+                                   + ff_res * 0.8 + float(rng.normal(0, 0.3)))
+        row["tlm_mag_cal_y_ut"] = (-MAG_B0H_UT * math.sin(yaw_rad)
+                                   + ff_res * 0.6 + float(rng.normal(0, 0.3)))
+        row["tlm_mag_cal_z_ut"] = (MAG_B0Z_UT - ff_res * 0.4
+                                   + float(rng.normal(0, 0.3)))
+        # レベル化観測 z(FF 補正後: 残差の一部だけ残る想定)
+        row["tlm_mag_lev_x_ut"] = (MAG_B0H_UT * math.cos(yaw_rad)
+                                   + ff_res * 0.1 + float(rng.normal(0, 0.2)))
+        row["tlm_mag_lev_y_ut"] = (-MAG_B0H_UT * math.sin(yaw_rad)
+                                   + ff_res * 0.1 + float(rng.normal(0, 0.2)))
+        # EKF2(シャドー): EKF1 より小さいバイアス・b_m で真値追従
+        ekf2_deg = yaw_true_deg + EKF2_BIAS_DEG + float(rng.normal(0, 0.15))
+        row["tlm_ekf2_yaw_rad"] = _wrap_pi(math.radians(ekf2_deg))
+        row["tlm_ekf2_bm_x_ut"] = (EKF2_BM_FINAL_UT * min(t / duration_s, 1.0)
+                                   + float(rng.normal(0, 0.03)))
+        row["tlm_ekf2_bm_y_ut"] = (-0.5 * EKF2_BM_FINAL_UT
+                                   * min(t / duration_s, 1.0)
+                                   + float(rng.normal(0, 0.03)))
+        # ヨー観測は飛行中 50Hz で受理(fused は 5 行に 4 行)
+        ekf2_status = 0
+        ekf2_fused = flying and (i % 5 != 0)
+        if flying:
+            ekf2_status |= EKF2_STATUS_YAW_OBS_FRESH | EKF2_TAU_RW_MODE \
+                | EKF2_HEALTHY2
+            if ekf2_fused:
+                ekf2_status |= EKF2_STATUS_YAW_OBS_FUSED
+            if t >= t_hover:  # ホバ安定後に飛行状態再アンカー実施済み
+                ekf2_status |= EKF2_FLIGHT_ANCHOR_DONE
+        row["tlm_ekf2_status"] = ekf2_status
+        row["tlm_ekf2_yaw_innov_rad"] = (
+            math.radians(float(rng.normal(0, 0.4))) if ekf2_fused else 0.0)
+        ekf2_gate = 0
+        if flying and t_spike1 <= t < t_spike1 + 0.4:
+            ekf2_gate |= FFG_R_INFLATED
+        row["tlm_ekf2_gate"] = ekf2_gate
+        # フロー(ride-along): burst 成立・飛行中のみ速度有効
+        if flying:
+            row["tlm_flow_vx_mps"] = (0.15 * math.sin(2.0 * math.pi * t / 5.0)
+                                      + float(rng.normal(0, 0.02)))
+            row["tlm_flow_vy_mps"] = (0.12 * math.cos(2.0 * math.pi * t / 6.0)
+                                      + float(rng.normal(0, 0.02)))
+            row["tlm_flow_squal"] = int(80 + rng.normal(0, 5))
+            row["tlm_flow_status"] = (FLOW_SENSOR_OK | FLOW_BURST_OK
+                                      | FLOW_VEL_VALID | FLOW_RANGE_VALID
+                                      | FLOW_SQUAL_OK)
+        else:
+            row["tlm_flow_vx_mps"] = 0.0
+            row["tlm_flow_vy_mps"] = 0.0
+            row["tlm_flow_squal"] = int(30 + rng.normal(0, 3))
+            row["tlm_flow_status"] = FLOW_SENSOR_OK | FLOW_BURST_OK
+        row["tlm_flow_dt_ms"] = int(max(0, min(255, 20 + rng.normal(0, 1))))
+
+        # ---- v6: PC 側ヨー基準列(MoCap のある position / multi のみ) ----
+        if fills_position:
+            row["yaw_ref_source"] = "mocap"
+            row["yaw_ref_sent_rad"] = math.radians(_wrap_deg(yaw_true_noisy))
+            row["yaw_ref_valid"] = 1 if flying else 0
+            row["motion_yaw_rad"] = math.radians(
+                _wrap_deg(yaw_true_deg + float(rng.normal(0, 2.0))))
+            row["motion_yaw_J"] = (0.5 + (0.5 if in_circle else 0.0)
+                                   + float(rng.normal(0, 0.05)))
+
         rows.append(row)
     return rows
 
 
-def write_csv(rows: list[dict], out_path: Path) -> None:
+def write_csv(rows: list[dict], out_path: Path,
+              columns: tuple[str, ...] = V6_COLUMNS) -> None:
+    """rows を columns の順で CSV 出力する。
+
+    columns に V5_COLUMNS 等の旧契約を渡すと v6 追加列を落とした
+    旧バージョン相当の CSV になる(互換回帰テスト用)。
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(V5_COLUMNS)
+        writer.writerow(columns)
         for row in rows:
-            writer.writerow([_fmt(row.get(col)) for col in V5_COLUMNS])
+            writer.writerow([_fmt(row.get(col)) for col in columns])
 
 
 def _cleanup_legacy_dummies() -> None:
@@ -521,7 +622,7 @@ def make_single(mode: str, duration_s: float, out_path: Path | None = None) -> P
     out_path = out_path or (DEFAULT_LOGS_DIR / f"dummy_{mode}.csv")
     rows = generate_rows(mode, duration_s)
     write_csv(rows, out_path)
-    print(f"生成完了: {out_path} ({len(rows)}行 × {len(V5_COLUMNS)}列, mode={mode})")
+    print(f"生成完了: {out_path} ({len(rows)}行 × {len(V6_COLUMNS)}列, mode={mode})")
     return out_path
 
 
@@ -536,14 +637,14 @@ def make_multi_group(duration_s: float, ts: str = DUMMY_MULTI_TS) -> list[Path]:
             circle_phase0=phase0, seed=seed,
         )
         write_csv(rows, out_path)
-        print(f"生成完了: {out_path} ({len(rows)}行 × {len(V5_COLUMNS)}列, "
+        print(f"生成完了: {out_path} ({len(rows)}行 × {len(V6_COLUMNS)}列, "
               f"mode=multi, drone={name})")
         paths.append(out_path)
     return paths
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="ダミーフライトログ(v4・109列)の生成")
+    parser = argparse.ArgumentParser(description="ダミーフライトログ(v6・136列)の生成")
     parser.add_argument("--mode", choices=("all", "position", "posture", "multi"),
                         default="all",
                         help="生成対象(既定 all = posture/position/multi×2 の4本。"

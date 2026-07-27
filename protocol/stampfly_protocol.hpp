@@ -45,7 +45,7 @@ constexpr size_t RLY_MAX_PEERS = 4;        // RLY_SET_PEERS の最大登録数(=
 constexpr size_t RLY_PEER_ENTRY_SIZE = 7;  // mac(6) + tlm_state_div(1)
 constexpr size_t MUX_HEADER_SIZE = 1;      // RLY_MUX_UP/DOWN の node_id(1B)
 // エンベロープに収まる内側フレームの最大ペイロード長(= 200 - 1 - 9 = 190)。
-// 既存の全メッセージ(最大 TLM_STATE 135B)が収まる。
+// 既存の全メッセージ(最大 TLM_STATE 184B)が収まる。
 constexpr size_t MAX_MUX_INNER_PAYLOAD =
     MAX_PAYLOAD_SIZE - MUX_HEADER_SIZE - FRAME_OVERHEAD;
 
@@ -82,12 +82,18 @@ enum class MsgType : uint8_t {
   CMD_FF_ANCHOR = 0x23,    // アンカー再取得要求(payload 0B)
   CMD_POS_ERR = 0x24,      // XY位置誤差+高度+ヨー目標(21B、機上XY制御。ハートビート兼用 50Hz)
   CMD_LED_MODE = 0x25,     // LED 表示モード切替(1B、計測中インジケータ)
+  // 磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.4。追加のみ・
+  // ver=0x02 のまま。契約書記載の 0x24-0x26 は既存 CMD_POS_ERR / CMD_LED_MODE
+  // と衝突するため、空きの 0x26-0x28 を同順で割当)
+  CMD_MAGBIAS_SET = 0x26,  // 学習ハードアイアン残差 Δb 適用/クリア(13B)
+  CMD_FLOWCAL_SET = 0x27,  // フロースケール適用/クリア(9B)
+  CMD_FLOW_PROBE = 0x28,   // PMW3901 burst プローブ実行(1B)
   // 下り(ドローン -> PC): 0x30–0x4F
-  TLM_STATE = 0x30,        // フル状態テレメトリ(135B、25Hz)
+  TLM_STATE = 0x30,        // フル状態テレメトリ(184B、25Hz)
   TLM_EVENT = 0x31,        // 状態遷移イベント(8B、即時+2Hz)
-  TLM_ACK = 0x32,          // 0x14–0x23, 0x25 コマンドへの応答(6B)
+  TLM_ACK = 0x32,          // 0x14–0x23, 0x25–0x28 コマンドへの応答(6B)
   TLM_EXP = 0x33,          // 実験テレメトリ(86B、MOTOR_TEST 中のみ 25Hz)
-  TLM_CAL_DATA = 0x34,     // キャリブ一括データ(112B、CMD_CAL_GET 応答)
+  TLM_CAL_DATA = 0x34,     // キャリブ一括データ(132B、CMD_CAL_GET 応答)
   TLM_CTRL = 0x35,         // 制御ループ診断テレメトリ(89B、25Hz 常時)
   // ログ(リレー/ドローン -> PC)
   LOG_TEXT = 0x40,      // 人間向けテキスト(1〜181B)
@@ -418,20 +424,24 @@ inline bool deserialize(const uint8_t* in, size_t len, CmdSetpoint* out) {
 // 角度指令の代わりに制御座標系の位置誤差(目標 − フィルタ済み現在位置)を送り、
 // 機体側が自身のヨー推定で誤差を機体座標系へ回転(ヨー回転補償)してから
 // XY PID を回す。alt_ref / yaw_ref / flags bit0-1 の意味は CMD_SETPOINT と同一。
-// mocap_yaw は MoCap 実測の制御座標系ヨー(フレーム整合検証・ログ用。bit3 有効時のみ)。
+// mocap_yaw は外部ヨー基準(制御座標系ヨー。ソースは PC 側設定: MoCap 実測 or
+// 移動ベースヨー。名称は互換のため維持)。ファームはソース非依存に消費し、
+// EKF2(est_mode=2)のヨー擬似観測・フレーム整合検証・ログに用いる(bit3 有効時のみ)。
+// bit4 は基準ヨー低信頼 → R_ψ 低信頼プリセット切替(MAG_AUTOTUNE_DESIGN.md §1.2)。
 struct CmdPosErr {
   static constexpr MsgType TYPE = MsgType::CMD_POS_ERR;
   static constexpr size_t PAYLOAD_SIZE = 4 + 4 + 4 + 4 + 4 + 1;
-  static constexpr uint8_t FLAG_ALT_REF_VALID = 0x01;    // bit0(CMD_SETPOINT と同義)
-  static constexpr uint8_t FLAG_YAW_REF_VALID = 0x02;    // bit1(同上)
-  static constexpr uint8_t FLAG_XY_ERR_VALID = 0x04;     // bit2: err_x/err_y 有効
-  static constexpr uint8_t FLAG_MOCAP_YAW_VALID = 0x08;  // bit3: mocap_yaw 有効
+  static constexpr uint8_t FLAG_ALT_REF_VALID = 0x01;      // bit0(CMD_SETPOINT と同義)
+  static constexpr uint8_t FLAG_YAW_REF_VALID = 0x02;      // bit1(同上)
+  static constexpr uint8_t FLAG_XY_ERR_VALID = 0x04;       // bit2: err_x/err_y 有効
+  static constexpr uint8_t FLAG_MOCAP_YAW_VALID = 0x08;    // bit3: mocap_yaw(外部ヨー基準)有効
+  static constexpr uint8_t FLAG_YAW_REF_LOW_TRUST = 0x10;  // bit4: 基準ヨー低信頼
 
   float err_x = 0.0f;      // m(制御座標系。target - filtered)
   float err_y = 0.0f;      // m
   float alt_ref = 0.0f;    // m
   float yaw_ref = 0.0f;    // rad(±π、機体ヨー角目標)
-  float mocap_yaw = 0.0f;  // rad(±π、MoCap 実測ヨー。bit3 有効時のみ)
+  float mocap_yaw = 0.0f;  // rad(±π、外部ヨー基準。bit3 有効時のみ)
   uint8_t flags = 0;
 };
 static_assert(CmdPosErr::PAYLOAD_SIZE == 21, "PROTOCOL.md: CMD_POS_ERR payload = 21B");
@@ -789,6 +799,7 @@ inline bool deserialize(const uint8_t* in, size_t len, CmdFfCommit* out) {
 }
 
 // 0x22 CMD_FF_MODE(2B)— ff_mode / est_mode の実行時切替(NVS 永続化)。
+// est_mode の受理範囲は 0..2(2=EKF2、MAG_AUTOTUNE_DESIGN.md §1.3)。
 struct CmdFfMode {
   static constexpr MsgType TYPE = MsgType::CMD_FF_MODE;
   static constexpr size_t PAYLOAD_SIZE = 1 + 1;
@@ -797,6 +808,7 @@ struct CmdFfMode {
   static constexpr uint8_t FF_MODE_B = 2;
   static constexpr uint8_t EST_MODE_COMPLEMENTARY = 0;  // 補正相補フィルタ
   static constexpr uint8_t EST_MODE_EKF = 1;
+  static constexpr uint8_t EST_MODE_EKF2 = 2;           // ヨー擬似観測付き EKF2
 
   uint8_t ff_mode = 0;
   uint8_t est_mode = 0;
@@ -843,10 +855,104 @@ inline bool deserialize(const uint8_t* in, size_t len, CmdLedMode* out) {
   return true;
 }
 
-// 0x30 TLM_STATE(135B)— フル状態テレメトリ(25Hz、400Hzループの16分周)。
+// 0x26 CMD_MAGBIAS_SET(13B)— 学習ハードアイアン残差 Δb の適用/クリア。
+// Δb [µT, b_cal 空間] を NVS `magbias` へ保存し即適用(mode=0 でクリア)。
+// ff_mode は降格しない(FF 係数は b_cal 空間のまま有効)。適用時: アンカー
+// 無効化+窓リセット+補正系再シード(mag3d 変更時と同パターン、ff_mode 降格
+// だけしない)。WAIT / COMPLETE / MOTOR_TEST のみ受理(MAG_AUTOTUNE_DESIGN.md §1.4)。
+struct CmdMagbiasSet {
+  static constexpr MsgType TYPE = MsgType::CMD_MAGBIAS_SET;
+  static constexpr size_t PAYLOAD_SIZE = 1 + 4 * 3;
+  static constexpr uint8_t MODE_CLEAR = 0;
+  static constexpr uint8_t MODE_SET = 1;
+
+  uint8_t mode = 0;  // 0=clear, 1=set
+  float dx = 0.0f;   // µT(b_cal 空間の Δb x)
+  float dy = 0.0f;   // µT(同 y)
+  float dz = 0.0f;   // µT(同 z)
+};
+static_assert(CmdMagbiasSet::PAYLOAD_SIZE == 13, "PROTOCOL.md: CMD_MAGBIAS_SET payload = 13B");
+
+inline bool serialize(const CmdMagbiasSet& m, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap < CmdMagbiasSet::PAYLOAD_SIZE) return false;
+  wr_u8(out + 0, m.mode);
+  wr_f32(out + 1, m.dx);
+  wr_f32(out + 5, m.dy);
+  wr_f32(out + 9, m.dz);
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, CmdMagbiasSet* out) {
+  if (in == nullptr || out == nullptr || len != CmdMagbiasSet::PAYLOAD_SIZE) return false;
+  out->mode = rd_u8(in + 0);
+  out->dx = rd_f32(in + 1);
+  out->dy = rd_f32(in + 5);
+  out->dz = rd_f32(in + 9);
+  return true;
+}
+
+// 0x27 CMD_FLOWCAL_SET(9B)— フロースケール [counts/rad] の適用/クリア。
+// NVS `flowcal` へ保存(mode=0 でクリア=既定 450.0 に戻る)。
+// WAIT / COMPLETE / MOTOR_TEST のみ受理(MAG_AUTOTUNE_DESIGN.md §1.4)。
+struct CmdFlowcalSet {
+  static constexpr MsgType TYPE = MsgType::CMD_FLOWCAL_SET;
+  static constexpr size_t PAYLOAD_SIZE = 1 + 4 + 4;
+  static constexpr uint8_t MODE_CLEAR = 0;
+  static constexpr uint8_t MODE_SET = 1;
+
+  uint8_t mode = 0;  // 0=clear, 1=set
+  float kx = 0.0f;   // counts/rad
+  float ky = 0.0f;   // counts/rad
+};
+static_assert(CmdFlowcalSet::PAYLOAD_SIZE == 9, "PROTOCOL.md: CMD_FLOWCAL_SET payload = 9B");
+
+inline bool serialize(const CmdFlowcalSet& m, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap < CmdFlowcalSet::PAYLOAD_SIZE) return false;
+  wr_u8(out + 0, m.mode);
+  wr_f32(out + 1, m.kx);
+  wr_f32(out + 5, m.ky);
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, CmdFlowcalSet* out) {
+  if (in == nullptr || out == nullptr || len != CmdFlowcalSet::PAYLOAD_SIZE) return false;
+  out->mode = rd_u8(in + 0);
+  out->kx = rd_f32(in + 1);
+  out->ky = rd_f32(in + 5);
+  return true;
+}
+
+// 0x28 CMD_FLOW_PROBE(1B)— PMW3901 burst プローブ実行。
+// モーター停止時のみ(回転中は status=busy で拒否)。結果は LOG_TEXT 複数行
+// (agree_ratio 等の要約)+ probe 成功で burst_ok ラッチ更新。n_cycles=0 は
+// 既定 200 サイクル。WAIT / COMPLETE / MOTOR_TEST のみ受理。
+struct CmdFlowProbe {
+  static constexpr MsgType TYPE = MsgType::CMD_FLOW_PROBE;
+  static constexpr size_t PAYLOAD_SIZE = 1;
+  static constexpr uint8_t DEFAULT_CYCLES = 200;
+
+  uint8_t n_cycles = 0;  // プローブサイクル数(0=既定 200)
+};
+static_assert(CmdFlowProbe::PAYLOAD_SIZE == 1, "PROTOCOL.md: CMD_FLOW_PROBE payload = 1B");
+
+inline bool serialize(const CmdFlowProbe& m, uint8_t* out, size_t cap) {
+  if (out == nullptr || cap < CmdFlowProbe::PAYLOAD_SIZE) return false;
+  wr_u8(out + 0, m.n_cycles);
+  return true;
+}
+
+inline bool deserialize(const uint8_t* in, size_t len, CmdFlowProbe* out) {
+  if (in == nullptr || out == nullptr || len != CmdFlowProbe::PAYLOAD_SIZE) return false;
+  out->n_cycles = rd_u8(in + 0);
+  return true;
+}
+
+// 0x30 TLM_STATE(184B)— フル状態テレメトリ(25Hz、400Hzループの16分周)。
 // オフセットは PROTOCOL.md の表と1対1対応(宣言順に隙間なくパック)。
 // v2: 末尾追加のみ(既存オフセット 0–96 は v1 と不変。serial_link.py が
 // seq_echo を先頭オフセット直読みするため末尾追加限定)。
+// 磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.1): オフセット
+// 135 以降を末尾追加して 135B → 184B(旧 135B フレームは受理しない)。
 struct TlmState {
   static constexpr MsgType TYPE = MsgType::TLM_STATE;
   static constexpr size_t PAYLOAD_SIZE =
@@ -867,17 +973,39 @@ struct TlmState {
       4 * 2 +              // db_hat_x_ut, db_hat_y_ut(v2)
       4 * 2 +              // bm_x_ut, bm_y_ut(v2)
       4 +                  // nis(v2)
-      1 + 1;               // ffg, ff_status(v2)
+      1 + 1 +              // ffg, ff_status(v2)
+      4 * 5 +              // mag_cal_x/y/z_ut, mag_lev_x/y_ut(磁気オートチューン拡張)
+      4 * 4 +              // ekf2_yaw_rad, ekf2_bm_x/y_ut, ekf2_yaw_innov_rad(同)
+      1 + 1 +              // ekf2_status, ekf2_gate(同)
+      4 * 2 +              // flow_vx_mps, flow_vy_mps(同)
+      1 + 1 + 1;           // flow_squal, flow_status, flow_dt_ms(同)
   static constexpr uint8_t FLAG_LOW_VOLTAGE = 0x01;     // bit0
   static constexpr uint8_t FLAG_SETPOINT_FRESH = 0x02;  // bit1 (<200ms)
   static constexpr uint8_t FLAG_FLYING = 0x04;          // bit2
   // ff_status ビット定義(v2)
   static constexpr uint8_t FF_STATUS_FF_MODE_MASK = 0x03;    // bit0-1: ff_mode(0-2)
-  static constexpr uint8_t FF_STATUS_EST_EKF = 0x04;         // bit2: est_mode(1=EKF)
+  static constexpr uint8_t FF_STATUS_EST_EKF = 0x04;         // bit2: est_mode==1(EKF)
   static constexpr uint8_t FF_STATUS_ANCHOR_VALID = 0x08;    // bit3
   static constexpr uint8_t FF_STATUS_FFCAL_LOADED = 0x10;    // bit4
   static constexpr uint8_t FF_STATUS_YAW_CTRL_ACTIVE = 0x20; // bit5
   static constexpr uint8_t FF_STATUS_MAG_FRESH = 0x40;       // bit6
+  static constexpr uint8_t FF_STATUS_EST_EKF2 = 0x80;        // bit7: est_mode==2(EKF2。
+                                                             // bit2/bit7 とも 0 なら相補CF)
+  // ekf2_status ビット定義(MAG_AUTOTUNE_DESIGN.md §1.1)
+  static constexpr uint8_t EKF2_STATUS_YAW_OBS_FRESH = 0x01;       // bit0: ヨー観測受信 <1s
+  static constexpr uint8_t EKF2_STATUS_YAW_OBS_FUSED = 0x02;       // bit1: 直近 0.5s 内に受理
+  static constexpr uint8_t EKF2_STATUS_FLIGHT_ANCHOR_DONE = 0x04;  // bit2
+  static constexpr uint8_t EKF2_STATUS_TAU_RW_MODE = 0x08;         // bit3: q_bm RWモード
+  static constexpr uint8_t EKF2_STATUS_BM_FROZEN = 0x10;           // bit4
+  static constexpr uint8_t EKF2_STATUS_HEALTHY2 = 0x20;            // bit5
+  static constexpr uint8_t EKF2_STATUS_YAW_OBS_LOW_TRUST = 0x40;   // bit6(bit7 予約)
+  // flow_status ビット定義(MAG_AUTOTUNE_DESIGN.md §1.1)
+  static constexpr uint8_t FLOW_STATUS_SENSOR_OK = 0x01;    // bit0
+  static constexpr uint8_t FLOW_STATUS_BURST_OK = 0x02;     // bit1
+  static constexpr uint8_t FLOW_STATUS_VEL_VALID = 0x04;    // bit2
+  static constexpr uint8_t FLOW_STATUS_RANGE_VALID = 0x08;  // bit3
+  static constexpr uint8_t FLOW_STATUS_SQUAL_OK = 0x10;     // bit4
+  static constexpr uint8_t FLOW_STATUS_INIT_RETRY = 0x20;   // bit5(bit6-7 予約)
 
   uint32_t seq_echo = 0;      // 最後に適用した CMD_SETPOINT / CMD_POS_ERR の seq(未受信なら0)
   uint32_t elapsed_ms = 0;    // 起動からの経過 [ms]
@@ -918,8 +1046,25 @@ struct TlmState {
   float nis = 0.0f;               // 直近 EKF 更新の NIS
   uint8_t ffg = 0;                // EKF ゲート/健全性ビット(yaw側 ffg 定義踏襲)
   uint8_t ff_status = 0;          // FF_STATUS_* ビット
+  // --- 磁気オートチューン/フロー拡張(オフセット 135 以降。契約 §1.1) ---
+  float mag_cal_x_ut = 0.0f;      // µT(b_cal = mag3d 適用後・FF 補正前、機体系 x)
+  float mag_cal_y_ut = 0.0f;      // µT(同 y)
+  float mag_cal_z_ut = 0.0f;      // µT(同 z)
+  float mag_lev_x_ut = 0.0f;      // µT(FF補正+magbias+EMA後レベル化水平 x = EKF観測 zx)
+  float mag_lev_y_ut = 0.0f;      // µT(同 y = zy)
+  float ekf2_yaw_rad = 0.0f;      // rad(EKF2 の ψ。シャドー中も常時)
+  float ekf2_bm_x_ut = 0.0f;      // µT(EKF2 の b_mx)
+  float ekf2_bm_y_ut = 0.0f;      // µT(同 b_my)
+  float ekf2_yaw_innov_rad = 0.0f;  // rad(直近ヨー観測イノベーション。未受信時 0)
+  uint8_t ekf2_status = 0;        // EKF2_STATUS_* ビット
+  uint8_t ekf2_gate = 0;          // EKF2 のゲートビット(ffg と同一ビット定義)
+  float flow_vx_mps = 0.0f;       // m/s(フロー機体系 x 速度。無効時 0)
+  float flow_vy_mps = 0.0f;       // m/s(同 y)
+  uint8_t flow_squal = 0;         // SQUAL 生値
+  uint8_t flow_status = 0;        // FLOW_STATUS_* ビット
+  uint8_t flow_dt_ms = 0;         // ms(フロー読み実測 dt。0-255 クランプ)
 };
-static_assert(TlmState::PAYLOAD_SIZE == 135, "PROTOCOL.md: TLM_STATE payload = 135B");
+static_assert(TlmState::PAYLOAD_SIZE == 184, "PROTOCOL.md: TLM_STATE payload = 184B");
 
 inline bool serialize(const TlmState& m, uint8_t* out, size_t cap) {
   if (out == nullptr || cap < TlmState::PAYLOAD_SIZE) return false;
@@ -961,6 +1106,22 @@ inline bool serialize(const TlmState& m, uint8_t* out, size_t cap) {
   wr_f32(out + 129, m.nis);
   wr_u8(out + 133, m.ffg);
   wr_u8(out + 134, m.ff_status);
+  wr_f32(out + 135, m.mag_cal_x_ut);
+  wr_f32(out + 139, m.mag_cal_y_ut);
+  wr_f32(out + 143, m.mag_cal_z_ut);
+  wr_f32(out + 147, m.mag_lev_x_ut);
+  wr_f32(out + 151, m.mag_lev_y_ut);
+  wr_f32(out + 155, m.ekf2_yaw_rad);
+  wr_f32(out + 159, m.ekf2_bm_x_ut);
+  wr_f32(out + 163, m.ekf2_bm_y_ut);
+  wr_f32(out + 167, m.ekf2_yaw_innov_rad);
+  wr_u8(out + 171, m.ekf2_status);
+  wr_u8(out + 172, m.ekf2_gate);
+  wr_f32(out + 173, m.flow_vx_mps);
+  wr_f32(out + 177, m.flow_vy_mps);
+  wr_u8(out + 181, m.flow_squal);
+  wr_u8(out + 182, m.flow_status);
+  wr_u8(out + 183, m.flow_dt_ms);
   return true;
 }
 
@@ -1004,6 +1165,22 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmState* out) {
   out->nis = rd_f32(in + 129);
   out->ffg = rd_u8(in + 133);
   out->ff_status = rd_u8(in + 134);
+  out->mag_cal_x_ut = rd_f32(in + 135);
+  out->mag_cal_y_ut = rd_f32(in + 139);
+  out->mag_cal_z_ut = rd_f32(in + 143);
+  out->mag_lev_x_ut = rd_f32(in + 147);
+  out->mag_lev_y_ut = rd_f32(in + 151);
+  out->ekf2_yaw_rad = rd_f32(in + 155);
+  out->ekf2_bm_x_ut = rd_f32(in + 159);
+  out->ekf2_bm_y_ut = rd_f32(in + 163);
+  out->ekf2_yaw_innov_rad = rd_f32(in + 167);
+  out->ekf2_status = rd_u8(in + 171);
+  out->ekf2_gate = rd_u8(in + 172);
+  out->flow_vx_mps = rd_f32(in + 173);
+  out->flow_vy_mps = rd_f32(in + 177);
+  out->flow_squal = rd_u8(in + 181);
+  out->flow_status = rd_u8(in + 182);
+  out->flow_dt_ms = rd_u8(in + 183);
   return true;
 }
 
@@ -1040,7 +1217,7 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmEvent* out) {
   return true;
 }
 
-// 0x32 TLM_ACK(6B)— 0x14–0x23, 0x25 コマンドへの応答。
+// 0x32 TLM_ACK(6B)— 0x14–0x23, 0x25–0x28 コマンドへの応答。
 struct TlmAck {
   static constexpr MsgType TYPE = MsgType::TLM_ACK;
   static constexpr size_t PAYLOAD_SIZE = 1 + 4 + 1;
@@ -1174,7 +1351,9 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmExp* out) {
   return true;
 }
 
-// 0x34 TLM_CAL_DATA(112B)— CMD_CAL_GET への応答(キャリブ一括データ)。
+// 0x34 TLM_CAL_DATA(132B)— CMD_CAL_GET への応答(キャリブ一括データ)。
+// 磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.5): magbias と
+// flowcal を末尾追加して 112B → 132B。
 struct TlmCalData {
   static constexpr MsgType TYPE = MsgType::TLM_CAL_DATA;
   static constexpr size_t PAYLOAD_SIZE =
@@ -1188,13 +1367,17 @@ struct TlmCalData {
       4 * 5 +      // geomag(decl_east_deg, incl_deg, H_uT, V_uT, F_uT)
       1 +          // ff_nlut
       4 +          // ff_crc32
-      1 + 1;       // ff_mode, est_mode
+      1 + 1 +      // ff_mode, est_mode
+      4 * 3 +      // magbias(磁気オートチューン拡張)
+      4 * 2;       // flowcal(同)
   static constexpr uint8_t VALID_MAG3D = 0x01;    // bit0
   static constexpr uint8_t VALID_ACCEL6 = 0x02;   // bit1
   static constexpr uint8_t VALID_ATTMOUNT = 0x04; // bit2
   static constexpr uint8_t VALID_YAWZERO = 0x08;  // bit3
   static constexpr uint8_t VALID_GEOMAG = 0x10;   // bit4
   static constexpr uint8_t VALID_FFCAL = 0x20;    // bit5
+  static constexpr uint8_t VALID_MAGBIAS = 0x40;  // bit6: magbias 有効(契約 §1.5)
+  static constexpr uint8_t VALID_FLOWCAL = 0x80;  // bit7: flowcal 有効(同上)
 
   uint8_t valid_flags = 0;
   float mag3d_offset[3] = {0.0f, 0.0f, 0.0f};
@@ -1211,8 +1394,10 @@ struct TlmCalData {
   uint32_t ff_crc32 = 0;
   uint8_t ff_mode = 0;
   uint8_t est_mode = 0;
+  float magbias[3] = {0.0f, 0.0f, 0.0f};  // Δb dx, dy, dz [µT, b_cal 空間]
+  float flowcal[2] = {0.0f, 0.0f};        // kx, ky [counts/rad]
 };
-static_assert(TlmCalData::PAYLOAD_SIZE == 112, "PROTOCOL.md: TLM_CAL_DATA payload = 112B");
+static_assert(TlmCalData::PAYLOAD_SIZE == 132, "PROTOCOL.md: TLM_CAL_DATA payload = 132B");
 
 inline bool serialize(const TlmCalData& m, uint8_t* out, size_t cap) {
   if (out == nullptr || cap < TlmCalData::PAYLOAD_SIZE) return false;
@@ -1229,6 +1414,8 @@ inline bool serialize(const TlmCalData& m, uint8_t* out, size_t cap) {
   wr_u32(out + 106, m.ff_crc32);
   wr_u8(out + 110, m.ff_mode);
   wr_u8(out + 111, m.est_mode);
+  for (size_t i = 0; i < 3; ++i) wr_f32(out + 112 + 4 * i, m.magbias[i]);
+  for (size_t i = 0; i < 2; ++i) wr_f32(out + 124 + 4 * i, m.flowcal[i]);
   return true;
 }
 
@@ -1247,6 +1434,8 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmCalData* out) {
   out->ff_crc32 = rd_u32(in + 106);
   out->ff_mode = rd_u8(in + 110);
   out->est_mode = rd_u8(in + 111);
+  for (size_t i = 0; i < 3; ++i) out->magbias[i] = rd_f32(in + 112 + 4 * i);
+  for (size_t i = 0; i < 2; ++i) out->flowcal[i] = rd_f32(in + 124 + 4 * i);
   return true;
 }
 
@@ -1648,6 +1837,12 @@ inline int expected_payload_size(uint8_t type) {
       return static_cast<int>(CmdFfMode::PAYLOAD_SIZE);
     case MsgType::CMD_LED_MODE:
       return static_cast<int>(CmdLedMode::PAYLOAD_SIZE);
+    case MsgType::CMD_MAGBIAS_SET:
+      return static_cast<int>(CmdMagbiasSet::PAYLOAD_SIZE);
+    case MsgType::CMD_FLOWCAL_SET:
+      return static_cast<int>(CmdFlowcalSet::PAYLOAD_SIZE);
+    case MsgType::CMD_FLOW_PROBE:
+      return static_cast<int>(CmdFlowProbe::PAYLOAD_SIZE);
     case MsgType::TLM_STATE:
       return static_cast<int>(TlmState::PAYLOAD_SIZE);
     case MsgType::TLM_EVENT:

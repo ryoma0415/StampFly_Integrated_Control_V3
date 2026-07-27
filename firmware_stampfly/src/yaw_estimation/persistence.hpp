@@ -39,4 +39,13 @@ void saveFfModes(uint8_t ff_mode, uint8_t est_mode);
 void clearFfCalibration();
 void loadFfCalibration(FfCalibration& calibration, uint8_t& ff_mode, uint8_t& est_mode);
 
+// 学習ハードアイアン残差 Δb (MAG_AUTOTUNE_DESIGN.md §2.5)。NVS namespace
+// "magbias": schema(u32=1) / valid(u8) / blob(f32×3) / crc(u32)。
+// Δb は b_cal 空間 [µT]。ブート時 CRC 照合、破損は自己修復破棄 (ffcal に倣う)。
+// mag3d 変更時は旧 b_cal 空間で無効になるため連動クリアする
+// (sensorHubFfOnMag3dChange が clearMagbias を呼ぶ)。
+void saveMagbias(bool valid, const MagVector& delta_b_ut);
+void clearMagbias();
+void loadMagbias(bool& valid, MagVector& delta_b_ut);
+
 #endif

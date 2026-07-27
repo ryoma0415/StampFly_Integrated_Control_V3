@@ -89,6 +89,23 @@
       "wire_hex": "040224040101021501010101010101059a99993e0101010101010104010e5f00"
     },
     {
+      "name": "cmd_pos_err_low_trust",
+      "payload_kind": "CMD_POS_ERR",
+      "type": 36,
+      "seq": 5,
+      "fields": {
+        "err_x": 0.1,
+        "err_y": -0.05,
+        "alt_ref": 0.3,
+        "yaw_ref": 0.5,
+        "mocap_yaw": -2.8,
+        "flags": 31
+      },
+      "payload_hex": "cdcccc3dcdcc4cbd9a99993e0000003f333333c01f",
+      "logical_hex": "02240500000015cdcccc3dcdcc4cbd9a99993e0000003f333333c01fdf1a",
+      "wire_hex": "0402240501010e15cdcccc3dcdcc4cbd9a99993e0101093f333333c01fdf1a00"
+    },
+    {
       "name": "tlm_state_full",
       "payload_kind": "TLM_STATE",
       "type": 48,
@@ -131,11 +148,27 @@
         "bm_y_ut": -0.4,
         "nis": 1.75,
         "ffg": 5,
-        "ff_status": 126
+        "ff_status": 126,
+        "mag_cal_x_ut": 24.5,
+        "mag_cal_y_ut": -13.75,
+        "mag_cal_z_ut": 38.25,
+        "mag_lev_x_ut": 27.9,
+        "mag_lev_y_ut": -3.1,
+        "ekf2_yaw_rad": 1.5533,
+        "ekf2_bm_x_ut": 2.4,
+        "ekf2_bm_y_ut": -1.6,
+        "ekf2_yaw_innov_rad": -0.021,
+        "ekf2_status": 43,
+        "ekf2_gate": 3,
+        "flow_vx_mps": 0.12,
+        "flow_vy_mps": -0.08,
+        "flow_squal": 84,
+        "flow_status": 23,
+        "flow_dt_ms": 20
       },
-      "payload_hex": "0403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0000e03f057e",
-      "logical_hex": "0230e8030000870403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0000e03f057e6ada",
-      "wire_hex": "050230e8030109870403020140e20110040601f085493c11c73abdf90fc93f0103803e010102bf010b403f62a1563d4df30ebd0101543f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0107e03f057e6ada00"
+      "payload_hex": "0403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0000e03f057e0000c44100005cc1000019423333df41666646c089d2c63f9a991940cdccccbf3108acbc2b038fc2f53d0ad7a3bd541714",
+      "logical_hex": "0230e8030000b80403020140e20100040601f085493c11c73abdf90fc93f0000803e000000bf0000403f62a1563d4df30ebd0000003f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0000e03f057e0000c44100005cc1000019423333df41666646c089d2c63f9a991940cdccccbf3108acbc2b038fc2f53d0ad7a3bd541714798f",
+      "wire_hex": "050230e8030109b80403020140e20110040601f085493c11c73abdf90fc93f0103803e010102bf010b403f62a1563d4df30ebd0101543f8fc2f53e5c8f023fcdcc4cbdcdcccc3d7b146e4085ebd13e3d0ad73ef628dc3eae47e13e0ad7233c0ad7a3bc48e17a3fc4095bb1c73f9487c53ff90fc93f66663640cdcc4c40cdcc8cbf9a99193fcdccccbe0105e03f057e0103c44101035cc1012a19423333df41666646c089d2c63f9a991940cdccccbf3108acbc2b038fc2f53d0ad7a3bd541714798f00"
     },
     {
       "name": "tlm_event_link_loss",
@@ -595,6 +628,62 @@
       "wire_hex": "04022524010105010170b900"
     },
     {
+      "name": "cmd_magbias_set",
+      "payload_kind": "CMD_MAGBIAS_SET",
+      "type": 38,
+      "seq": 37,
+      "fields": {
+        "mode": 1,
+        "dx": 13.2,
+        "dy": -8.4,
+        "dz": 2.1
+      },
+      "payload_hex": "0133335341666606c166660640",
+      "logical_hex": "0226250000000d0133335341666606c1666606402c42",
+      "wire_hex": "040226250101110d0133335341666606c1666606402c4200"
+    },
+    {
+      "name": "cmd_magbias_clear",
+      "payload_kind": "CMD_MAGBIAS_SET",
+      "type": 38,
+      "seq": 38,
+      "fields": {
+        "mode": 0,
+        "dx": 0.0,
+        "dy": 0.0,
+        "dz": 0.0
+      },
+      "payload_hex": "00000000000000000000000000",
+      "logical_hex": "0226260000000d00000000000000000000000000f081",
+      "wire_hex": "040226260101020d01010101010101010101010103f08100"
+    },
+    {
+      "name": "cmd_flowcal_set",
+      "payload_kind": "CMD_FLOWCAL_SET",
+      "type": 39,
+      "seq": 39,
+      "fields": {
+        "mode": 1,
+        "kx": 452.5,
+        "ky": 447.25
+      },
+      "payload_hex": "010040e24300a0df43",
+      "logical_hex": "02272700000009010040e24300a0df43080e",
+      "wire_hex": "0402272701010309010440e24306a0df43080e00"
+    },
+    {
+      "name": "cmd_flow_probe",
+      "payload_kind": "CMD_FLOW_PROBE",
+      "type": 40,
+      "seq": 40,
+      "fields": {
+        "n_cycles": 0
+      },
+      "payload_hex": "00",
+      "logical_hex": "0228280000000100b848",
+      "wire_hex": "040228280101020103b84800"
+    },
+    {
       "name": "tlm_ack_ff_commit_ok",
       "payload_kind": "TLM_ACK",
       "type": 50,
@@ -648,7 +737,7 @@
       "type": 52,
       "seq": 202,
       "fields": {
-        "valid_flags": 63,
+        "valid_flags": 255,
         "mag3d_offset": [
           12.5,
           -8.25,
@@ -688,11 +777,20 @@
         "ff_nlut": 8,
         "ff_crc32": 3735928559,
         "ff_mode": 2,
-        "est_mode": 1
+        "est_mode": 2,
+        "magbias": [
+          13.2,
+          -8.4,
+          2.1
+        ],
+        "flowcal": [
+          452.5,
+          447.25
+        ]
       },
-      "payload_hex": "3f00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde0201",
-      "logical_hex": "0234ca000000703f00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde02019537",
-      "wire_hex": "040234ca010103703f01034841010304c1014b70405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0103f0c0010346420114f04166660c42cdcc384208efbeadde0201953700"
+      "payload_hex": "ff00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde020233335341666606c1666606400040e24300a0df43",
+      "logical_hex": "0234ca00000084ff00004841000004c1000070405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0000f0c0000046420000f04166660c42cdcc384208efbeadde020233335341666606c1666606400040e24300a0df431b0a",
+      "wire_hex": "040234ca01010384ff01034841010304c1014b70405c8f823f0ad7233c0ad7a3bc0ad7233c48e17a3f8fc2f53c0ad7a3bc8fc2f53c6666863fa69b443c6f1203bc3108ac3cee7c7f3f8941803f52b87e3f8fc2753c5839b4bcb6f39dbf0103f0c001034642011ef04166660c42cdcc384208efbeadde020233335341666606c1666606400440e24306a0df431b0a00"
     },
     {
       "name": "tlm_ctrl_full",

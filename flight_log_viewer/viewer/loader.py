@@ -1,4 +1,4 @@
-"""V2 フライトログ CSV(50Hz・v4 109列)の読み込みと派生量の計算。
+"""V2 フライトログ CSV(50Hz・v4 109列〜v6 136列)の読み込みと派生量の計算。
 
 - 破損した末尾(電源断などで途切れた行)は旧 Drone_Log_Viewer と同様に
   切り捨てて読む。
@@ -8,6 +8,9 @@
   v4 で CSV から廃止された roll_ref_deg / pitch_ref_deg / cmd_yaw_ref_deg は
   「CSV に列があればそれを使用、無ければ *_rad から派生生成」とし、
   旧ログ v1〜v3 との互換を保つ。
+- v6 追加列(EKF2/磁気観測/フロー。docs/MAG_AUTOTUNE_DESIGN.md §1.1・§3)は
+  列名ベース読み込みのため v5 以前のログでも従来どおり読める — 列が無い
+  ログでは EKF2 系統・新パネルが自動的にスキップされる。
 """
 
 from __future__ import annotations
@@ -26,13 +29,14 @@ from .constants import (
     TEXT_COLUMNS,
     TLM_FLAG_FLYING,
     V4_COLUMNS,
-    V5_COLUMNS,
+    V6_COLUMNS,
     YAW_SOURCES,
 )
 
-# ヨー比較の対象(推定3系統)。基準(真値)は mocap があれば mocap、
-# なければ Madgwick(その場合 madgwick 自身は比較から除外)。
-YAW_ESTIMATOR_KEYS: tuple[str, ...] = ("madgwick", "ekf", "gyro_int")
+# ヨー比較の対象(推定4系統。ekf2 は v6 ログのみ列が存在し、無いログでは
+# 自動スキップ)。基準(真値)は mocap があれば mocap、なければ Madgwick
+# (その場合 madgwick 自身は比較から除外)。
+YAW_ESTIMATOR_KEYS: tuple[str, ...] = ("madgwick", "ekf", "ekf2", "gyro_int")
 
 # 飛行ログの既定保存先: <repo>/logs/flight_logs/
 # (viewer/ → flight_log_viewer/ → <repo> の 2 階層上)
@@ -264,11 +268,11 @@ def load_log(csv_path: str | Path) -> FlightLog:
         raise ValueError(f"必須列 elapsed_time がありません: {csv_path}")
 
     # 列の検証(過不足は警告のみ。契約は docs/LOG_STRUCTURE.md を参照)。
-    # 必須は v4 の 109 列。v5 追加列(MoCap 正解ヨー等)は旧ログに無くて
-    # 正常なため欠落警告の対象にしない — v5 列が有れば「契約に無い列」にも
-    # しない(V5_COLUMNS 基準で判定)。
+    # 必須は v4 の 109 列。v5/v6 追加列(MoCap 正解ヨー・EKF2/磁気/フロー等)
+    # は旧ログに無くて正常なため欠落警告の対象にしない — これらの列が有れば
+    # 「契約に無い列」にもしない(V6_COLUMNS 基準で判定)。
     missing = [c for c in V4_COLUMNS if c not in df.columns]
-    extra = [c for c in df.columns if c not in V5_COLUMNS]
+    extra = [c for c in df.columns if c not in V6_COLUMNS]
     if missing:
         warnings.append(
             f"契約({N_COLUMNS}列)に対して欠けている列が {len(missing)} 個あります: "

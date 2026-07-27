@@ -438,6 +438,26 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.mode = ju8(f, "mode");
     ok = serialize(m, buf, sizeof(buf));
     n = CmdLedMode::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MAGBIAS_SET") {
+    CmdMagbiasSet m;
+    m.mode = ju8(f, "mode");
+    m.dx = jf(f, "dx");
+    m.dy = jf(f, "dy");
+    m.dz = jf(f, "dz");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdMagbiasSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FLOWCAL_SET") {
+    CmdFlowcalSet m;
+    m.mode = ju8(f, "mode");
+    m.kx = jf(f, "kx");
+    m.ky = jf(f, "ky");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFlowcalSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FLOW_PROBE") {
+    CmdFlowProbe m;
+    m.n_cycles = ju8(f, "n_cycles");
+    ok = serialize(m, buf, sizeof(buf));
+    n = CmdFlowProbe::PAYLOAD_SIZE;
   } else if (kind == "TLM_ACK") {
     TlmAck m;
     m.acked_type = ju8(f, "acked_type");
@@ -487,6 +507,8 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.ff_crc32 = ju32(f, "ff_crc32");
     m.ff_mode = ju8(f, "ff_mode");
     m.est_mode = ju8(f, "est_mode");
+    jfarr(f, "magbias", m.magbias, 3);
+    jfarr(f, "flowcal", m.flowcal, 2);
     ok = serialize(m, buf, sizeof(buf));
     n = TlmCalData::PAYLOAD_SIZE;
   } else if (kind == "TLM_CTRL") {
@@ -540,6 +562,22 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.nis = jf(f, "nis");
     m.ffg = ju8(f, "ffg");
     m.ff_status = ju8(f, "ff_status");
+    m.mag_cal_x_ut = jf(f, "mag_cal_x_ut");
+    m.mag_cal_y_ut = jf(f, "mag_cal_y_ut");
+    m.mag_cal_z_ut = jf(f, "mag_cal_z_ut");
+    m.mag_lev_x_ut = jf(f, "mag_lev_x_ut");
+    m.mag_lev_y_ut = jf(f, "mag_lev_y_ut");
+    m.ekf2_yaw_rad = jf(f, "ekf2_yaw_rad");
+    m.ekf2_bm_x_ut = jf(f, "ekf2_bm_x_ut");
+    m.ekf2_bm_y_ut = jf(f, "ekf2_bm_y_ut");
+    m.ekf2_yaw_innov_rad = jf(f, "ekf2_yaw_innov_rad");
+    m.ekf2_status = ju8(f, "ekf2_status");
+    m.ekf2_gate = ju8(f, "ekf2_gate");
+    m.flow_vx_mps = jf(f, "flow_vx_mps");
+    m.flow_vy_mps = jf(f, "flow_vy_mps");
+    m.flow_squal = ju8(f, "flow_squal");
+    m.flow_status = ju8(f, "flow_status");
+    m.flow_dt_ms = ju8(f, "flow_dt_ms");
     ok = serialize(m, buf, sizeof(buf));
     n = TlmState::PAYLOAD_SIZE;
   } else if (kind == "TLM_EVENT") {
@@ -696,6 +734,18 @@ std::vector<uint8_t> reserialize_payload(const std::string& kind,
     CmdLedMode m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
     n = CmdLedMode::PAYLOAD_SIZE;
+  } else if (kind == "CMD_MAGBIAS_SET") {
+    CmdMagbiasSet m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdMagbiasSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FLOWCAL_SET") {
+    CmdFlowcalSet m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFlowcalSet::PAYLOAD_SIZE;
+  } else if (kind == "CMD_FLOW_PROBE") {
+    CmdFlowProbe m;
+    ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));
+    n = CmdFlowProbe::PAYLOAD_SIZE;
   } else if (kind == "TLM_ACK") {
     TlmAck m;
     ok = deserialize(payload.data(), payload.size(), &m) && serialize(m, buf, sizeof(buf));

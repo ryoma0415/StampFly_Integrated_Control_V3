@@ -384,8 +384,10 @@ class FfProfileManager:
             est = int(value)
         except (TypeError, ValueError):
             return default
+        # est=2(EKF2)を受理(MAG_AUTOTUNE_DESIGN.md §1.3 / §3)
         return est if est in (proto.CmdFfMode.EST_MODE_COMPLEMENTARY,
-                              proto.CmdFfMode.EST_MODE_EKF) else default
+                              proto.CmdFfMode.EST_MODE_EKF,
+                              proto.CmdFfMode.EST_MODE_EKF2) else default
 
     def _read_back_ff(self, node_id: Optional[int] = None
                       ) -> Optional[proto.TlmCalData]:
