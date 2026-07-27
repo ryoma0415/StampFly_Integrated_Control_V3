@@ -44,6 +44,7 @@ from .loader import FlightLog, wrapped_plot_series  # noqa: E402
 DEFAULT_ANIM_FPS = 20.0        # 動画なし時のフレームレート
 FIGURE_SIZE = (19.2, 10.8)     # 1920x1080 @ dpi100
 TRAIL_WINDOW_S = 5.0           # 時系列パネルの表示窓 [s]
+SUMMARY_DPI = 150              # 全区間サマリ静止画(MP4 併出力)の解像度
 XY_TRAIL_POINTS = 150          # XY 軌跡の尾の点数
 VIDEO_MAX_WIDTH_PX = 960       # 事前読み込みする動画フレームの最大幅
 BITRATE_KBPS = 8000            # MP4 ビットレート
@@ -283,6 +284,32 @@ def _update_ts_panels(ts_panels, now: float) -> None:
         ax.set_xlim(window_lo, now + TRAIL_WINDOW_S * 0.1)
 
 
+def _set_ts_panels_full_range(ts_panels, t0: float, t1: float) -> None:
+    """時系列パネル群を全区間表示にする(サマリ静止画用)。
+
+    アニメの表示窓(TRAIL_WINDOW_S)を外し、各線の全データを描いて
+    x 軸を全区間に固定する。y 範囲は _build_ts_panel が全データから
+    固定済みのため触らない。
+    """
+    pad = max((t1 - t0) * 0.02, 1e-3)
+    for ax, lines in ts_panels:
+        for line, t_line, values in lines:
+            line.set_data(t_line, values)
+        ax.set_xlim(t0 - pad, t1 + pad)
+
+
+def _last_finite_point(df: pd.DataFrame, x_col: str, y_col: str
+                       ) -> tuple[float, float] | None:
+    """両列とも有限な最後の点を返す(無ければ None)。"""
+    x = df[x_col].to_numpy(dtype=float)
+    y = df[y_col].to_numpy(dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not finite.any():
+        return None
+    idx = int(np.flatnonzero(finite)[-1])
+    return float(x[idx]), float(y[idx])
+
+
 class _AnimationBuilder:
     """7 パネルアニメーションの Figure・Artist を構築し、フレーム更新する。"""
 
@@ -462,6 +489,39 @@ class _AnimationBuilder:
             f"{self.log.name}   t={now:6.2f}s   モード: {self.log.mode}")
         return []
 
+    def save_summary(self, out_path: Path) -> Path:
+        """全区間サマリ静止画を保存する(MP4 併出力)。
+
+        アニメと同じパネル構成のまま、時系列は全区間・XY は全軌跡を描く。
+        動画パネルは再生できないため中間フレームをサムネイルとして載せる。
+        アニメーション保存完了後に呼ぶこと(Artist を全区間表示へ
+        書き換えるため、以降のフレーム更新には使えない)。
+        """
+        if self.im_video is not None and self.video_frames:
+            # 中間フレーム = 飛行中盤の代表画像(先頭は地上待機のことが多い)
+            mid = len(self.video_frames) // 2
+            self.im_video.set_data(self.video_frames[mid])
+            self.ax_main.set_title(
+                "ドローン飛行映像(サムネイル: 中間フレーム)",
+                fontsize=13, color=TEXT_COLOR)
+        if self.has_pos:
+            self.ln_trail.set_data(self.df["pos_x"], self.df["pos_y"])
+            last = _last_finite_point(self.df, "pos_x", "pos_y")
+            if last is not None:
+                self.pt_current.set_data([last[0]], [last[1]])
+            if self.pt_target is not None:
+                last_t = _last_finite_point(self.df, "target_x", "target_y")
+                if last_t is not None:
+                    self.pt_target.set_data([last_t[0]], [last_t[1]])
+        _set_ts_panels_full_range(self.ts_panels,
+                                  float(self.t[0]), float(self.t[-1]))
+        self.title.set_text(
+            f"{self.log.name}   全区間 {self.t[0]:.1f}–{self.t[-1]:.1f}s"
+            f"   モード: {self.log.mode}")
+        self.fig.savefig(out_path, dpi=SUMMARY_DPI,
+                         facecolor=self.fig.get_facecolor())
+        return out_path
+
 
 # ---------------------------------------------------------------------------
 # 生成エントリポイント
@@ -544,8 +604,13 @@ def generate_animation(
 
     anim.save(str(out_path), writer=writer, dpi=ANIM_DPI,
               progress_callback=_progress)
+    # 全区間サマリ静止画(同一レイアウト・時系列は全区間・動画は
+    # サムネイル)を MP4 と並べて出力する
+    summary_path = out_path.with_name(out_path.stem + "_summary.png")
+    builder.save_summary(summary_path)
     plt.close(builder.fig)
     print(f"アニメーション生成完了: {out_path}")
+    print(f"全区間サマリ静止画: {summary_path}")
     return out_path
 
 
@@ -674,6 +739,24 @@ class _MultiAnimationBuilder:
             f"複数機同時制御   t={now:6.2f}s   機体: {self._names}")
         return []
 
+    def save_summary(self, out_path: Path) -> Path:
+        """全区間サマリ静止画を保存する(単機版 save_summary と同じ規約)。"""
+        for has_pos, trail, point, df in self.xy_artists:
+            if not has_pos:
+                continue
+            trail.set_data(df["pos_x"], df["pos_y"])
+            last = _last_finite_point(df, "pos_x", "pos_y")
+            if last is not None:
+                point.set_data([last[0]], [last[1]])
+        _set_ts_panels_full_range(self.ts_panels,
+                                  float(self.t[0]), float(self.t[-1]))
+        self.title.set_text(
+            f"複数機同時制御   全区間 {self.t[0]:.1f}–{self.t[-1]:.1f}s"
+            f"   機体: {self._names}")
+        self.fig.savefig(out_path, dpi=SUMMARY_DPI,
+                         facecolor=self.fig.get_facecolor())
+        return out_path
+
 
 def generate_multi_animation(
     logs: list[FlightLog],
@@ -739,6 +822,10 @@ def generate_multi_animation(
 
     anim.save(str(out_path), writer=writer, dpi=ANIM_DPI,
               progress_callback=_progress)
+    # 全区間サマリ静止画(単機版と同じ規約)を MP4 と並べて出力する
+    summary_path = out_path.with_name(out_path.stem + "_summary.png")
+    builder.save_summary(summary_path)
     plt.close(builder.fig)
     print(f"複数機アニメーション生成完了: {out_path}")
+    print(f"全区間サマリ静止画: {summary_path}")
     return out_path

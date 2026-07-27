@@ -90,7 +90,9 @@ python3 -m venv .venv
 # 静止画グラフ+ヨー解析+サマリレポート(CSV のみ指定時の既定動作)
 .venv/bin/python visualize.py ../logs/flight_logs/20260706_120000_position.csv
 
-# アニメーション MP4(動画なし・ログのみ)
+# アニメーション MP4(動画なし・ログのみ)。MP4 と並べて
+# <名前>_summary.png(同一レイアウトの全区間サマリ静止画)も自動出力される
+# (時系列パネルは全区間・XY は全軌跡・動画パネルは中間フレームのサムネイル)
 .venv/bin/python visualize.py ../logs/flight_logs/xxx_position.csv --animation
 
 # スマホ動画と同期合成(opencv-python 必要)。--track で ROI 追跡枠を合成
