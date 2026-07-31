@@ -1,0 +1,129 @@
+{
+ "ekf_main": {
+  "e2_mean_fly": 2.24,
+  "e2_std_fly": 0.55,
+  "e2_absmax_demeaned": 4.06,
+  "e1_mean_fly": -11.81,
+  "e1_std_fly": 4.65,
+  "e1_range": [
+   -24.3,
+   -4.8
+  ],
+  "ekf2_track_sent_rms": 0.551,
+  "innov_rms": 0.464,
+  "gate_R_INFLATED": {
+   "n": 412,
+   "t": [
+    17.1,
+    50.5
+   ]
+  },
+  "gate_Z_REJECT": {
+   "n": 48,
+   "t": [
+    8.5,
+    9.6
+   ]
+  },
+  "gate_DRIFT_WARN": {
+   "n": 74,
+   "t": [
+    24.8,
+    36.6
+   ]
+  },
+  "bm_start": [
+   -5.02,
+   1.0
+  ],
+  "bm_end": [
+   -3.72,
+   -5.57
+  ],
+  "anchor_t": 9.53,
+  "low_trust_rows": 0
+ },
+ "ekf_short": {
+  "e2_mean_fly": 3.93,
+  "e2_std_fly": 0.2,
+  "e2_absmax_demeaned": 0.92,
+  "e1_mean_fly": -21.02,
+  "e1_std_fly": 9.57,
+  "e1_range": [
+   -37.8,
+   -4.5
+  ],
+  "ekf2_track_sent_rms": 0.216,
+  "innov_rms": 0.19,
+  "gate_R_INFLATED": {
+   "n": 341,
+   "t": [
+    0.0,
+    6.8
+   ]
+  },
+  "gate_Z_REJECT": {
+   "n": 515,
+   "t": [
+    7.7,
+    18.0
+   ]
+  },
+  "gate_DRIFT_WARN": {
+   "n": 0,
+   "t": null
+  },
+  "bm_start": [
+   8.63,
+   -13.7
+  ],
+  "bm_end": [
+   4.93,
+   -1.03
+  ],
+  "anchor_t": 18.55,
+  "low_trust_rows": 0
+ },
+ "timeline_main": {
+  "events": [
+   [
+    "log start (pre_roll)",
+    0.0
+   ],
+   [
+    "arm/flying phase",
+    3.02
+   ],
+   [
+    "takeoff (state3)",
+    3.05
+   ],
+   [
+    "FLYING (state4)",
+    7.86
+   ],
+   [
+    "flight_anchor",
+    9.53
+   ]
+  ],
+  "yaw_cmd_moves": [],
+  "pos_target_moves_n": 15,
+  "pos_moves_first_last": [
+   [
+    50.1,
+    0.05,
+    0.0
+   ],
+   [
+    77.2,
+    0.0,
+    0.0
+   ]
+  ],
+  "landing_t": 91.63,
+  "log_end": 93.1,
+  "yaw_rate_max_deg_s": 50.3,
+  "yaw_rate_p95": 29.6
+ }
+}

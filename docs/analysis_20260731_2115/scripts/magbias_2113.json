@@ -1,0 +1,78 @@
+{
+  "schema": "stampfly_magbias_profile",
+  "version": 1,
+  "name": "magbias_20260731_2113",
+  "created_at": "2026-07-31T21:43:48+0900",
+  "source_logs": [
+    "20260731_211304_position.csv"
+  ],
+  "delta_b_ut": null,
+  "hover_residual_ut": {
+    "leveled_xy": [
+      5.832178,
+      -1.249692
+    ],
+    "z": null,
+    "current_a": 3.204
+  },
+  "ff_supplement": {
+    "voltage_coeff_ut_per_v": [
+      55.59990737430102,
+      -182.2242041455198
+    ],
+    "duty_coeff": [
+      [
+        33.858956699177455,
+        5.961794300607176,
+        17.051813327318538,
+        22.775817563411294
+      ],
+      [
+        -91.74790125273265,
+        21.120954230624584,
+        -54.163988163123115,
+        -12.383476916318253
+      ]
+    ],
+    "r2": 0.8111434712524694,
+    "current_coeff_ut_per_a": [
+      -0.11280153515396957,
+      -5.231760969126307
+    ],
+    "intercept_ut": [
+      -245.46561689397961,
+      737.9758560965702
+    ],
+    "r2_xy": [
+      0.703700969961303,
+      0.8226922106752911
+    ],
+    "n_samples": 953,
+    "duty_order": [
+      "FL",
+      "FR",
+      "RL",
+      "RR"
+    ]
+  },
+  "binding": {
+    "mag3d_hash": "sha256:5fb3806f125f6b6349a7b2383194c826058a2124e201a498ff524391605e395a",
+    "ffcal_crc": "72aee421"
+  },
+  "quality": {
+    "yaw_excursion_deg": 28.896391,
+    "fit_rms_ut": null,
+    "warnings": [
+      "delta_b=null: ヨー励振不足 (28.9° < 45°)",
+      "離陸前の地上窓が無いため z 残差は null(ログが飛行中から開始)"
+    ]
+  },
+  "provenance": {
+    "tool": "magbias_learn.py",
+    "tool_version": "1.0",
+    "log_generation": "v6",
+    "yaw_source": "mocap_yaw_true_deg",
+    "bm_source": "ekf2_bm",
+    "flight_duration_s": 29.047000000000004
+  }
+}

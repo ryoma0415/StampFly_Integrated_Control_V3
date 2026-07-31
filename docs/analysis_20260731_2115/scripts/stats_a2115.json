@@ -1,0 +1,513 @@
+{
+ "main2115": {
+  "truth_vs_gyro": {
+   "drift_deg_per_min": -0.7811993739117293,
+   "detrended_rms_deg": 0.4626766261820383,
+   "detrended_maxabs_deg": 4.313861403484516,
+   "n_outlier_rows": 0,
+   "shortwin5s_shape_rms_med": 0.2063909119286241,
+   "shortwin5s_shape_rms_p95": 0.6375064578686679,
+   "jump_p99_deg_per_row": 0.9900960799999889,
+   "jump_max_deg_per_row": 5.950213000000019,
+   "n_jump_gt20": 0,
+   "cont_filter_reject_rows": 0,
+   "rb_error_mean_mm": 0.7960988397077782,
+   "rb_marker_count_hist": {
+    "0": 4654
+   }
+  },
+  "anchor": {
+   "meta_anchor_deg": 2.253,
+   "meta_yaw_est_deg": 1.228,
+   "implied_pre_arm_med": -6.1424008160797,
+   "implied_post_arm_med": 2.252898220411012,
+   "post_arm_sent_eq_true_plus_anchor_rms": 1.646179371455969e-05,
+   "t_latch_settle": 3.047,
+   "latch_delay_after_arm_s": 0.0,
+   "anchor_step_at_arm_deg": 8.395298670750151,
+   "sent_minus_e1_after_latch": {
+    "mean": -5.265548420605034
+   },
+   "innov_maxabs_arm_window": 5.424248742283017,
+   "innov_maxabs_whole": 5.424248742283017,
+   "t_innov_maxabs": 3.11
+  },
+  "fusion": {
+   "fused_frac_all": 1.0,
+   "fused_frac_preroll": 1.0,
+   "fused_frac_ground_armed": 1.0,
+   "fused_frac_flight": 1.0,
+   "fused_at_takeoff": true,
+   "fresh_frac": 1.0,
+   "recapture_rows": 0,
+   "low_trust_rows": 0,
+   "obs_n": 2172,
+   "obs_rate_hz": 23.346805400292375,
+   "innov_obs": {
+    "rms": 0.4679680833137417,
+    "mean": 0.0196433251447591,
+    "p50_abs": 0.17397863449147447,
+    "p95_abs": 0.7913463883228871,
+    "p99_abs": 2.070821305418503,
+    "maxabs": 5.424248742283017,
+    "frac_within_3deg": 0.9967771639042358,
+    "gate30_margin_worst": 0.8191917085905661
+   },
+   "innov_rms_ground": 0.553555557289693,
+   "innov_rms_flight": 0.4578065743630566
+  },
+  "flight_anchor": {
+   "t_first": 9.531,
+   "frac": 0.897722389342501,
+   "dt_after_flying": 1.6710000000000003,
+   "dt_after_arm": 6.484,
+   "current_at_anchor": 3.2033333333333336,
+   "t_last_alt_hold_reset": 7.5,
+   "alt_hold_frac_prefa": 1.0,
+   "z_reject": {
+    "ekf2_flight_all": 0.011461318051575931,
+    "ekf2_pre_anchor": 0.5301204819277109,
+    "ekf2_post_anchor": 0.00097442143727162,
+    "ekf1_flight_all": 0.8268863419293219,
+    "ekf1_pre_anchor": 0.5301204819277109,
+    "ekf1_post_anchor": 0.8328867235079171,
+    "ekf1_bm_frozen_frac": 0.0
+   },
+   "mag_cal_z": {
+    "ground_mean": -19.909657828828824,
+    "flight_mean": -9.807879222301814,
+    "shift_at_flight": 10.10177860652701,
+    "pre_anchor_mean": -10.583600518072288
+   },
+   "ekf2_gate_hist_flight": {
+    "0": 3660,
+    "1": 406,
+    "8": 48,
+    "64": 68,
+    "65": 6
+   },
+   "ekf1_ffg_hist_flight": {
+    "0": 545,
+    "1": 180,
+    "8": 3463
+   }
+  },
+  "bm": {
+   "ekf2_at_start": [
+    -5.018645,
+    0.997619
+   ],
+   "ekf2_at_anchor_reset": [
+    0.0,
+    0.0
+   ],
+   "ekf1_at_start": [
+    -0.746557,
+    -1.170234
+   ],
+   "ekf1_norm_max": 17.777869442846885,
+   "ekf2_norm_max": 10.792050258645805,
+   "ekf2_final_last10s_med": [
+    -3.790719,
+    -6.908708
+   ],
+   "ekf2_std_post_anchor": [
+    1.6074033616492658,
+    2.410121929425128
+   ],
+   "ekf1_std_flight": [
+    2.364726475694762,
+    3.8433269220121127
+   ],
+   "ekf2_conv_time_after_anchor_s": 62.547000000000004,
+   "ekf1_heading_R2_xy": [
+    0.246,
+    0.258
+   ],
+   "ekf1_heading_amp_uT_xy": [
+    4.82,
+    6.45
+   ],
+   "ekf2_heading_R2_xy": [
+    0.067,
+    0.163
+   ],
+   "ekf2_heading_amp_uT_xy": [
+    1.4,
+    2.15
+   ],
+   "drift_warn_spans": [
+    {
+     "t0": 24.766,
+     "t1": 25.36,
+     "dur": 0.59,
+     "bm_rate_max": NaN
+    },
+    {
+     "t0": 35.75,
+     "t1": 36.578,
+     "dur": 0.83,
+     "bm_rate_max": NaN
+    }
+   ],
+   "drift_warn_rows": 74
+  },
+  "yaw_err": {
+   "EKF1": {
+    "flight_rms": 14.748402830912449,
+    "flight_mean": -13.997587756131551,
+    "flight_maxabs": 26.602037878375484,
+    "drift_deg_per_min": 6.372893249571106,
+    "ground_offset_used": 0.0
+   },
+   "EKF2": {
+    "flight_rms": 0.5473939131259141,
+    "flight_mean": -0.011503352693855119,
+    "flight_maxabs": 4.045125793738123,
+    "drift_deg_per_min": -0.07169549297796811,
+    "ground_offset_used": 0.0
+   },
+   "gyro_int": {
+    "flight_rms": 0.903822686547699,
+    "flight_mean": 0.7073193063902129,
+    "flight_maxabs": 4.513561805748736,
+    "drift_deg_per_min": 0.7538004440564446,
+    "ground_offset_used": -1.1924254819379456
+   },
+   "madgwick": {
+    "flight_rms": 2.457953855830772,
+    "flight_mean": -1.0818744013300068,
+    "flight_maxabs": 8.948020030497673,
+    "drift_deg_per_min": 2.2622990443396755,
+    "ground_offset_used": -0.7030622291167106
+   }
+  },
+  "turn_segments": [
+   {
+    "t0": 12.813,
+    "t1": 15.156,
+    "dpsi": 99.6
+   },
+   {
+    "t0": 20.828,
+    "t1": 23.188,
+    "dpsi": -99.6
+   },
+   {
+    "t0": 27.031,
+    "t1": 28.281,
+    "dpsi": -46.6
+   },
+   {
+    "t0": 33.766,
+    "t1": 34.938,
+    "dpsi": 46.6
+   }
+  ],
+  "yaw_err_phases": {
+   "EKF1": {
+    "hover": {
+     "n": 3427,
+     "rms": 13.980814521906598,
+     "maxabs": 26.602037878375484
+    },
+    "turn": {
+     "n": 761,
+     "rms": 17.799516343450833,
+     "maxabs": 25.395334363316806
+    }
+   },
+   "EKF2": {
+    "hover": {
+     "n": 3427,
+     "rms": 0.3989133590733975,
+     "maxabs": 3.5944630922436147
+    },
+    "turn": {
+     "n": 761,
+     "rms": 0.9656027719772127,
+     "maxabs": 4.045125793738123
+    }
+   },
+   "gyro_int": {
+    "hover": {
+     "n": 3427,
+     "rms": 0.911779863890313,
+     "maxabs": 3.401585658927445
+    },
+    "turn": {
+     "n": 761,
+     "rms": 0.8670848668131516,
+     "maxabs": 4.513561805748736
+    }
+   },
+   "madgwick": {
+    "hover": {
+     "n": 3427,
+     "rms": 1.9697976495338678,
+     "maxabs": 8.948020030497673
+    },
+    "turn": {
+     "n": 761,
+     "rms": 3.9717870655072938,
+     "maxabs": 8.66538209724169
+    }
+   }
+  },
+  "true_peak_rate_deg_s": 49.75851446894348,
+  "ekf2_lag": {
+   "best_lag_s": 0.03,
+   "rms_at_best_lag_meanfree": 0.44999521309196944,
+   "rms_lag0_meanfree": 0.5472730296699276
+  },
+  "ekf2_err_vs_rate_corr": 0.537479471589229,
+  "timeline": {
+   "dur": 93.063,
+   "t_arm": 3.047,
+   "t_lift": 5.469,
+   "t_flying": 7.86,
+   "t_landing": 91.625,
+   "t_flight_anchor": 9.531,
+   "volt_end": 3.4656,
+   "firmware_uptime_at_log0_ms": 42582
+  }
+ },
+ "short2113": {
+  "truth_vs_gyro": {
+   "drift_deg_per_min": -2.4849867910659276,
+   "detrended_rms_deg": 0.22662504310182982,
+   "detrended_maxabs_deg": 1.010455651805058,
+   "n_outlier_rows": 0,
+   "shortwin5s_shape_rms_med": 0.12911018865438112,
+   "shortwin5s_shape_rms_p95": 0.22360445858327083,
+   "jump_p99_deg_per_row": 0.455203120000001,
+   "jump_max_deg_per_row": 1.7535159999999905,
+   "n_jump_gt20": 0,
+   "cont_filter_reject_rows": 0,
+   "rb_error_mean_mm": 0.8635557632398754,
+   "rb_marker_count_hist": {
+    "0": 1605
+   }
+  },
+  "anchor": {
+   "meta_anchor_deg": 3.84,
+   "meta_yaw_est_deg": 19.976,
+   "implied_pre_arm_med": 2.843139245262904,
+   "implied_post_arm_med": 3.839879808687215,
+   "post_arm_sent_eq_true_plus_anchor_rms": 1.630224327279109e-05,
+   "t_latch_settle": 3.047,
+   "latch_delay_after_arm_s": 0.016000000000000014,
+   "anchor_step_at_arm_deg": 0.9967397384948811,
+   "sent_minus_e1_after_latch": {
+    "mean": 1.1231680423482968
+   },
+   "innov_maxabs_arm_window": 1.3127609002037421,
+   "innov_maxabs_whole": 1.3127609002037421,
+   "t_innov_maxabs": 4.656
+  },
+  "fusion": {
+   "fused_frac_all": 1.0,
+   "fused_frac_preroll": 1.0,
+   "fused_frac_ground_armed": 1.0,
+   "fused_frac_flight": 1.0,
+   "fused_at_takeoff": true,
+   "fresh_frac": 1.0,
+   "recapture_rows": 0,
+   "low_trust_rows": 0,
+   "obs_n": 745,
+   "obs_rate_hz": 23.269615192403794,
+   "innov_obs": {
+    "rms": 0.37320989834788665,
+    "mean": 0.0853744799217358,
+    "p50_abs": 0.15252136506382513,
+    "p95_abs": 0.9811787650056321,
+    "p99_abs": 1.1061889885784555,
+    "maxabs": 1.3127609002037421,
+    "frac_within_3deg": 1.0,
+    "gate30_margin_worst": 0.9562413033265419
+   },
+   "innov_rms_ground": 0.6424057488590912,
+   "innov_rms_flight": 0.1884013547919939
+  },
+  "flight_anchor": {
+   "t_first": 18.547,
+   "frac": 0.4224299065420561,
+   "dt_after_flying": 10.703,
+   "dt_after_arm": 15.516,
+   "current_at_anchor": 3.2539999999999996,
+   "t_last_alt_hold_reset": 16.531,
+   "alt_hold_frac_prefa": 0.43843283582089554,
+   "z_reject": {
+    "ekf2_flight_all": 0.44232437120555074,
+    "ekf2_pre_anchor": 0.9514925373134329,
+    "ekf2_post_anchor": 0.0,
+    "ekf1_flight_all": 0.0,
+    "ekf1_pre_anchor": 0.0,
+    "ekf1_post_anchor": 0.0,
+    "ekf1_bm_frozen_frac": 1.0
+   },
+   "mag_cal_z": {
+    "ground_mean": -19.497467225225222,
+    "flight_mean": -12.351707168256722,
+    "shift_at_flight": 7.1457600569685,
+    "pre_anchor_mean": -13.524128020522388
+   },
+   "ekf2_gate_hist_flight": {
+    "0": 643,
+    "8": 510
+   },
+   "ekf1_ffg_hist_flight": {
+    "32": 1153
+   }
+  },
+  "bm": {
+   "ekf2_at_start": [
+    8.633315,
+    -13.697337
+   ],
+   "ekf2_at_anchor_reset": [
+    0.770054,
+    -0.149366
+   ],
+   "ekf1_at_start": [
+    14.157362,
+    -13.827589
+   ],
+   "ekf1_norm_max": 19.789722493050906,
+   "ekf2_norm_max": 18.82000324658346,
+   "ekf2_final_last10s_med": [
+    5.712001,
+    -1.094597
+   ],
+   "ekf2_std_post_anchor": [
+    1.092872750468227,
+    0.6063914518723272
+   ],
+   "ekf1_std_flight": [
+    0.6694595979077925,
+    0.6538580909861585
+   ],
+   "ekf2_conv_time_after_anchor_s": 2.562000000000001,
+   "ekf1_heading_R2_xy": [
+    0.452,
+    0.452
+   ],
+   "ekf1_heading_amp_uT_xy": [
+    20.22,
+    19.75
+   ],
+   "ekf2_heading_R2_xy": [
+    0.188,
+    0.087
+   ],
+   "ekf2_heading_amp_uT_xy": [
+    91.35,
+    64.83
+   ]
+  },
+  "yaw_err": {
+   "EKF1": {
+    "flight_rms": 26.59216504257218,
+    "flight_mean": -24.625901643380995,
+    "flight_maxabs": 42.152117382328555,
+    "drift_deg_per_min": -90.4370700137782,
+    "ground_offset_used": 0.0
+   },
+   "EKF2": {
+    "flight_rms": 0.21757696529516563,
+    "flight_mean": 0.0773722660477908,
+    "flight_maxabs": 0.9042299663240385,
+    "drift_deg_per_min": 0.3103809869698388,
+    "ground_offset_used": 0.0
+   },
+   "gyro_int": {
+    "flight_rms": 0.9667506813341503,
+    "flight_mean": 0.9252710700298407,
+    "flight_maxabs": 1.608456795534778,
+    "drift_deg_per_min": 1.907901220957592,
+    "ground_offset_used": -20.487829241503405
+   },
+   "madgwick": {
+    "flight_rms": 1.2294543926406551,
+    "flight_mean": 1.0382786686986507,
+    "flight_maxabs": 2.21308129318723,
+    "drift_deg_per_min": 4.378638327684151,
+    "ground_offset_used": -20.53915711359545
+   }
+  },
+  "turn_segments": [
+   {
+    "t0": 24.203,
+    "t1": 26.438,
+    "dpsi": 94.3
+   }
+  ],
+  "yaw_err_phases": {
+   "EKF1": {
+    "hover": {
+     "n": 940,
+     "rms": 24.208506606637823,
+     "maxabs": 42.152117382328555
+    },
+    "turn": {
+     "n": 213,
+     "rms": 35.23545702918644,
+     "maxabs": 38.55050210706531
+    }
+   },
+   "EKF2": {
+    "hover": {
+     "n": 940,
+     "rms": 0.23596251465405318,
+     "maxabs": 0.9042299663240385
+    },
+    "turn": {
+     "n": 213,
+     "rms": 0.10266645904284824,
+     "maxabs": 0.31719883104912583
+    }
+   },
+   "gyro_int": {
+    "hover": {
+     "n": 940,
+     "rms": 0.9299747749804549,
+     "maxabs": 1.608456795534778
+    },
+    "turn": {
+     "n": 213,
+     "rms": 1.1146481693056896,
+     "maxabs": 1.4149330739556945
+    }
+   },
+   "madgwick": {
+    "hover": {
+     "n": 940,
+     "rms": 1.1610587921185904,
+     "maxabs": 2.21308129318723
+    },
+    "turn": {
+     "n": 213,
+     "rms": 1.49435938792749,
+     "maxabs": 1.7505626039916535
+    }
+   }
+  },
+  "true_peak_rate_deg_s": 17.315207033901352,
+  "ekf2_lag": {
+   "best_lag_s": 0.02,
+   "rms_at_best_lag_meanfree": 0.16045501717843347,
+   "rms_lag0_meanfree": 0.20335503011650227
+  },
+  "ekf2_err_vs_rate_corr": 0.4048931200025992,
+  "timeline": {
+   "dur": 32.078,
+   "t_arm": 3.031,
+   "t_lift": 6.516,
+   "t_flying": 7.844,
+   "t_landing": 30.891,
+   "t_flight_anchor": 18.547,
+   "volt_end": 3.3472,
+   "firmware_uptime_at_log0_ms": 436541
+  }
+ }
+}

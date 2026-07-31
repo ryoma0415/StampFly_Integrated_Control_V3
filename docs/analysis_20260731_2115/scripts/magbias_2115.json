@@ -1,0 +1,82 @@
+{
+  "schema": "stampfly_magbias_profile",
+  "version": 1,
+  "name": "magbias_20260731_2115",
+  "created_at": "2026-07-31T21:43:39+0900",
+  "source_logs": [
+    "20260731_211535_position.csv"
+  ],
+  "delta_b_ut": [
+    -3.426552508317371,
+    -12.117019136288514,
+    10.019934500000002
+  ],
+  "hover_residual_ut": {
+    "leveled_xy": [
+      -3.594142,
+      -5.195353
+    ],
+    "z": 10.019934500000002,
+    "current_a": 3.216
+  },
+  "ff_supplement": {
+    "voltage_coeff_ut_per_v": [
+      2.362158283761716,
+      27.788174918648068
+    ],
+    "duty_coeff": [
+      [
+        9.323595898592421,
+        -1.197661137377518,
+        13.438950005535036,
+        -1.3094473643157987
+      ],
+      [
+        -12.87000847045963,
+        13.609196040870998,
+        -5.242542818816856,
+        10.863217865805472
+      ]
+    ],
+    "r2": 0.3877623396965707,
+    "current_coeff_ut_per_a": [
+      -1.9174501024864692,
+      0.5420350768625097
+    ],
+    "intercept_ut": [
+      -21.702805111386592,
+      -110.13978073133293
+    ],
+    "r2_xy": [
+      0.10513603671363825,
+      0.5636442581272998
+    ],
+    "n_samples": 4002,
+    "duty_order": [
+      "FL",
+      "FR",
+      "RL",
+      "RR"
+    ]
+  },
+  "binding": {
+    "mag3d_hash": "sha256:5fb3806f125f6b6349a7b2383194c826058a2124e201a498ff524391605e395a",
+    "ffcal_crc": "72aee421"
+  },
+  "quality": {
+    "yaw_excursion_deg": 177.81802300000004,
+    "fit_rms_ut": 2.84698193355538,
+    "warnings": [
+      "z 残差はホバ/地上の mag_cal_z 差 — FF z残差と環境鉛直磁場差(高度依存)の合算であり分離していない",
+      "delta_b の x/y はレベル化水平フィット値を roll/pitch≈0 のホバ近傍近似で b_cal 機体系へ同一視したもの(大チルト飛行では不正確)。z成分はホバ/地上の mag_cal_z 差で、環境鉛直勾配(高度依存)を含む(FLIGHT_ANALYSIS_20260727.md §3.2 注意1)"
+    ]
+  },
+  "provenance": {
+    "tool": "magbias_learn.py",
+    "tool_version": "1.0",
+    "log_generation": "v6",
+    "yaw_source": "mocap_yaw_true_deg",
+    "bm_source": "ekf2_bm",
+    "flight_duration_s": 90.016
+  }
+}
