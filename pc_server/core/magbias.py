@@ -373,16 +373,31 @@ class MagbiasManager:
 
     # ---- flowcal / flow probe パススルー(契約 §3.5) ----
 
-    def flowcal_set(self, kx: Any, ky: Any) -> dict[str, Any]:
-        """フロースケール [counts/rad] を機体 NVS へ保存する(読み戻し照合)。"""
+    def flowcal_set(self, m00: Any, m11: Any, m01: Any = 0.0,
+                    m10: Any = 0.0) -> dict[str, Any]:
+        """フロー較正行列 K [counts/rad] を機体 NVS へ保存する(読み戻し照合)。
+
+        【2026-07-31 改訂】kx/ky 2 定数 → 2×2 行列化(契約 §1.4)。K は
+        「機体系レート [rad/s] → センサーカウントレート [counts/s]」の写像で、
+        純スケールなら K=diag(kx,ky)、取付回転 φ0 込みなら K=diag(kx,ky)·R(φ0)。
+        引数順は対角優先 (m00, m11, m01, m10) — 旧 API の 2 引数呼び出し
+        flowcal_set(kx, ky) は diag(kx,ky) の適用として後方互換で動く。
+        """
         try:
-            kx_v = float(kx)
-            ky_v = float(ky)
+            m00_v = float(m00)
+            m11_v = float(m11)
+            m01_v = float(m01)
+            m10_v = float(m10)
         except (TypeError, ValueError):
-            return self._fail(f"kx/ky が数値ではありません: {kx!r}, {ky!r}")
-        if not (math.isfinite(kx_v) and math.isfinite(ky_v)) \
-                or kx_v <= 0.0 or ky_v <= 0.0:
-            return self._fail(f"kx/ky は正の有限値が必要です: {kx_v}, {ky_v}")
+            return self._fail(
+                f"K 行列が数値ではありません: {m00!r}, {m01!r}, {m10!r}, {m11!r}")
+        if not all(math.isfinite(v) for v in (m00_v, m01_v, m10_v, m11_v)) \
+                or m00_v <= 0.0 or m11_v <= 0.0:
+            return self._fail(
+                f"対角 m00/m11 は正の有限値が必要です: {m00_v}, {m11_v}")
+        det = m00_v * m11_v - m01_v * m10_v
+        if det <= 0.0:
+            return self._fail(f"det(K) が正ではありません(K⁻¹ 不安定): {det}")
         busy = self._begin()
         if busy:
             return self._fail(busy)
@@ -390,7 +405,8 @@ class MagbiasManager:
             ok, detail = self._send_ack(
                 proto.MsgType.CMD_FLOWCAL_SET,
                 proto.CmdFlowcalSet(mode=proto.CmdFlowcalSet.MODE_SET,
-                                    kx=kx_v, ky=ky_v).to_payload())
+                                    m00=m00_v, m01=m01_v,
+                                    m10=m10_v, m11=m11_v).to_payload())
             if not ok:
                 return self._fail(f"CMD_FLOWCAL_SET が失敗しました: {detail}")
             data = self._read_back()
@@ -399,22 +415,26 @@ class MagbiasManager:
             if not (data.valid_flags & proto.TlmCalData.VALID_FLOWCAL):
                 return self._fail("読み戻しで flowcal が有効になっていません",
                                   verified=False)
-            mismatch = [f"{axis}: sent={want:.2f} drone={float(got):.2f}"
-                        for axis, want, got in zip(("kx", "ky"),
-                                                   (kx_v, ky_v), data.flowcal)
+            got_matrix = (data.flowcal_m00, data.flowcal_m01,
+                          data.flowcal_m10, data.flowcal_m11)
+            mismatch = [f"{name}: sent={want:.2f} drone={float(got):.2f}"
+                        for name, want, got in zip(
+                            ("m00", "m01", "m10", "m11"),
+                            (m00_v, m01_v, m10_v, m11_v), got_matrix)
                         if abs(float(got) - want) > CAL_VERIFY_TOLERANCE]
             if mismatch:
                 return self._fail(
                     f"読み戻し値が一致しません: {', '.join(mismatch)}",
                     verified=False)
-            self._set_message(f"flowcal を適用しました(kx={kx_v:.1f}, "
-                              f"ky={ky_v:.1f})")
+            self._set_message(
+                f"flowcal を適用しました(K=[{m00_v:.1f} {m01_v:.1f}; "
+                f"{m10_v:.1f} {m11_v:.1f}])")
             return {"ok": True, "verified": True, **self.status()}
         finally:
             self._end()
 
     def flowcal_clear(self) -> dict[str, Any]:
-        """フロースケールをクリアする(機体は既定 450.0 に戻る)。"""
+        """フロー較正行列をクリアする(機体は既定 diag(450,450) に戻る)。"""
         busy = self._begin()
         if busy:
             return self._fail(busy)

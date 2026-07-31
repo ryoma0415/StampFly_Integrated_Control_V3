@@ -1466,22 +1466,23 @@ uint8_t process_one_v2_command(const V2Command& c, bool& send_cal_data_after) {
             return handle_cmd_magbias_set(m);
         }
         case MsgType::CMD_FLOWCAL_SET: {
-            // フロースケール適用/クリア+NVS `flowcal`(MAG_AUTOTUNE_DESIGN.md
-            // §1.4/§2.5)。mode=0 でクリア=既定 450.0 に戻る。
+            // フロー較正行列 K の適用/クリア+NVS `flowcal`(MAG_AUTOTUNE_DESIGN.md
+            // §1.4/§2.5。2026-07-31 改訂: 2×2 行列化 17B)。mode=0 でクリア=
+            // 既定 diag(450,450) に戻る。妥当性(対角スケール範囲・非対角上限・
+            // det≈0 ガード)は flowcalMatrixValid に集約。
             stampfly::CmdFlowcalSet m;
             if (!stampfly::deserialize(c.payload, c.len, &m)) return TlmAck::STATUS_INVALID_ARG;
             if (m.mode > stampfly::CmdFlowcalSet::MODE_SET) return TlmAck::STATUS_INVALID_ARG;
             if (m.mode == stampfly::CmdFlowcalSet::MODE_SET) {
-                if (!isfinite(m.kx) || !isfinite(m.ky) ||
-                    m.kx < FLOW_SCALE_MIN_COUNTS_PER_RAD ||
-                    m.kx > FLOW_SCALE_MAX_COUNTS_PER_RAD ||
-                    m.ky < FLOW_SCALE_MIN_COUNTS_PER_RAD ||
-                    m.ky > FLOW_SCALE_MAX_COUNTS_PER_RAD) {
+                if (!flowcalMatrixValid(m.m00, m.m01, m.m10, m.m11)) {
                     return TlmAck::STATUS_INVALID_ARG;
                 }
-                flowHubApplyCalibration(m.kx, m.ky);  // 即適用+NVS 保存
+                // 即適用+NVS 保存(K⁻¹ 計算不成立は防御的に invalid_arg)
+                if (!flowHubApplyCalibration(m.m00, m.m01, m.m10, m.m11)) {
+                    return TlmAck::STATUS_INVALID_ARG;
+                }
             } else {
-                flowHubClearCalibration();  // 既定 450.0 へ+NVS クリア
+                flowHubClearCalibration();  // 既定 diag(450,450) へ+NVS クリア
             }
             return TlmAck::STATUS_OK;
         }

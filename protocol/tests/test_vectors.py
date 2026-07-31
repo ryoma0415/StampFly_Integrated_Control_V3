@@ -94,7 +94,10 @@ def _build_message(kind: str, fields: dict):
             ff_mode=fields["ff_mode"],
             est_mode=fields["est_mode"],
             magbias=tuple(fields["magbias"]),
-            flowcal=tuple(fields["flowcal"]))
+            flowcal_m00=fields["flowcal_m00"],
+            flowcal_m11=fields["flowcal_m11"],
+            flowcal_m01=fields["flowcal_m01"],
+            flowcal_m10=fields["flowcal_m10"])
     if kind == "TLM_CTRL":
         return sp.TlmCtrl(
             elapsed_ms=fields["elapsed_ms"],
@@ -291,12 +294,13 @@ def test_cmd_setpoint_field_offsets(vectors):
 
 
 def test_tlm_cal_data_field_offsets(vectors):
-    """TLM_CAL_DATA(132B)のオフセットが契約どおりであること(v2+磁気オートチューン拡張)。"""
+    """TLM_CAL_DATA(140B)のオフセットが契約どおりであること(v2+磁気オートチューン
+    拡張+2026-07-31 flowcal 2×2 化)。"""
     import struct
     vec = next(f for f in vectors["frames"] if f["name"] == "tlm_cal_data_full")
     payload = bytes.fromhex(vec["payload_hex"])
     f = vec["fields"]
-    assert len(payload) == 132
+    assert len(payload) == 140
     assert payload[0] == f["valid_flags"]
     # bit6=magbias / bit7=flowcal(MAG_AUTOTUNE_DESIGN.md §1.5)
     assert f["valid_flags"] & sp.TlmCalData.VALID_MAGBIAS
@@ -321,7 +325,12 @@ def test_tlm_cal_data_field_offsets(vectors):
     assert payload[110] == f["ff_mode"]
     assert payload[111] == f["est_mode"]
     assert f32s(112, 3) == want32(f["magbias"])
-    assert f32s(124, 2) == want32(f["flowcal"])
+    # flowcal K 行列のワイヤ順は m00@124, m11@128, m01@132, m10@136
+    # (既存 kx/ky オフセット互換維持のため行優先ではない)
+    assert f32s(124, 1) == want32([f["flowcal_m00"]])
+    assert f32s(128, 1) == want32([f["flowcal_m11"]])
+    assert f32s(132, 1) == want32([f["flowcal_m01"]])
+    assert f32s(136, 1) == want32([f["flowcal_m10"]])
 
 
 def test_tlm_ctrl_field_offsets(vectors):

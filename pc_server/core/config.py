@@ -34,6 +34,8 @@ FF_STATE_PATH = DATA_DIR / "ff_state.json"
 # magbias(学習ハードアイアン残差)プロファイル/適用状態(契約 §3.4)
 MAGBIAS_PROFILES_DIR = DATA_DIR / "magbias_profiles"
 MAGBIAS_STATE_PATH = DATA_DIR / "magbias_state.json"
+# フロー較正(純回転 2×2 フィット)の適用状態(FLIGHT_ANALYSIS_20260731.md §5)
+FLOWCAL_STATE_PATH = DATA_DIR / "flowcal_state.json"
 MAG3D_CALIBRATION_PATH = CONFIG_DIR / "mag3d_calibration.json"
 GEOMAG_PROFILES_PATH = CONFIG_DIR / "geomagnetic_profiles.json"
 DATA_ANALYSIS_DIR = REPO_DIR / "data_analysis"

@@ -64,17 +64,32 @@ bit2/bit7とも0なら相補CF)。
 | type | 名前 | payload | 動作 |
 |---|---|---|---|
 | 0x26 | CMD_MAGBIAS_SET | `u8 mode(0=clear,1=set), f32 dx,dy,dz` =13B | 学習ハードアイアン残差Δb [µT, b_cal空間] をNVS `magbias` へ保存+即適用。**ff_modeは降格しない**(FF係数はb_cal空間のまま有効)。適用時: アンカー無効化+窓リセット+補正系再シード(mag3d変更時と同パターン、ff_mode降格だけしない) |
-| 0x27 | CMD_FLOWCAL_SET | `u8 mode(0=clear,1=set), f32 kx, ky` =9B | フロースケール [counts/rad] をNVS `flowcal` へ保存 |
+| 0x27 | CMD_FLOWCAL_SET | `u8 mode(0=clear,1=set), f32 m00,m01,m10,m11` =**17B** | フロー較正行列 K [counts/rad] をNVS `flowcal`(schema v2)へ保存。K は機体系レート→センサーカウントレートの 2×2 写像(純スケールなら K=diag(kx,ky)、取付回転込みなら K=diag(kx,ky)·R(φ0))。ファーム適用は rate = K⁻¹·counts_rate(ジャイロ補償より前) |
+
+> **改訂(2026-07-31 flowcal 2×2 化)**: CMD_FLOWCAL_SET は当初の 9B
+> (`mode, kx, ky`)から 17B の 2×2 行列へ変更。7/31 初飛行の実測
+> (FLIGHT_ANALYSIS_20260731.md §5)でスケール誤差 x1.11/y1.26 に加えて
+> 取付回転 φ0=-9.4° を検出し、kx/ky の 2 定数では回転を表現できないため。
+> 受理条件: 対角 m00/m11 ∈ [100, 2000]、|m01|,|m10| ≤ 2000、
+> det(K) ≥ 100²(det≈0 ガード。不成立は invalid_arg)。
 | 0x28 | CMD_FLOW_PROBE | `u8 n_cycles(0=既定200)` =1B | PMW3901 burstプローブ実行(モーター停止時のみ、busyで拒否)。結果はLOG_TEXT複数行(agree_ratio等の要約)+ probe成功でburst_okラッチ更新 |
 
-### 1.5 TLM_CAL_DATA(0x34)拡張: 112B → **132B**(末尾追加)
+### 1.5 TLM_CAL_DATA(0x34)拡張: 112B → **140B**(末尾追加)
 
 | offset | 型 | フィールド |
 |---|---|---|
 | 112 | f32×3 | magbias dx,dy,dz [µT] |
-| 124 | f32×2 | flowcal kx,ky [counts/rad] |
+| 124 | f32 | flowcal_m00 [counts/rad](旧 kx。K 行列対角) |
+| 128 | f32 | flowcal_m11 [counts/rad](旧 ky。同) |
+| 132 | f32 | flowcal_m01 [counts/rad](2026-07-31 追加。非対角) |
+| 136 | f32 | flowcal_m10 [counts/rad](同) |
 
 valid_flags: **bit6=magbias有効、bit7=flowcal有効** 新設(bit5=ffcalは既存)。
+
+> **改訂(2026-07-31 flowcal 2×2 化)**: 当初の 132B(flowcal kx,ky@124)から
+> 140B へ末尾拡張。既存オフセット 124/128 の kx/ky は m00/m11 に改名
+> (K 行列の対角成分として意味維持)、m01@132・m10@136 を末尾追加。
+> ワイヤ順は **m00, m11, m01, m10**(オフセット互換維持のため行優先ではない)。
 
 ## 2. ファームウェア仕様
 
@@ -128,13 +143,21 @@ valid_flags: **bit6=magbias有効、bit7=flowcal有効** 新設(bit5=ffcalは既
 - 読みスロット: 既存20Hz低速スロットと同居しない独立20ms周期(50Hz)。ToF/磁気の
   I2Cとは別バス(SPI)なのでtick内共存可(52µs)。
 - 出力はテレメトリ+ログのみ(ride-along)。制御・EKF観測には未接続。
+- **【改訂 2026-07-31】counts→レート変換は 2×2 行列適用**: 軸マッピング・符号
+  (既定固定)適用後のカウントレートに rate = K⁻¹·counts_rate(ジャイロ補償より
+  前)。K⁻¹ は NVS ロード/CMD_FLOWCAL_SET 適用時に一度計算してキャッシュ
+  (det≈0 は flowcalMatrixValid が事前拒否+computeInverse の二重ガード)。
+- **PC側較正フィット(core/flowcal.py)の距離復元**: ファームの v=trans·d は
+  ToF **生スラント距離**を使うが、TLM_STATE の altitude_tof はチルト補正+LPF後。
+  フィットでは d_slant = altitude_tof / max(cosφ·cosθ, 0.2) で復元して整合させる
+  (未補正だと±25°ロッキング較正で非対角+7.7%・φ0−0.6°の系統誤差 — 回帰テストあり)。
 
 ### 2.5 NVS(persistence)
 
 | namespace | キー | 内容 |
 |---|---|---|
 | `magbias` | schema(u32=1), valid(u8), blob(f32×3), crc(u32) | Δb [µT, b_cal空間]。ブート時CRC照合、破損は自己修復破棄 |
-| `flowcal` | schema(u32=1), valid(u8), kx, ky(f32), crc(u32) | フロースケール。未設定時は既定450.0 |
+| `flowcal` | schema(u32=**2**), valid(u8), m00,m01,m10,m11(f32×4), crc(u32) | フロー較正行列 K [counts/rad](**改訂 2026-07-31**: v1 の kx,ky 2 定数 → 2×2 行列)。crc は {m00,m01,m10,m11} の f32 列。未設定時は既定 diag(450,450)。**v1 → v2 移行**: ブートロードで schema=1 を検出したら v1 CRC({kx,ky})・値域照合の上 diag(kx,ky) へ移行して v2 で保存し直す(旧キー kx/ky は削除。照合不成立は自己修復破棄) |
 
 ブートロード順: mag3d → accel6 → attmount → geomag → yawzero → ffcal → **magbias → flowcal**。
 mag3d変更時: magbiasは旧b_cal空間で無効になるため**連動クリア**(ffcalのff_mode降格と同時)。
@@ -201,7 +224,7 @@ mag3d変更時: magbiasは旧b_cal空間で無効になるため**連動クリ�
 | # | 項目 | 基準 |
 |---|---|---|
 | 1 | ファーム | `pio run -d firmware_stampfly -e release` 成功。既存TLM/CMDオフセット不変 |
-| 2 | protocol | 全structサイズassert・round-tripテストパス(184/132B含む) |
+| 2 | protocol | 全structサイズassert・round-tripテストパス(184/140B含む。140B は 2026-07-31 flowcal 2×2 化) |
 | 3 | pc_server | pytest全パス(magbias apply・yaw_refソース切替・v6ロガー含む) |
 | 4 | viewer | v5/v6両ログを読めて、v6でEKF2比較パネルが出る |
 | 5 | 後方互換 | est_mode=0/1の飛行挙動・現行EKF数式/定数は完全不変。フロー無効時(burst不成立)の飛行挙動不変 |

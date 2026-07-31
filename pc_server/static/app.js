@@ -143,6 +143,11 @@ const els = {
   // 計測(EKF/FF性能ログ)パネル(T1-6: exp_record_start/stop)
   btnExpRecStart: $("btnExpRecStart"), btnExpRecStop: $("btnExpRecStop"),
   expRecStatus: $("expRecStatus"),
+  // リアルタイムモニタ(ヨー/フロー速度/2D位置。canvas 自前描画)
+  btnRtmonToggle: $("btnRtmonToggle"), rtmonBody: $("rtmonBody"),
+  rtmonYawCanvas: $("rtmonYawCanvas"), rtmonVelCanvas: $("rtmonVelCanvas"),
+  rtmonXyCanvas: $("rtmonXyCanvas"), btnRtmonReset: $("btnRtmonReset"),
+  rtmonInfo: $("rtmonInfo"),
   sweepLocation: $("sweepLocation"), sweepOrientation: $("sweepOrientation"), sweepMemo: $("sweepMemo"),
   btnSweepStart: $("btnSweepStart"), btnSweepAbort: $("btnSweepAbort"),
   sweepStepTag: $("sweepStepTag"), sweepProgressFill: $("sweepProgressFill"),
@@ -176,6 +181,19 @@ const els = {
   magbiasSelect: $("magbiasSelect"), btnMagbiasApply: $("btnMagbiasApply"),
   btnMagbiasClear: $("btnMagbiasClear"),
   magbiasApplied: $("magbiasApplied"), magbiasMsg: $("magbiasMsg"),
+  // フロー較正(純回転フィット)パネル
+  btnFlowcalStart: $("btnFlowcalStart"), btnFlowcalStop: $("btnFlowcalStop"),
+  btnFlowcalApply: $("btnFlowcalApply"), btnFlowcalClear: $("btnFlowcalClear"),
+  flowcalRecStatus: $("flowcalRecStatus"), flowcalBadge: $("flowcalBadge"),
+  fcFillSamples: $("fcFillSamples"), fcValSamples: $("fcValSamples"),
+  fcFillValid: $("fcFillValid"), fcValValid: $("fcValValid"),
+  fcFillStdP: $("fcFillStdP"), fcValStdP: $("fcValStdP"),
+  fcFillStdQ: $("fcFillStdQ"), fcValStdQ: $("fcValStdQ"),
+  fcFillSqual: $("fcFillSqual"), fcValSqual: $("fcValSqual"),
+  fcFillTof: $("fcFillTof"), fcValTof: $("fcValTof"),
+  fcR2: $("fcR2"), fcScale: $("fcScale"), fcPhi: $("fcPhi"),
+  fcUsed: $("fcUsed"), fcMatrix: $("fcMatrix"), fcDroneMatrix: $("fcDroneMatrix"),
+  flowcalApplied: $("flowcalApplied"), flowcalMsg: $("flowcalMsg"),
   // 設定タブ(UI専用: MoCap マッピング)
   tabSettings: $("tabSettings"), panelSettings: $("panelSettings"),
   mapAxisSel: { x: $("mapXAxis"), y: $("mapYAxis"), z: $("mapZAxis") },
@@ -216,6 +234,8 @@ let appliedMapping = null;         // サーバ適用済みマッピング(ゼ�
 let selectedDuty = UI.DUTY_DEFAULT;
 let ffStatus = null;               // /api/ffprofile の状態
 let magbiasStatus = null;          // /api/magbias の状態
+let flowcalStatus = null;          // /api/flowcal の状態
+let flowcalPollTimer = null;       // 記録中のライブメーターポーリング
 let yawRefSentAt = -Infinity;      // ヨー基準ソース送信時刻(echo抑制用)
 let geomagStatus = null;           // /api/geomag の状態
 let calprofStatus = null;          // /api/calprofile の状態
@@ -594,6 +614,7 @@ function onState(data) {
   renderMocap();
   renderExperiment();
   renderMulti();
+  rtmonOnState();   // リアルタイムモニタのサンプリング(描画は10Hz間引き)
   if (uiMode === "position") drawPlot();
   if (uiMode === "multi") drawMultiPlot();
 }
@@ -1913,7 +1934,10 @@ function applyMode(mode, sendToServer) {
   } else {
     stopRbCheck();   // タブ離脱時に RB 確認ポーリングを止める
   }
-  if (mode === "experiment") refreshExperimentPanels();
+  if (mode === "experiment") {
+    refreshExperimentPanels();
+    rtmonRequestDraw();   // リアルタイムモニタの初期描画(履歴は保持済み)
+  }
   // 設定タブ表示中はモードechoでパネルを奪わない(UI専用タブ)
   syncSettingsVisual();
 }
@@ -2129,6 +2153,401 @@ function updateExperimentControls() {
   }
 }
 
+/* ===================== リアルタイムモニタ(Experiment) ===================== */
+/* ヨー3系統+MoCap / フロー速度 / フロー積算2D位置を canvas 自前描画する
+   (外部ライブラリなし)。サンプリングは WS state(20Hz)ごとに常時行い、
+   時刻は機体 elapsed_ms(TLM_STATE クロック)基準 — 同一フレーム再配信は
+   dt=0 として捨て、逆行(機体再起動)でバッファをクリアする。
+   再描画は requestAnimationFrame + 時刻間引きで 10Hz 上限。タブ非表示
+   (document.hidden。rAF も停止する)・Experiment 以外のタブ・折りたたみ中は
+   描画しない(サンプリング/積算は継続)。 */
+const RTMON = {
+  WINDOW_S: 60,            // 表示窓/軌跡保持 [s]
+  CAPACITY: 1600,          // リングバッファ容量(60s × 25Hz + 余裕)
+  REDRAW_MIN_MS: 100,      // 再描画間隔の下限(=10Hz 上限)
+  DT_MAX_S: 0.25,          // 積算/差分 dt の上限(フレーム落ち・再接続保護)
+  XY_HALF_MIN_M: 1.0,      // 2D位置プロットの表示半幅の下限(初期 ±1m)
+  VEL_HALF_MIN: 0.25,      // 速度グラフ y 半幅の下限 [m/s]
+  FLOW_VEL_VALID: 0x04,    // TlmState.FLOW_STATUS_VEL_VALID(契約 §1.1)
+};
+
+/* 固定容量リングバッファ(満杯時は最古を上書き) */
+class RtRing {
+  constructor(capacity) {
+    this.cap = capacity;
+    this.buf = new Array(capacity);
+    this.start = 0;
+    this.len = 0;
+  }
+  push(item) {
+    if (this.len < this.cap) {
+      this.buf[(this.start + this.len) % this.cap] = item;
+      this.len++;
+    } else {
+      this.buf[this.start] = item;
+      this.start = (this.start + 1) % this.cap;
+    }
+  }
+  get(i) { return this.buf[(this.start + i) % this.cap]; }
+  last() { return this.len ? this.get(this.len - 1) : null; }
+  clear() { this.start = 0; this.len = 0; }
+}
+
+const rtmonRing = new RtRing(RTMON.CAPACITY);
+let rtmonCollapsed = false;        // 折りたたみ(既定は表示)
+let rtmonPos = { x: 0, y: 0 };     // フロー速度のデッドレコニング積算 [m]
+let rtmonResetT = -Infinity;       // 積算リセット時刻(フロー軌跡はこれ以降のみ)
+let rtmonLastDrawMs = 0;           // 直近描画時刻(rAF タイムスタンプ)
+let rtmonRafId = null;
+
+/* DPR 対応の 2D コンテキスト取得(xyCanvas の setupCanvasDpr と同じ手法) */
+function rtmonSetupCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.width, h = canvas.height;
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  return ctx;
+}
+const rtmonYawCtx = rtmonSetupCanvas(els.rtmonYawCanvas);
+const rtmonVelCtx = rtmonSetupCanvas(els.rtmonVelCanvas);
+const rtmonXyCtx = rtmonSetupCanvas(els.rtmonXyCanvas);
+
+function rtmonColors() {
+  const css = getComputedStyle(document.documentElement);
+  const gv = (name, fb) => css.getPropertyValue(name).trim() || fb;
+  return {
+    grid: gv("--plot-grid", "#1d2330"),
+    axis: gv("--plot-axis", "#384154"),
+    text: gv("--text-dim", "#8b93a3"),
+    mdg: gv("--rt-madgwick", "#ec4899"),
+    ekf1: gv("--rt-ekf1", "#38bdf8"),
+    ekf2: gv("--rt-ekf2", "#a78bfa"),
+    mocap: gv("--rt-mocap", "#34d399"),
+    vx: gv("--rt-vx", "#38bdf8"),
+    vy: gv("--rt-vy", "#fbbf24"),
+  };
+}
+
+/* WS state(20Hz)ごとの1サンプル取り込み+デッドレコニング積算 */
+function rtmonOnState() {
+  const d = lastDrone;
+  if (!d || typeof d.elapsed_ms !== "number") return;
+  const t = d.elapsed_ms / 1000;
+  const prev = rtmonRing.last();
+  if (prev) {
+    if (t < prev.t - 1) {
+      // 機体再起動(elapsed_ms リセット): 履歴と積算をやり直す
+      rtmonRing.clear();
+      rtmonPos = { x: 0, y: 0 };
+      rtmonResetT = -Infinity;
+    } else if (t <= prev.t) {
+      return;   // 同一 TLM_STATE の再配信(WS 20Hz > TLM 25Hz の位相揺れ)
+    }
+  }
+  const m = lastMocap;
+  const mocapOk = !!(m && m.fresh && m.valid !== false &&
+                     typeof m.x === "number" && typeof m.y === "number");
+  const mocapYaw = m
+    ? ((typeof m.yaw_true_deg === "number") ? m.yaw_true_deg
+       : (typeof m.yaw_deg === "number") ? m.yaw_deg : null)
+    : null;
+  const vx = typeof d.flow_vx_mps === "number" ? d.flow_vx_mps : null;
+  const vy = typeof d.flow_vy_mps === "number" ? d.flow_vy_mps : null;
+  const velValid = typeof d.flow_status === "number" &&
+                   (d.flow_status & RTMON.FLOW_VEL_VALID) !== 0;
+
+  const last2 = rtmonRing.last();   // クリア後は null
+  const dt = last2 ? t - last2.t : 0;
+  let mvx = null, mvy = null;       // MoCap 速度の機体系換算(比較表示用)
+  if (last2 && dt > 0 && dt <= RTMON.DT_MAX_S) {
+    // デッドレコニング積算 p += R(ψ_active)·v_flow·dt(vel_valid 時のみ。
+    // ψ_active はアクティブ推定器ヨー = drone.yaw_est)
+    if (velValid && vx !== null && vy !== null &&
+        typeof d.yaw_est === "number") {
+      const psi = d.yaw_est * Math.PI / 180;
+      rtmonPos.x += (Math.cos(psi) * vx - Math.sin(psi) * vy) * dt;
+      rtmonPos.y += (Math.sin(psi) * vx + Math.cos(psi) * vy) * dt;
+    }
+    // MoCap 速度: 位置の前進差分(世界系)を MoCap ヨーで機体系へ回す
+    // (フロー速度と同じフレームで重ねられるように)
+    if (mocapOk && last2.mx !== null && last2.my !== null &&
+        mocapYaw !== null) {
+      const wx = (m.x - last2.mx) / dt;
+      const wy = (m.y - last2.my) / dt;
+      const ang = -mocapYaw * Math.PI / 180;
+      const c = Math.cos(ang), s = Math.sin(ang);
+      mvx = c * wx - s * wy;
+      mvy = s * wx + c * wy;
+    }
+  }
+
+  rtmonRing.push({
+    t,
+    yawMdg: typeof d.yaw === "number" ? d.yaw : null,
+    yawEst: typeof d.yaw_est === "number" ? d.yaw_est : null,
+    yawEkf2: typeof d.ekf2_yaw === "number" ? d.ekf2_yaw : null,
+    yawMocap: mocapOk ? mocapYaw : null,
+    vx, vy, velValid, mvx, mvy,
+    squal: typeof d.flow_squal === "number" ? d.flow_squal : null,
+    px: rtmonPos.x, py: rtmonPos.y,
+    mx: mocapOk ? m.x : null, my: mocapOk ? m.y : null,
+  });
+  rtmonRequestDraw();
+}
+
+function rtmonVisible() {
+  return uiMode === "experiment" && !rtmonCollapsed && !document.hidden;
+}
+
+/* rAF 1発予約 + 時刻間引き(<100ms なら描画せず次の WS state で再試行 →
+   20Hz 流入時の実効再描画 ≈10Hz。タブ非表示時は rAF ごと停止) */
+function rtmonRequestDraw() {
+  if (!rtmonVisible() || rtmonRafId !== null) return;
+  rtmonRafId = requestAnimationFrame((ts) => {
+    rtmonRafId = null;
+    if (ts - rtmonLastDrawMs < RTMON.REDRAW_MIN_MS) return;
+    rtmonLastDrawMs = ts;
+    rtmonDrawAll();
+  });
+}
+
+/* 時系列1枠を描く。series: [{key, color, label, dash}](key はサンプルの
+   フィールド名)。opts.wrap=true で ±180° ラップ跨ぎ(隣接差>180°)の線を
+   切る。opts.fixed=[min,max] で固定レンジ、無指定は窓内データから自動。 */
+function rtmonDrawTimeChart(canvas, ctx, series, opts) {
+  const w = parseFloat(canvas.style.width);
+  const h = parseFloat(canvas.style.height);
+  const c = rtmonColors();
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = '10px "SF Mono", ui-monospace, Menlo, monospace';
+  const last = rtmonRing.last();
+  if (!last) {
+    ctx.fillStyle = c.text;
+    ctx.fillText("データなし(テレメトリ受信待ち)", 10, h / 2);
+    return;
+  }
+  const padL = 38, padR = 8, padT = 16, padB = 14;
+  const t1 = last.t;
+  const t0 = t1 - RTMON.WINDOW_S;
+
+  // y レンジ(固定 or 窓内データから自動、最小半幅つき)
+  let yMin, yMax;
+  if (opts.fixed) {
+    [yMin, yMax] = opts.fixed;
+  } else {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < rtmonRing.len; i++) {
+      const smp = rtmonRing.get(i);
+      if (smp.t < t0) continue;
+      for (const sr of series) {
+        const v = smp[sr.key];
+        if (typeof v === "number" && Number.isFinite(v)) {
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+      }
+    }
+    const halfMin = opts.halfMin || 0.1;
+    if (!Number.isFinite(lo)) { lo = -halfMin; hi = halfMin; }
+    const mid = (hi + lo) / 2;
+    const half = Math.max((hi - lo) / 2 * 1.15, halfMin);
+    yMin = mid - half;
+    yMax = mid + half;
+  }
+  const xOf = (t) => padL + ((t - t0) / RTMON.WINDOW_S) * (w - padL - padR);
+  const yOf = (v) => padT + ((yMax - v) / (yMax - yMin)) * (h - padT - padB);
+
+  // グリッド: 縦=10s 刻み、横=固定レンジは指定目盛 / 自動は4分割
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = c.grid;
+  ctx.fillStyle = c.text;
+  for (let g = Math.ceil(t0 / 10) * 10; g <= t1 + 1e-9; g += 10) {
+    const x = xOf(g);
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, h - padB); ctx.stroke();
+  }
+  const ticks = opts.ticks
+    || [yMin, yMin + (yMax - yMin) * 0.25, yMin + (yMax - yMin) * 0.5,
+        yMin + (yMax - yMin) * 0.75, yMax];
+  for (const v of ticks) {
+    if (v < yMin - 1e-9 || v > yMax + 1e-9) continue;
+    const y = yOf(v);
+    ctx.strokeStyle = Math.abs(v) < 1e-9 ? c.axis : c.grid;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    ctx.fillText(String(Math.round(v * 100) / 100), 2, y + 3);
+  }
+
+  // 各系列の折れ線(null/ラップ跨ぎで線を切る)
+  for (const sr of series) {
+    ctx.strokeStyle = sr.color;
+    ctx.lineWidth = 1.4;
+    if (sr.dash) ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    let pen = false;
+    let prevV = null;
+    for (let i = 0; i < rtmonRing.len; i++) {
+      const smp = rtmonRing.get(i);
+      if (smp.t < t0) continue;
+      const raw = smp[sr.key];
+      if (typeof raw !== "number" || !Number.isFinite(raw)) {
+        pen = false;
+        prevV = null;
+        continue;
+      }
+      const v = opts.wrap ? wrap180(raw) : raw;
+      if (opts.wrap && pen && prevV !== null && Math.abs(v - prevV) > 180) {
+        pen = false;   // ±180° 跨ぎ: セグメント分割(縦線を描かない)
+      }
+      const x = xOf(smp.t), y = yOf(clamp(v, yMin, yMax));
+      if (!pen) { ctx.moveTo(x, y); pen = true; } else { ctx.lineTo(x, y); }
+      prevV = v;
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 凡例(上端に色付きラベルを並べる)
+  let lx = padL + 4;
+  for (const sr of series) {
+    ctx.fillStyle = sr.color;
+    ctx.fillText(sr.label, lx, 11);
+    lx += ctx.measureText(sr.label).width + 12;
+  }
+}
+
+/* 2D位置(正方形): フロー積算軌跡(直近60s・リセット以降)+ MoCap 位置 */
+function rtmonDrawXyChart() {
+  const canvas = els.rtmonXyCanvas;
+  const ctx = rtmonXyCtx;
+  const w = parseFloat(canvas.style.width);
+  const h = parseFloat(canvas.style.height);
+  const c = rtmonColors();
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = '10px "SF Mono", ui-monospace, Menlo, monospace';
+  const last = rtmonRing.last();
+  if (!last) {
+    ctx.fillStyle = c.text;
+    ctx.fillText("データなし", 10, h / 2);
+    return;
+  }
+  const t0 = last.t - RTMON.WINDOW_S;
+
+  // スケール自動: 窓内のフロー軌跡(リセット以降)と MoCap 位置の最大絶対値
+  // (下限 ±1m)
+  let half = RTMON.XY_HALF_MIN_M;
+  for (let i = 0; i < rtmonRing.len; i++) {
+    const smp = rtmonRing.get(i);
+    if (smp.t < t0) continue;
+    if (smp.t >= rtmonResetT) {
+      half = Math.max(half, Math.abs(smp.px), Math.abs(smp.py));
+    }
+    if (smp.mx !== null) {
+      half = Math.max(half, Math.abs(smp.mx), Math.abs(smp.my));
+    }
+  }
+  half *= 1.1;
+  const toPx = (x, y) => [w / 2 + (x / half) * (w / 2 - 6),
+                          h / 2 - (y / half) * (h / 2 - 6)];
+
+  // グリッド(0.5m / 1m / 2m 刻みをスケールに応じて選択)+ 原点軸
+  const step = half <= 1.6 ? 0.5 : half <= 3.2 ? 1 : 2;
+  ctx.lineWidth = 1;
+  for (let g = -Math.floor(half / step) * step; g <= half + 1e-9; g += step) {
+    ctx.strokeStyle = Math.abs(g) < 1e-9 ? c.axis : c.grid;
+    const [gx] = toPx(g, 0);
+    const [, gy] = toPx(0, g);
+    ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke();
+  }
+  ctx.fillStyle = c.text;
+  ctx.fillText(`±${half.toFixed(1)}m`, 4, 11);
+
+  // 軌跡2本: フロー積算(実線)と MoCap(接続時のみ)。null で線を切る
+  const drawTrail = (getXY, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath();
+    let pen = false;
+    let lastPt = null;
+    for (let i = 0; i < rtmonRing.len; i++) {
+      const smp = rtmonRing.get(i);
+      if (smp.t < t0) continue;
+      const pt = getXY(smp);
+      if (pt === null) { pen = false; continue; }
+      const [x, y] = toPx(pt[0], pt[1]);
+      if (!pen) { ctx.moveTo(x, y); pen = true; } else { ctx.lineTo(x, y); }
+      lastPt = pt;
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    if (lastPt !== null) {   // 現在点
+      const [x, y] = toPx(lastPt[0], lastPt[1]);
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    return lastPt !== null;
+  };
+  drawTrail((smp) => (smp.t >= rtmonResetT ? [smp.px, smp.py] : null), c.vx);
+  const hasMocap = drawTrail(
+    (smp) => (smp.mx !== null ? [smp.mx, smp.my] : null), c.mocap);
+
+  // 凡例
+  ctx.fillStyle = c.vx;
+  ctx.fillText("フロー積算", 4, h - 6);
+  if (hasMocap) {
+    ctx.fillStyle = c.mocap;
+    ctx.fillText("MoCap", 78, h - 6);
+  }
+}
+
+function rtmonDrawAll() {
+  const c = rtmonColors();
+  rtmonDrawTimeChart(els.rtmonYawCanvas, rtmonYawCtx, [
+    { key: "yawMdg", color: c.mdg, label: "Madgwick" },
+    { key: "yawEst", color: c.ekf1, label: "EKF" },
+    { key: "yawEkf2", color: c.ekf2, label: "EKF2" },
+    { key: "yawMocap", color: c.mocap, label: "MoCap" },
+  ], { wrap: true, fixed: [-190, 190], ticks: [-180, -90, 0, 90, 180] });
+  rtmonDrawTimeChart(els.rtmonVelCanvas, rtmonVelCtx, [
+    { key: "vx", color: c.vx, label: "flow_vx" },
+    { key: "vy", color: c.vy, label: "flow_vy" },
+    { key: "mvx", color: c.vx, label: "MoCap vx", dash: true },
+    { key: "mvy", color: c.vy, label: "MoCap vy", dash: true },
+  ], { halfMin: RTMON.VEL_HALF_MIN });
+  rtmonDrawXyChart();
+
+  // 現在値の1行サマリ
+  const smp = rtmonRing.last();
+  if (smp) {
+    const fv = (v, d2) => (typeof v === "number" ? v.toFixed(d2) : "--");
+    els.rtmonInfo.textContent =
+      `積算位置 x=${fv(smp.px, 2)} y=${fv(smp.py, 2)} m` +
+      ` / flow vx=${fv(smp.vx, 2)} vy=${fv(smp.vy, 2)} m/s` +
+      ` SQUAL=${smp.squal ?? "--"}` +
+      `${smp.velValid ? "" : "(vel無効)"}` +
+      (smp.mx !== null
+        ? ` / MoCap x=${fv(smp.mx, 2)} y=${fv(smp.my, 2)} m` : "");
+  }
+}
+
+function rtmonReset() {
+  rtmonPos = { x: 0, y: 0 };
+  const last = rtmonRing.last();
+  rtmonResetT = last ? last.t : -Infinity;
+  rtmonRequestDraw();
+}
+
+function rtmonToggle() {
+  rtmonCollapsed = !rtmonCollapsed;
+  els.rtmonBody.classList.toggle("hidden", rtmonCollapsed);
+  els.btnRtmonToggle.textContent = rtmonCollapsed ? "表示" : "非表示";
+  if (!rtmonCollapsed) rtmonRequestDraw();
+}
+
 /* ---- REST 状態の取得と描画(Experiment 各パネル) ---- */
 
 function ffModeLabel(v) {
@@ -2253,6 +2672,158 @@ function setMagbiasStatus(resp) {
   }
 }
 
+/* ---- フロー較正(純回転 2×2 フィット)パネル ---- */
+
+/* メータースケール/合格ライン(core/flowcal.py の受入基準と同値。
+   合格ラインの位置は index.html の .fc-meter-line と対で保守する) */
+const FLOWCAL_UI = {
+  SAMPLES_SCALE: 600,   // n メーターのフルスケール(合格 200 = 33.3%)
+  SAMPLES_PASS: 200,
+  VALID_PASS: 0.8,      // 有効サンプル率の目安ライン(80%)
+  STD_SCALE: 1.0,       // 励振 std のフルスケール [rad/s](合格 0.30 = 30%)
+  STD_PASS: 0.3,
+  SQUAL_SCALE: 128,     // SQUAL フルスケール(ゲート 25 = 19.5%)
+  SQUAL_PASS: 25,
+  TOF_SCALE_M: 1.0,     // ToF フルスケール [m](推奨帯 0.15〜0.5 = 15〜50%)
+  TOF_MIN_M: 0.15,
+  TOF_MAX_M: 0.5,
+  POLL_MS: 500,         // 記録中ライブメーターのポーリング間隔
+};
+
+function setFcMeter(fill, valEl, frac, pass, text) {
+  fill.style.width = `${clamp(frac * 100, 0, 100)}%`;
+  fill.classList.toggle("pass", !!pass);
+  valEl.textContent = text;
+}
+
+function fcMatrixLabel(m) {
+  if (!Array.isArray(m) || m.length !== 4) return "--";
+  // ワイヤ順は m00,m01,m10,m11(行優先)
+  return `[${m[0].toFixed(1)} ${m[1].toFixed(1)}; ${m[2].toFixed(1)} ${m[3].toFixed(1)}]`;
+}
+
+function fcImpliedLabel(m) {
+  // 含意パラメータ: kx=|K·e1|(第1列), ky=|K·e2|(第2列), φ0(diag·R 形の平均)
+  if (!Array.isArray(m) || m.length !== 4) return "";
+  const kx = Math.hypot(m[0], m[2]);
+  const ky = Math.hypot(m[1], m[3]);
+  const phi = 0.5 * (Math.atan2(-m[1], m[0]) + Math.atan2(m[2], m[3]))
+    * 180 / Math.PI;
+  return ` kx=${kx.toFixed(0)} ky=${ky.toFixed(0)} φ0=${phi >= 0 ? "+" : ""}${phi.toFixed(1)}°`;
+}
+
+function renderFlowcal() {
+  const st = flowcalStatus;
+  if (!st) return;
+  // 記録状態+ライブメーター
+  els.flowcalRecStatus.textContent = st.collecting
+    ? `記録中 ${st.duration_s != null ? st.duration_s.toFixed(0) : "-"}s`
+    : (st.busy ? "適用中…" : "待機中");
+  const live = st.live;
+  const nValid = live ? live.n_valid : 0;
+  setFcMeter(els.fcFillSamples, els.fcValSamples,
+    nValid / FLOWCAL_UI.SAMPLES_SCALE, nValid >= FLOWCAL_UI.SAMPLES_PASS,
+    live ? `${live.n_valid}/${live.n_total}` : "--");
+  setFcMeter(els.fcFillValid, els.fcValValid,
+    live ? live.valid_ratio : 0,
+    live && live.valid_ratio >= FLOWCAL_UI.VALID_PASS,
+    live ? `${(live.valid_ratio * 100).toFixed(0)}%` : "--");
+  setFcMeter(els.fcFillStdP, els.fcValStdP,
+    live ? live.std_p_rad_s / FLOWCAL_UI.STD_SCALE : 0,
+    live && live.std_p_rad_s >= FLOWCAL_UI.STD_PASS,
+    live ? `${live.std_p_rad_s.toFixed(2)} rad/s` : "--");
+  setFcMeter(els.fcFillStdQ, els.fcValStdQ,
+    live ? live.std_q_rad_s / FLOWCAL_UI.STD_SCALE : 0,
+    live && live.std_q_rad_s >= FLOWCAL_UI.STD_PASS,
+    live ? `${live.std_q_rad_s.toFixed(2)} rad/s` : "--");
+  setFcMeter(els.fcFillSqual, els.fcValSqual,
+    live ? live.squal / FLOWCAL_UI.SQUAL_SCALE : 0,
+    live && live.squal >= FLOWCAL_UI.SQUAL_PASS,
+    live ? String(live.squal) : "--");
+  setFcMeter(els.fcFillTof, els.fcValTof,
+    live ? live.tof_m / FLOWCAL_UI.TOF_SCALE_M : 0,
+    live && live.tof_m >= FLOWCAL_UI.TOF_MIN_M
+      && live.tof_m <= FLOWCAL_UI.TOF_MAX_M,
+    live ? `${live.tof_m.toFixed(2)} m` : "--");
+
+  // フィット結果+合否バッジ
+  const fit = st.fit;
+  if (!fit) {
+    els.flowcalBadge.textContent = "フィット未実施";
+    els.flowcalBadge.className = "badge b-dim";
+  } else if (fit.ok) {
+    els.flowcalBadge.textContent = "合格(適用可)";
+    els.flowcalBadge.className = "badge b-ok";
+  } else {
+    const nw = (fit.warnings || []).length;
+    els.flowcalBadge.textContent = `不合格(警告${nw}件)`;
+    els.flowcalBadge.className = "badge b-warn";
+  }
+  const hasMatrix = !!(fit && Array.isArray(fit.matrix));
+  els.fcR2.textContent = hasMatrix
+    ? `${fit.r2x.toFixed(3)} / ${fit.r2y.toFixed(3)}` : "--";
+  els.fcScale.textContent = hasMatrix
+    ? `${fit.kx.toFixed(1)} / ${fit.ky.toFixed(1)}` : "--";
+  els.fcPhi.textContent = hasMatrix
+    ? `${fit.phi0_deg >= 0 ? "+" : ""}${fit.phi0_deg.toFixed(1)}° / ×${fit.ratio.toFixed(2)}` : "--";
+  els.fcUsed.textContent = hasMatrix
+    ? `${fit.n_used}(棄却 ${fit.n_rejected} / 有効 ${fit.n_valid} / 総 ${fit.n_total})`
+    : (fit ? `有効 ${fit.n_valid} / 総 ${fit.n_total}` : "--");
+  els.fcMatrix.textContent = hasMatrix
+    ? fcMatrixLabel(fit.matrix) : "--";
+  const drone = st.drone;
+  els.fcDroneMatrix.textContent = !drone
+    ? "--(CAL_GET 未受信)"
+    : (drone.valid
+      ? fcMatrixLabel(drone.matrix) + fcImpliedLabel(drone.matrix)
+      : "未設定(既定 diag(450,450))");
+
+  // 適用状態バナー+メッセージ
+  const a = st.applied;
+  els.flowcalApplied.textContent = a
+    ? `flowcal適用中: K=${fcMatrixLabel(a.matrix)} ` +
+      `φ0=${a.phi0_deg >= 0 ? "+" : ""}${(a.phi0_deg ?? 0).toFixed(1)}°` +
+      `${a.forced ? "(force適用)" : ""}${a.verified ? "" : "(未検証)"}`
+    : "flowcal: 未適用(既定 diag(450,450))";
+  els.flowcalApplied.classList.toggle("applied", !!a);
+  if (st.message) els.flowcalMsg.textContent = st.message;
+
+  // ボタン活性(適用は「フィット結果あり」が条件。合否はサーバが判定し、
+  // 不合格は confirm 経由の force で強制適用できる)
+  els.btnFlowcalStart.disabled = !!(st.collecting || st.busy);
+  els.btnFlowcalStop.disabled = !st.collecting;
+  els.btnFlowcalApply.disabled = !!(st.collecting || st.busy || !hasMatrix);
+  els.btnFlowcalClear.disabled = !!st.busy;
+}
+
+function flowcalEnsurePolling() {
+  const active = !!(flowcalStatus && flowcalStatus.collecting);
+  if (active && flowcalPollTimer === null) {
+    flowcalPollTimer = setInterval(fetchFlowcal, FLOWCAL_UI.POLL_MS);
+  } else if (!active && flowcalPollTimer !== null) {
+    clearInterval(flowcalPollTimer);
+    flowcalPollTimer = null;
+  }
+}
+
+async function fetchFlowcal() {
+  const body = await apiGet("/api/flowcal", true);
+  if (body && typeof body.collecting === "boolean") {
+    flowcalStatus = body;
+    renderFlowcal();
+    flowcalEnsurePolling();
+  }
+}
+
+function setFlowcalStatus(resp) {
+  // POST 応答は status() のフィールドを含む(ok/message 等の余剰キーは無害)
+  if (resp && typeof resp.collecting === "boolean") {
+    flowcalStatus = resp;
+    renderFlowcal();
+    flowcalEnsurePolling();
+  }
+}
+
 function renderGeomag() {
   const st = geomagStatus;
   if (!st) return;
@@ -2369,6 +2940,7 @@ function refreshExperimentPanels() {
   fetchAccel6();
   fetchCal3d();
   fetchMagbias();
+  fetchFlowcal();
 }
 
 /* ---- FF 適用(共通: mag3d 不一致時は confirm で force 再適用) ---- */
@@ -2665,6 +3237,14 @@ function wireEvents() {
     appendConsole("ui", "計測停止を要求しました");
   });
 
+  // リアルタイムモニタ: 折りたたみ / 積算リセット / タブ復帰時の再描画
+  // (非表示中は rAF が発火しないため、可視化された瞬間に1回描き直す)
+  els.btnRtmonToggle.addEventListener("click", rtmonToggle);
+  els.btnRtmonReset.addEventListener("click", rtmonReset);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) rtmonRequestDraw();
+  });
+
   // スイープ
   els.btnSweepStart.addEventListener("click", () => withBusy(els.btnSweepStart, async () => {
     const resp = await apiPost("/api/sweep", {
@@ -2931,6 +3511,65 @@ function wireEvents() {
         setMagbiasStatus(resp);
       }
     }));
+
+  // フロー較正(純回転フィット)。withBusy は使わない — ボタン活性は
+  // renderFlowcal が collecting/busy/fit から一元的に決める(finally の
+  // 一律再有効化が「停止ボタンは記録中のみ」等の状態則を壊すため)
+  els.btnFlowcalStart.addEventListener("click", async () => {
+    els.btnFlowcalStart.disabled = true;
+    const resp = await apiPost("/api/flowcal", { action: "start_record" });
+    if (resp) {
+      appendConsole("ui", resp.ok
+        ? "フロー較正の記録を開始しました(20〜30秒ゆらしてください)"
+        : `フロー較正 記録開始失敗: ${resp.message || "不明なエラー"}`);
+      setFlowcalStatus(resp);
+    }
+    renderFlowcal();
+    if (!flowcalStatus) els.btnFlowcalStart.disabled = false;
+  });
+  els.btnFlowcalStop.addEventListener("click", async () => {
+    els.btnFlowcalStop.disabled = true;
+    const resp = await apiPost("/api/flowcal", { action: "stop_and_fit" });
+    if (resp) {
+      appendConsole("ui", resp.ok
+        ? "フロー較正フィット: 合格(適用できます)"
+        : `フロー較正フィット: ${resp.message || "不明なエラー"}`);
+      setFlowcalStatus(resp);
+    }
+    renderFlowcal();
+    if (!flowcalStatus) els.btnFlowcalStop.disabled = false;
+  });
+  els.btnFlowcalApply.addEventListener("click", async () => {
+    els.btnFlowcalApply.disabled = true;
+    let resp = await apiPost("/api/flowcal", { action: "apply" });
+    if (resp && !resp.ok && resp.quality_warning
+        && Array.isArray(resp.warnings)) {
+      const detail = resp.warnings.slice(0, 5).join("\n");
+      if (window.confirm(`フィットが受入基準を満たしていません:\n${detail}\n\n強制適用しますか?(推奨: 収集をやり直す)`)) {
+        resp = await apiPost("/api/flowcal", { action: "apply", force: true });
+      }
+    }
+    if (resp) {
+      appendConsole("ui", resp.ok
+        ? "flowcal を適用しました(CAL_GET 読み戻し照合OK)"
+        : `flowcal 適用失敗: ${resp.message || "不明なエラー"}`);
+      setFlowcalStatus(resp);
+    }
+    renderFlowcal();
+    if (!flowcalStatus) els.btnFlowcalApply.disabled = false;
+  });
+  els.btnFlowcalClear.addEventListener("click", async () => {
+    els.btnFlowcalClear.disabled = true;
+    const resp = await apiPost("/api/flowcal", { action: "clear" });
+    if (resp) {
+      appendConsole("ui", resp.ok
+        ? "フロー較正の記録・フィット結果をクリアしました(機体 NVS は不変)"
+        : `フロー較正 クリア失敗: ${resp.message || "不明なエラー"}`);
+      setFlowcalStatus(resp);
+    }
+    els.btnFlowcalClear.disabled = false;
+    renderFlowcal();
+  });
 
   // SPACE = どこからでも緊急STOP(Experiment 中はモーター停止も送出)
   // 例外: テキスト入力(プロファイル名・メモ等)へのフォーカス中のみ通常入力を

@@ -13,7 +13,7 @@ pc_server/server.py の TelemetryHub(モーター部)/ SweepRunner / SequenceRun
 v2 追加: ExpRecorder(実験計測ログ、EKF/FF 性能評価)。
 - 行 = TLM_EXP 受信ごと(≈25Hz)+最新 TLM_STATE のヨー推定/FF 診断列。
 - 出力: pc_server/data/exp_logs/explog_<ts>.csv + explog_<ts>_meta.json
-  (`stampfly_explog_meta` v1)。
+  (`stampfly_explog_meta` v2。v2 でフロー/ToF 列を末尾追加)。
 - 計測中はスイープ/シーケンス開始と部分マスクの CMD_MOTOR_RUN を拒否する
   (サーバ側が正。相互チェックは start_gate で原子化)。
 
@@ -82,8 +82,10 @@ EXP_CLIENT_QUEUE_DEPTH = 200
 CAL3D_MAX_SAMPLES = 6000
 
 # ----------------------------------------------------------------------
-# 実験計測ログ(ExpRecorder)の CSV 列(stampfly_explog_meta v1 と対の契約。
-# 解析スクリプトの前提になるため順序変更禁止)
+# 実験計測ログ(ExpRecorder)の CSV 列(stampfly_explog_meta v2 と対の契約。
+# 解析スクリプトの前提になるため順序変更禁止。追加は末尾のみ —
+# v2 でフロー/ToF 列(flow_* / alt_tof_m。TLM_STATE スナップショット由来)を
+# 末尾追加した。旧ログ(v1)は該当列なしとして data_analysis 側が自動スキップ)
 # ----------------------------------------------------------------------
 EXPLOG_FIELDS = [
     "t_s", "exp_elapsed_ms", "duty_cmd", "motors_mask", "motors",
@@ -95,7 +97,13 @@ EXPLOG_FIELDS = [
     "yaw_est_deg", "yaw_gyro_int_deg", "yaw_ref_deg",
     "db_hat_x_ut", "db_hat_y_ut", "bm_x_ut", "bm_y_ut",
     "nis", "ffg", "ff_status", "tlm_state_age_ms",
+    # v2 追加(オプティカルフロー/ToF。契約 §1.1 の TLM_STATE 末尾拡張)
+    "flow_vx_mps", "flow_vy_mps", "flow_squal", "flow_status", "flow_dt_ms",
+    "alt_tof_m",
 ]
+
+# stampfly_explog_meta のスキーマ版数(2: フロー/ToF 列の末尾追加)
+EXPLOG_META_VERSION = 2
 
 MS_PER_S = 1000.0   # 単位変換(tlm_state_age_ms 列)
 
@@ -720,7 +728,7 @@ class ExpRecorder:
         geomag = load_geomagnetic_config()
         meta = {
             "schema": "stampfly_explog_meta",
-            "version": 1,
+            "version": EXPLOG_META_VERSION,
             "started_at": _iso_localtime(started_at),
             "started_at_epoch": started_at,
             "ended_at": _iso_localtime(ended_at),
@@ -803,6 +811,13 @@ class ExpRecorder:
                 "ffg": state.ffg,
                 "ff_status": state.ff_status,
                 "tlm_state_age_ms": age_s * MS_PER_S,
+                # v2: オプティカルフロー/ToF(TLM_STATE 末尾拡張。契約 §1.1)
+                "flow_vx_mps": state.flow_vx_mps,
+                "flow_vy_mps": state.flow_vy_mps,
+                "flow_squal": state.flow_squal,
+                "flow_status": state.flow_status,
+                "flow_dt_ms": state.flow_dt_ms,
+                "alt_tof_m": state.altitude_tof,
             })
         return row
 

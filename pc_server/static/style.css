@@ -29,6 +29,14 @@
   --multi-c2: #f59e0b;
   --multi-c3: #f87171;
 
+  /* Experiment リアルタイムモニタ配色(app.js が参照) */
+  --rt-madgwick: #ec4899;
+  --rt-ekf1: #38bdf8;
+  --rt-ekf2: #a78bfa;
+  --rt-mocap: #34d399;
+  --rt-vx: #38bdf8;
+  --rt-vy: #fbbf24;
+
   /* 飛行状態バッジ配色 */
   --st-init: #6b7280;
   --st-calib: #8b5cf6;
@@ -840,6 +848,85 @@ input[type="range"]:disabled::-moz-range-thumb { background: var(--off); }
   color: var(--text-dim);
   word-break: break-all;
 }
+
+/* リアルタイムモニタ(ヨー/フロー速度/2D位置。canvas 自前描画) */
+.rtmon-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.rtmon-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rtmon-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-start;
+}
+.rtmon-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rtmon-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.rtmon-chart canvas {
+  display: block;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+/* フロー較正(純回転フィット)パネルのライブメーター
+   (合格ライン = .fc-meter-line。位置は index.html 側で threshold/scale %) */
+.fc-meters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 4px 16px;
+  margin-top: 6px;
+}
+.fc-meter {
+  display: grid;
+  grid-template-columns: 130px 1fr 84px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.fc-meter-label { color: var(--text-dim); }
+.fc-meter-bar {
+  position: relative;
+  height: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.fc-meter-fill {
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  width: 0;
+  background: var(--warn);
+  transition: width 0.2s linear;
+}
+.fc-meter-fill.pass { background: var(--ok); }
+.fc-meter-line {
+  position: absolute;
+  top: -1px; bottom: -1px;
+  width: 2px;
+  background: var(--text-dim);
+  opacity: 0.8;
+}
+.fc-meter-val { text-align: right; }
+.fc-result-head { margin: 4px 0; }
 
 .exp-grid {
   display: grid;

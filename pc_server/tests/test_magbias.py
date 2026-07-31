@@ -160,12 +160,26 @@ class TestMagbiasApply:
 
 class TestFlowPassthrough:
     def test_flowcal_set_and_verify(self, magbias_session):
+        """2026-07-31 改訂: 2×2 行列(対角優先引数順 m00, m11, m01, m10)。"""
         session, transport, clock, responder, mgr = magbias_session
-        result = mgr.flowcal_set(455.0, 447.5)
+        result = mgr.flowcal_set(455.0, 447.5, 36.25, -33.5)
         assert result["ok"], result
         assert result["verified"] is True
         assert responder.cal_data.valid_flags & proto.TlmCalData.VALID_FLOWCAL
-        assert responder.cal_data.flowcal == pytest.approx((455.0, 447.5))
+        assert responder.cal_data.flowcal_m00 == pytest.approx(455.0)
+        assert responder.cal_data.flowcal_m11 == pytest.approx(447.5)
+        assert responder.cal_data.flowcal_m01 == pytest.approx(36.25)
+        assert responder.cal_data.flowcal_m10 == pytest.approx(-33.5)
+
+    def test_flowcal_set_diag_two_args(self, magbias_session):
+        """旧 API 互換の 2 引数呼び出しは diag(kx,ky) の適用になること。"""
+        session, transport, clock, responder, mgr = magbias_session
+        result = mgr.flowcal_set(455.0, 447.5)
+        assert result["ok"], result
+        assert responder.cal_data.flowcal_m00 == pytest.approx(455.0)
+        assert responder.cal_data.flowcal_m11 == pytest.approx(447.5)
+        assert responder.cal_data.flowcal_m01 == pytest.approx(0.0)
+        assert responder.cal_data.flowcal_m10 == pytest.approx(0.0)
 
     def test_flowcal_clear(self, magbias_session):
         session, transport, clock, responder, mgr = magbias_session
@@ -179,6 +193,8 @@ class TestFlowPassthrough:
         session, transport, clock, responder, mgr = magbias_session
         assert mgr.flowcal_set("abc", 450.0)["ok"] is False
         assert mgr.flowcal_set(-1.0, 450.0)["ok"] is False
+        # det(K) ≤ 0(K⁻¹ 不安定)は拒否
+        assert mgr.flowcal_set(450.0, 450.0, 500.0, 500.0)["ok"] is False
 
     def test_flow_probe_acked(self, magbias_session):
         session, transport, clock, responder, mgr = magbias_session

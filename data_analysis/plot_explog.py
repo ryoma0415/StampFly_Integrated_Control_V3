@@ -3,7 +3,7 @@
 
 pc_server の Experiment モードが出力する
 pc_server/data/exp_logs/explog_<YYYYMMDD_HHMMSS>.csv（≈25Hz）を読み、
-ヨー推定3系統の比較・FF補正の説明力・EKF健全性などを PNG 6枚 + summary.txt に
+ヨー推定3系統の比較・FF補正の説明力・EKF健全性などを PNG 6〜7枚 + summary.txt に
 まとめる。必要な列が無い / 全欠損の図は自動でスキップする。
 
 出力図:
@@ -13,6 +13,8 @@ pc_server/data/exp_logs/explog_<YYYYMMDD_HHMMSS>.csv（≈25Hz）を読み、
     04_mag_ff.png           校正済み磁場変化 Δb_cal と FF推定外乱 db_hat の重畳
     05_ekf_diagnostics.png  NIS（閾値 2.0 / 5.99 / 13.8）+ ffg 8ゲートのタイムライン
     06_ff_status.png        ff_status（ff_mode + フラグビット）のタイムライン
+    07_flow.png             オプティカルフロー: 速度 / SQUAL・dt / ToF高度 /
+                            flow_status ビット（v2 ログのみ。列が無ければスキップ）
 
 アニメーション（7枠レイアウト・スマホ動画同期）:
     メニュー [2]/[3] または --animation で、時系列6枠をスクロール窓表示
@@ -123,6 +125,17 @@ FF_STATUS_FLAGS = [  # (bit, ラベル, 色)
 NIS_EXPECT = 2.0
 NIS_SOFT = 5.99
 NIS_REJECT = 13.8
+
+# flow_status ビット定義（protocol TlmState.FLOW_STATUS_* と一致。契約 §1.1）
+FLOW_STATUS_BITS = [  # (bit, ラベル, 色)
+    (0, "SENSOR_OK", "#16a34a"),
+    (1, "BURST_OK", "#0284c7"),
+    (2, "VEL_VALID", "#7c3aed"),
+    (3, "RANGE_VALID", "#d97706"),
+    (4, "SQUAL_OK", "#db2777"),
+    (5, "INIT_RETRY", "#ef4444"),
+]
+FLOW_VEL_VALID_BIT = 2
 
 
 # ---------------------------------------------------------------- load --------
@@ -597,6 +610,114 @@ def fig06_ff_status(data: dict, t: np.ndarray, on: np.ndarray,
     ax2.grid(alpha=0.3, axis="x")
     ax2.set_xlabel("時間 [s]")
     save_fig(fig, out, "06_ff_status.png")
+    return True
+
+
+def fig07_flow(data: dict, t: np.ndarray, on: np.ndarray,
+               out: Path, tsuffix: str) -> bool:
+    """オプティカルフロー4段: 速度 / SQUAL・dt / ToF高度 / flow_status ビット。
+
+    v2 ログ（flow_*/alt_tof_m 列あり）でのみ描く。v1 ログは列が無いため
+    従来どおり自動スキップ（既存6枚の出力は不変）。
+    """
+    has_vel = usable(data, "flow_vx_mps") or usable(data, "flow_vy_mps")
+    has_squal = usable(data, "flow_squal") or usable(data, "flow_dt_ms")
+    has_alt = usable(data, "alt_tof_m")
+    has_status = usable(data, "flow_status")
+    if not (has_vel or has_squal or has_alt or has_status):
+        print("  スキップ: 07_flow（flow_*/alt_tof_m 列が無い/全欠損 — v1 ログ）")
+        return False
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+        4, 1, figsize=(13, 11), sharex=True,
+        gridspec_kw={"height_ratios": [2, 1.4, 1.2, 1.2]})
+
+    # vel_valid=0 区間（フロー速度が信頼できない区間）の薄灰帯を全段に引く
+    st_col = col(data, "flow_status")
+    invalid = None
+    if np.isfinite(st_col).any():
+        st = np.nan_to_num(st_col).astype(int)
+        invalid = ((st >> FLOW_VEL_VALID_BIT) & 1) == 0
+
+    def _invalid_spans(ax) -> None:
+        if invalid is None or not invalid.any():
+            return
+        edges = np.diff(np.concatenate([[0], invalid.astype(int), [0]]))
+        starts = np.where(edges == 1)[0]
+        ends = np.where(edges == -1)[0] - 1
+        label_done = False
+        for s, e in zip(starts, ends):
+            if s >= len(t):
+                continue
+            e = min(e, len(t) - 1)
+            ax.axvspan(t[s], t[e], color="#9ca3af", alpha=0.15,
+                       label=None if label_done else "vel_valid=0")
+            label_done = True
+
+    # ① フロー速度（機体系）
+    _invalid_spans(ax1)
+    _motor_spans(ax1, t, on)
+    if usable(data, "flow_vx_mps"):
+        ax1.plot(t, col(data, "flow_vx_mps"), "-", lw=1.2, color="#0284c7",
+                 label="flow_vx（機体x）")
+    if usable(data, "flow_vy_mps"):
+        ax1.plot(t, col(data, "flow_vy_mps"), "-", lw=1.2, color="#d97706",
+                 label="flow_vy（機体y）")
+    ax1.axhline(0, ls=":", lw=0.8, color="#6b7280")
+    ax1.set_ylabel("速度 [m/s]")
+    ax1.grid(alpha=0.3)
+    ax1.legend(loc="best", fontsize=8)
+    ax1.set_title("⑦ オプティカルフロー: 速度 / SQUAL・dt / ToF高度 / status"
+                  + tsuffix, fontsize=12)
+
+    # ② SQUAL（左軸）+ 実測 dt（右軸）
+    _invalid_spans(ax2)
+    if usable(data, "flow_squal"):
+        ax2.plot(t, col(data, "flow_squal"), "-", lw=1.0, color="#db2777",
+                 label="SQUAL")
+        ax2.set_ylabel("SQUAL", color="#db2777")
+        ax2.tick_params(axis="y", labelcolor="#db2777")
+    ax2.grid(alpha=0.3)
+    if usable(data, "flow_dt_ms"):
+        ax2t = ax2.twinx()
+        ax2t.plot(t, col(data, "flow_dt_ms"), "-", lw=0.9, color="#475569",
+                  alpha=0.8, label="flow_dt [ms]")
+        ax2t.set_ylabel("dt [ms]", color="#475569")
+        ax2t.tick_params(axis="y", labelcolor="#475569")
+        h1, l1 = ax2.get_legend_handles_labels()
+        h2, l2 = ax2t.get_legend_handles_labels()
+        ax2.legend(h1 + h2, l1 + l2, loc="best", fontsize=8)
+    else:
+        ax2.legend(loc="best", fontsize=8)
+
+    # ③ ToF 高度（フロー速度スケーリングの分母）
+    _invalid_spans(ax3)
+    if has_alt:
+        ax3.plot(t, col(data, "alt_tof_m"), "-", lw=1.2, color="#16a34a",
+                 label="alt_tof [m]")
+        ax3.legend(loc="best", fontsize=8)
+    else:
+        ax3.text(0.5, 0.5, "alt_tof_m 列なし/全欠損", ha="center", va="center",
+                 transform=ax3.transAxes, color="#6b7280")
+    ax3.set_ylabel("ToF高度 [m]")
+    ax3.grid(alpha=0.3)
+
+    # ④ flow_status ビットのタイムライン（帯 = ビットが立っている区間）
+    if has_status:
+        st = np.nan_to_num(st_col).astype(int)
+        for i, (bit, name, color) in enumerate(FLOW_STATUS_BITS):
+            active = ((st >> bit) & 1).astype(bool)
+            ax4.fill_between(t, i + 0.1, i + 0.9, where=active, color=color,
+                             step="mid")
+        ax4.set_yticks([i + 0.5 for i in range(len(FLOW_STATUS_BITS))])
+        ax4.set_yticklabels([f"bit{b}: {n}" for b, n, _ in FLOW_STATUS_BITS],
+                            fontsize=8)
+        ax4.set_ylim(0, len(FLOW_STATUS_BITS))
+        ax4.grid(alpha=0.3, axis="x")
+    else:
+        ax4.text(0.5, 0.5, "flow_status 列なし/全欠損", ha="center", va="center",
+                 transform=ax4.transAxes, color="#6b7280")
+    ax4.set_xlabel("時間 [s]")
+    save_fig(fig, out, "07_flow.png")
     return True
 
 
@@ -1349,7 +1470,7 @@ def choose_mode() -> str | None:
     従来の「引数なし実行=静止画」挙動を保つ。
     """
     print("\n出力の種類を選んでください:\n")
-    print("  [1] 静止画グラフ一式（従来: PNG 6枚 + summary.txt）")
+    print("  [1] 静止画グラフ一式（従来: PNG 6〜7枚 + summary.txt）")
     print("  [2] アニメーション（スマホ動画同期, MP4）")
     print("  [3] アニメーション（動画なし, MP4）")
     print()
@@ -1453,7 +1574,7 @@ def default_out_dir(path: Path) -> Path:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="StampFly Experiment 計測ログ（explog CSV）のグラフ化"
-                    "（PNG 6枚 + summary.txt / アニメ MP4）")
+                    "（PNG 6〜7枚 + summary.txt / アニメ MP4）")
     ap.add_argument("explog", nargs="?",
                     help="explog CSV パス（省略時は exp_logs の一覧から対話選択）")
     ap.add_argument("-o", "--out",
@@ -1554,6 +1675,7 @@ def main() -> None:
     n_figs += fig04_mag_ff(data, t, on, out, tsuffix)
     n_figs += fig05_ekf_diagnostics(data, t, on, out, tsuffix)
     n_figs += fig06_ff_status(data, t, on, out, tsuffix)
+    n_figs += fig07_flow(data, t, on, out, tsuffix)
     write_summary(data, t, on, path, meta, out)
 
     print(f"{n_figs}枚の図 + summary.txt を {out} に出力しました。")

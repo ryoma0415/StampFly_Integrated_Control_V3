@@ -5,7 +5,7 @@
 - REST: /api/ports, /api/airframes, /api/config
 - v2 REST(Experiment タブ): /api/sweep, /api/sequence, /api/cal3d,
   /api/accel6, /api/quickcal, /api/geomag, /api/calprofile, /api/ffprofile,
-  /api/magbias, /api/flow, /api/yawref
+  /api/magbias, /api/flowcal, /api/flow, /api/yawref
   (GET=状態、POST {"action": ...}=操作。core 層の戻り値 dict をそのまま返す)
 - WebSocket /ws: UI コマンド受付 + 20Hz 状態配信 + 即時 event/log 配信
   (v2 コマンド: set_mode "experiment" / experiment_activate / set_yaw_control /
@@ -413,6 +413,34 @@ async def api_magbias(body: dict) -> dict:
                                        body.get("name"))
     if action == "status":
         return await asyncio.to_thread(session.magbias.status)
+    return _UNKNOWN_ACTION
+
+
+@app.get("/api/flowcal")
+async def api_flowcal_status() -> dict:
+    return await asyncio.to_thread(session.flowcal.status)
+
+
+@app.post("/api/flowcal")
+async def api_flowcal(body: dict) -> dict:
+    """フロー較正(純回転 2×2 フィット。FLIGHT_ANALYSIS_20260731.md §5)。
+
+    start_record はモーター停止・非飛行時のみ受理(core/flowcal.py の
+    ゲート)。apply は合格フィットのみ(不合格は force で強制)。
+    clear は PC 側の記録/フィット破棄(機体 NVS のクリアは /api/flow)。
+    """
+    action = body.get("action")
+    if action == "start_record":
+        return await asyncio.to_thread(session.flowcal.start_record)
+    if action == "stop_and_fit":
+        return await asyncio.to_thread(session.flowcal.stop_and_fit)
+    if action == "apply":
+        return await asyncio.to_thread(session.flowcal.apply,
+                                       bool(body.get("force")))
+    if action == "clear":
+        return await asyncio.to_thread(session.flowcal.clear)
+    if action == "status":
+        return await asyncio.to_thread(session.flowcal.status)
     return _UNKNOWN_ACTION
 
 

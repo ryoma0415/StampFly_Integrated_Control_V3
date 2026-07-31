@@ -21,6 +21,22 @@ namespace {
 FlowState g_flow;
 FlowCalibration g_flow_cal;
 
+// K⁻¹ を計算してキャッシュする(2026-07-31 改訂: 2×2 行列較正)。
+// det≈0(FLOW_SCALE_DET_MIN_COUNTS2 未満)は数値不安定として拒否 —
+// flowcalMatrixValid 通過後は成立しないが、防御として二重に張る。
+bool computeInverse(FlowCalibration& cal) {
+    const float det = cal.m00 * cal.m11 - cal.m01 * cal.m10;
+    if (!isfinite(det) || fabsf(det) < FLOW_SCALE_DET_MIN_COUNTS2) {
+        return false;
+    }
+    const float inv_det = 1.0f / det;
+    cal.inv00 = cal.m11 * inv_det;
+    cal.inv01 = -cal.m01 * inv_det;
+    cal.inv10 = -cal.m10 * inv_det;
+    cal.inv11 = cal.m00 * inv_det;
+    return true;
+}
+
 // 健全率の移動窓 (直近 N 読みの sample_healthy を 1bit ずつ保持する代わりに
 // 単純なリングカウンタで近似: 窓内 valid 数 / 窓長)。
 uint8_t g_health_window[FLOW_HEALTH_WINDOW_READS] = {0};
@@ -119,14 +135,25 @@ bool probeResultPass(const Pmw3901BurstProbeResult& r) {
 
 void flowHubInit() {
     // NVS "flowcal" ロード(ブートロード順: … → magbias → flowcal。契約 §2.5)。
-    // 未設定・破損時は既定 450.0 のまま(loadFlowcal が既定値を返す)。
-    float kx = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
-    float ky = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
+    // 未設定・破損時は既定 diag(450,450) のまま(loadFlowcal が既定値を返す。
+    // v1 スキーマは loadFlowcal 内で diag(kx,ky) へ移行済み)。
+    float m00 = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
+    float m01 = 0.0f;
+    float m10 = 0.0f;
+    float m11 = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
     bool cal_valid = false;
-    loadFlowcal(cal_valid, kx, ky);
+    loadFlowcal(cal_valid, m00, m01, m10, m11);
     g_flow_cal.valid = cal_valid;
-    g_flow_cal.x_scale = kx;
-    g_flow_cal.y_scale = ky;
+    g_flow_cal.m00 = m00;
+    g_flow_cal.m01 = m01;
+    g_flow_cal.m10 = m10;
+    g_flow_cal.m11 = m11;
+    // K⁻¹ をロード時に一度計算してキャッシュ(det≈0 は loadFlowcal の
+    // flowcalMatrixValid 照合で除外済み。防御失敗時は既定へ戻す)。
+    if (!computeInverse(g_flow_cal)) {
+        g_flow_cal = FlowCalibration{};  // 既定 diag(450,450)+既定 K⁻¹
+        USBSerial.println("flowcal inverse failed; using default scale");
+    }
 
     g_flow.sensor_ok = pmw3901Init();
     g_flow.product_id = pmw3901ProductId();
@@ -236,10 +263,15 @@ void flowHubUpdate(
     }
 
     // ---- 較正適用: 機体軸フローレート [rad/s] ----
+    // 【2026-07-31 改訂】rate = K⁻¹·counts_rate(2×2 行列適用。ジャイロ補償
+    // より前)。K⁻¹ はロード/適用時に計算済みのキャッシュ。軸マッピング・
+    // 符号(既定固定)を先に適用してから行列に掛ける。
     const float raw_x = (g_flow_cal.x_src == 0 ? g_flow.fx_raw_cps : g_flow.fy_raw_cps);
     const float raw_y = (g_flow_cal.y_src == 0 ? g_flow.fx_raw_cps : g_flow.fy_raw_cps);
-    g_flow.flow_x_rate = raw_x * g_flow_cal.x_sign / g_flow_cal.x_scale;
-    g_flow.flow_y_rate = raw_y * g_flow_cal.y_sign / g_flow_cal.y_scale;
+    const float cx = raw_x * g_flow_cal.x_sign;   // [counts/s]
+    const float cy = raw_y * g_flow_cal.y_sign;
+    g_flow.flow_x_rate = g_flow_cal.inv00 * cx + g_flow_cal.inv01 * cy;
+    g_flow.flow_y_rate = g_flow_cal.inv10 * cx + g_flow_cal.inv11 * cy;
 
     const bool rate_ok = fabsf(g_flow.flow_x_rate) < FLOW_MAX_RATE_RAD_S &&
                          fabsf(g_flow.flow_y_rate) < FLOW_MAX_RATE_RAD_S;
@@ -287,15 +319,25 @@ void flowHubUpdate(
     healthWindowPush(g_flow.sample_healthy);
 }
 
-void flowHubApplyCalibration(float kx, float ky) {
-    g_flow_cal.valid = true;
-    g_flow_cal.x_scale = kx;
-    g_flow_cal.y_scale = ky;
-    saveFlowcal(true, kx, ky);
+bool flowHubApplyCalibration(float m00, float m01, float m10, float m11) {
+    // K⁻¹ を先にテンポラリで計算し、成立したときだけ適用する
+    // (det≈0 は flight_control の flowcalMatrixValid で拒否済み — 防御)。
+    FlowCalibration next = g_flow_cal;
+    next.valid = true;
+    next.m00 = m00;
+    next.m01 = m01;
+    next.m10 = m10;
+    next.m11 = m11;
+    if (!computeInverse(next)) {
+        return false;
+    }
+    g_flow_cal = next;
+    saveFlowcal(true, m00, m01, m10, m11);
+    return true;
 }
 
 void flowHubClearCalibration() {
-    g_flow_cal = FlowCalibration{};  // 既定 450.0 へ戻す
+    g_flow_cal = FlowCalibration{};  // 既定 diag(450,450)+既定 K⁻¹ へ戻す
     clearFlowcal();
 }
 

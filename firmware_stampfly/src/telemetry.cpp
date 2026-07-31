@@ -339,10 +339,13 @@ void telemetry_send_cal_data(void) {
     m.magbias[0] = g_yaw_est.magbias.x;
     m.magbias[1] = g_yaw_est.magbias.y;
     m.magbias[2] = g_yaw_est.magbias.z;
-    // flowcal kx/ky [counts/rad]: 適用中の実スケールを送る(未較正時は既定
-    // 450.0 が載り、bit7=0 で「既定値のまま」と読み分けられる。契約 §2.5)
-    m.flowcal[0] = fcal.x_scale;
-    m.flowcal[1] = fcal.y_scale;
+    // flowcal K 行列 [counts/rad](2026-07-31 改訂: 2×2 化): 適用中の実行列を
+    // 送る(未較正時は既定 diag(450,450) が載り、bit7=0 で「既定値のまま」と
+    // 読み分けられる。契約 §2.5)。ワイヤ順 m00@124, m11@128, m01@132, m10@136。
+    m.flowcal_m00 = fcal.m00;
+    m.flowcal_m11 = fcal.m11;
+    m.flowcal_m01 = fcal.m01;
+    m.flowcal_m10 = fcal.m10;
 
     uint8_t payload[stampfly::TlmCalData::PAYLOAD_SIZE];
     if (!stampfly::serialize(m, payload, sizeof(payload))) return;

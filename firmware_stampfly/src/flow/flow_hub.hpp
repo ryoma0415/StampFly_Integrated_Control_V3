@@ -19,7 +19,9 @@
 //    (プローブ合格で burst_ok ラッチ更新)のみ。
 //  - テレメトリ窓アキュムレータ(移植元 acc_*)は V2 のワイヤに対応枠が
 //    ないため非移植。
-//  - 較正はスケール kx/ky のみワイヤ設定可(CMD_FLOWCAL_SET。契約 §1.4/§2.5)。
+//  - 較正は 2×2 行列 K のみワイヤ設定可(CMD_FLOWCAL_SET。契約 §1.4/§2.5。
+//    【2026-07-31 改訂】kx/ky 2 定数 → K 行列化: スケール誤差に加えて取付
+//    回転 φ0 を表現する。FLIGHT_ANALYSIS_20260731.md §5)。
 //    軸マッピング・符号は既定値(x=dx/+, y=dy/+)に固定。
 //
 // 速度換算 (FRD 系。Bitcraze mm_flow.c の FLU 測定モデルを座標変換して逆算。
@@ -32,15 +34,28 @@
 //   d = ToF 生スラント距離 [m](チルト補正 cosφcosθ は掛けない —
 //   フロー式の分母 z/R22 ≈ d で相殺するため)。
 
-// counts→rad スケールと軸マッピングの較正値 (スケールのみ NVS "flowcal" に永続化)。
+// counts→rad 較正行列と軸マッピングの較正値 (行列のみ NVS "flowcal" に永続化)。
+// K [counts/rad] は「機体系レート [rad/s] → センサーカウントレート [counts/s]」
+// の 2×2 写像(行優先)。純スケールなら K=diag(kx,ky)、取付回転 φ0 込みなら
+// K=diag(kx,ky)·R(φ0)。適用は rate = K⁻¹·counts_rate(ジャイロ補償より前)。
+// K⁻¹ はロード/適用時に一度計算してキャッシュする(det≈0 は
+// flowcalMatrixValid が事前に拒否)。
 struct FlowCalibration {
-    bool valid = false;    // NVS 較正済みか(false でも既定スケールで換算は行う)
+    bool valid = false;    // NVS 較正済みか(false でも既定行列で換算は行う)
     uint8_t x_src = 0;     // 0=dx, 1=dy(V2: 既定固定。ワイヤ設定なし)
     uint8_t y_src = 1;
     float x_sign = 1.0f;   // ±1(V2: 既定固定)
     float y_sign = 1.0f;
-    float x_scale = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;  // [counts/rad] > 0
-    float y_scale = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
+    // K 行列 [counts/rad](既定 diag(450,450))
+    float m00 = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
+    float m01 = 0.0f;
+    float m10 = 0.0f;
+    float m11 = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
+    // K⁻¹ キャッシュ [rad/counts](flowHubInit / flowHubApplyCalibration が更新)
+    float inv00 = 1.0f / FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
+    float inv01 = 0.0f;
+    float inv10 = 0.0f;
+    float inv11 = 1.0f / FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;
 };
 
 // 健全性ビット(内部集計用。TLM の flow_status とは別 — そちらは
@@ -114,9 +129,11 @@ void flowHubUpdate(
     float yaw_rad
 );
 
-// 較正スケールの適用+NVS 保存 / クリア(CMD_FLOWCAL_SET。契約 §1.4)。
-// 値は妥当性チェック済みであること(flight_control 層でチェック)。
-void flowHubApplyCalibration(float kx, float ky);
+// 較正行列 K の適用+NVS 保存 / クリア(CMD_FLOWCAL_SET。契約 §1.4)。
+// 値は flowcalMatrixValid で妥当性チェック済みであること(flight_control 層で
+// チェック)。K⁻¹ 計算不成立(det≈0。検査通過後は起こり得ない防御)なら
+// 何も変えずに false を返す。
+bool flowHubApplyCalibration(float m00, float m01, float m10, float m11);
 void flowHubClearCalibration();
 
 // CMD_FLOW_PROBE の実処理(契約 §1.4): burst プローブを実行し、結果要約を

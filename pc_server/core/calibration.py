@@ -590,6 +590,22 @@ class CalibrationManager:
             else:
                 self._cal_data_by_node[node_id] = (cal, time.monotonic())
 
+    def peek_cal_data(self) -> tuple[Optional[proto.TlmCalData],
+                                     Optional[float]]:
+        """直近受信の TLM_CAL_DATA を要求なしで覗く(非ブロッキング)。
+
+        戻り値は (cal, 受信からの経過秒)。未受信は (None, None)。
+        UI の状態ポーリング(flowcal.status など)が CAL_GET を発行せずに
+        「機体の現在値」を表示するために使う — 最新値が必要な操作は
+        従来どおり fetch_cal_data(要求+待ち)を使うこと。
+        """
+        with self._lock:
+            cal = self._cal_data
+            at = self._cal_data_at
+        if cal is None:
+            return None, None
+        return cal, time.monotonic() - at
+
     def fetch_cal_data(self, node_id: Optional[int] = None
                        ) -> Optional[proto.TlmCalData]:
         """CMD_CAL_GET → TLM_CAL_DATA を待つ(タイムアウトで None)。

@@ -386,7 +386,8 @@ class TestSweepRunner:
 class TestExpRecorder:
     """実験計測ログ(EKF/FF 性能ログ): CSV/meta 出力・計測中ガード・自動停止。"""
 
-    # 仕様 T1-2 の列順(実装定数のリグレッション検知のため文字通りに固定)
+    # 仕様 T1-2 の列順(実装定数のリグレッション検知のため文字通りに固定。
+    # v2 でフロー/ToF 列を末尾追加 — stampfly_explog_meta v2)
     EXPECTED_FIELDS = [
         "t_s", "exp_elapsed_ms", "duty_cmd", "motors_mask", "motors",
         "cv", "mag_fresh",
@@ -398,6 +399,8 @@ class TestExpRecorder:
         "yaw_est_deg", "yaw_gyro_int_deg", "yaw_ref_deg",
         "db_hat_x_ut", "db_hat_y_ut", "bm_x_ut", "bm_y_ut",
         "nis", "ffg", "ff_status", "tlm_state_age_ms",
+        "flow_vx_mps", "flow_vy_mps", "flow_squal", "flow_status",
+        "flow_dt_ms", "alt_tof_m",
     ]
 
     @staticmethod
@@ -423,7 +426,10 @@ class TestExpRecorder:
             state=proto.FlightState.WAIT, yaw_est_rad=0.5,
             yaw_gyro_int_rad=0.25, yaw_ref_rad=-0.1,
             db_hat_x_ut=1.5, db_hat_y_ut=-2.5, bm_x_ut=3.0, bm_y_ut=-4.0,
-            nis=1.25, ffg=3, ff_status=0x15)
+            nis=1.25, ffg=3, ff_status=0x15,
+            altitude_tof=0.42,
+            flow_vx_mps=0.12, flow_vy_mps=-0.34, flow_squal=88,
+            flow_status=0x1F, flow_dt_ms=11)
         transport.push(proto.MsgType.TLM_STATE, tlm_state.to_payload())
         assert wait_until(lambda: session._tlm_state_snapshot()[0] is not None)
 
@@ -470,11 +476,17 @@ class TestExpRecorder:
         assert float(row["nis"]) == pytest.approx(1.25)
         assert row["ffg"] == "3" and row["ff_status"] == "21"
         assert row["tlm_state_age_ms"] != ""
+        # v2: フロー/ToF 列(TLM_STATE スナップショット由来)
+        assert float(row["flow_vx_mps"]) == pytest.approx(0.12)
+        assert float(row["flow_vy_mps"]) == pytest.approx(-0.34)
+        assert row["flow_squal"] == "88" and row["flow_status"] == "31"
+        assert row["flow_dt_ms"] == "11"
+        assert float(row["alt_tof_m"]) == pytest.approx(0.42)
 
         meta = json.loads(
             (tmp_path / result["meta"]).read_text(encoding="utf-8"))
         assert meta["schema"] == "stampfly_explog_meta"
-        assert meta["version"] == 1
+        assert meta["version"] == experiment.EXPLOG_META_VERSION
         assert meta["aborted"] is False
         assert meta["sample_count"] == len(rows)
         assert meta["started_at_epoch"] <= meta["ended_at_epoch"]
@@ -496,7 +508,9 @@ class TestExpRecorder:
         with (tmp_path / result["file"]).open() as fp:
             rows = list(csv_mod.DictReader(fp))
         for key in ("yaw_est_deg", "yaw_ref_deg", "nis", "ffg",
-                    "ff_status", "tlm_state_age_ms"):
+                    "ff_status", "tlm_state_age_ms",
+                    "flow_vx_mps", "flow_vy_mps", "flow_squal",
+                    "flow_status", "flow_dt_ms", "alt_tof_m"):
             assert rows[0][key] == "", key
         assert rows[0]["current_a"] != ""
 

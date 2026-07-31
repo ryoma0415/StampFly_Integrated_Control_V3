@@ -35,6 +35,18 @@ bit4(基準ヨー低信頼)を新設し、mocap_yaw の意味を「外部ヨー�
 est_mode 受理範囲を 0..2(2=EKF2)へ拡大。長さ検査は厳格のままのため、
 **旧 135B / 112B フレームは受理しない**(新旧ファーム混在は不可)。
 
+flowcal 2×2 行列化(**改訂 2026-07-31**、追加/形式変更のみ、PROTOCOL_VERSION は
+**0x02 のまま**。根拠: `FLIGHT_ANALYSIS_20260731.md` §5 — 初飛行実測で
+スケール誤差 x1.11/y1.26 に加え取付回転 φ0=-9.4° を検出し、kx/ky の 2 定数では
+回転を表現できないため):
+CMD_FLOWCAL_SET を **9B → 17B**(`u8 mode + f32 m00,m01,m10,m11`)、
+TLM_CAL_DATA を **132B → 140B**(flowcal m01@132 / m10@136 を末尾追加。
+既存オフセット 124/128 の kx/ky は m00/m11 として対角の意味を維持)。
+K [counts/rad] は「機体系レート [rad/s] → センサーカウントレート [counts/s]」の
+2×2 写像(純スケールなら K=diag(kx,ky)、取付回転込みなら K=diag(kx,ky)·R(φ0))。
+ファーム適用は rate = K⁻¹·counts_rate(ジャイロ補償より前)。長さ検査は厳格の
+ままのため、**旧 9B / 132B フレームは受理しない**。
+
 ## 設計原則(旧システムの教訓)
 
 旧プロトコルは「ヘッダバイト走査+固定長+8bit加算和」で、ペイロード内の 0x41 を
@@ -127,7 +139,7 @@ CMD_LED_MODE(0x25)、磁気オートチューン/フロー系(0x26–0x28)は
 | 0x23 | CMD_FF_ANCHOR | なし(0B) | アンカー再取得要求(モーター停止中のみ。回転中/窓未充足は status=busy) |
 | 0x25 | CMD_LED_MODE | `u8 mode(0=AUTO,1=RECORDING)` =1B(v2.2) | LED 表示モード切替(**計測中インジケータ**)。mode=1 で **MOTOR_TEST 中のみ LED をマゼンタ(0xff00ff)常灯**にする(スマホ動画のカット点検出用。**同期規約: マゼンタに変わった瞬間 = 計測開始 t_s=0 = 動画カット位置**)。フェイルセーフ: 最後の mode=1 から **3 秒で AUTO へ自動復帰**(PC は計測中約 1 秒間隔で再送=キープアライブ)。**MOTOR_TEST 離脱でも即 AUTO**。受理状態はキャリブ系と同じ(WAIT/COMPLETE/MOTOR_TEST。表示効果は MOTOR_TEST のみ)。マゼンタは INIT/CALIBRATION と同値だが起動直後の状態と MOTOR_TEST は同時に成立しないため計測ウィンドウ内で一意 |
 | 0x26 | CMD_MAGBIAS_SET | `u8 mode(0=clear,1=set), f32 dx, dy, dz(µT)` =**13B** | 学習ハードアイアン残差 Δb [µT, **b_cal 空間**] を NVS `magbias` へ保存+即適用(mode=0 でクリア)。**ff_mode は降格しない**(FF 係数は b_cal 空間のまま有効)。適用時: アンカー無効化+窓リセット+補正系再シード(mag3d 変更時と同パターン、ff_mode 降格だけしない)。mag3d 変更時は旧 b_cal 空間で無効になるため機体側で**連動クリア**(`MAG_AUTOTUNE_DESIGN.md` §1.4, §2.5) |
-| 0x27 | CMD_FLOWCAL_SET | `u8 mode(0=clear,1=set), f32 kx, ky(counts/rad)` =**9B** | フロースケールを NVS `flowcal` へ保存(mode=0 でクリア=既定 450.0) |
+| 0x27 | CMD_FLOWCAL_SET | `u8 mode(0=clear,1=set), f32 m00, m01, m10, m11(counts/rad)` =**17B**(改訂 2026-07-31: 旧 9B `mode, kx, ky` の 2×2 行列化) | フロー較正行列 K を NVS `flowcal`(schema v2)へ保存(mode=0 でクリア=既定 diag(450,450))。K は「機体系レート [rad/s] → センサーカウントレート [counts/s]」の写像(行優先。純スケールなら K=diag(kx,ky)、取付回転込みなら K=diag(kx,ky)·R(φ0))。ファーム適用は rate = K⁻¹·counts_rate(ジャイロ補償より前)。受理条件: 対角 m00/m11 ∈ [100, 2000]、\|m01\|,\|m10\| ≤ 2000、det(K) ≥ 100²(det≈0 は invalid_arg) |
 | 0x28 | CMD_FLOW_PROBE | `u8 n_cycles(0=既定200)` =**1B** | PMW3901 burst プローブ実行(**モーター停止時のみ**、回転中は status=busy で拒否)。結果は LOG_TEXT 複数行(agree_ratio 等の要約)+ probe 成功で burst_ok ラッチ更新 |
 
 ### 下り(ドローン → PC)
@@ -138,7 +150,7 @@ CMD_LED_MODE(0x25)、磁気オートチューン/フロー系(0x26–0x28)は
 | 0x31 | TLM_EVENT | `u8 state, u8 prev_state, u8 reason, u8 flags, f32 voltage` =8B | 状態遷移時に即時送信+2Hzで定期再送 |
 | 0x32 | TLM_ACK | `u8 acked_type, u32 acked_seq, u8 status` =6B(v2) | 0x14–0x23, 0x25–0x28 への応答。status: 0=ok, 1=bad_state, 2=invalid_arg, 3=crc_mismatch, 4=busy, 5=incomplete |
 | 0x33 | TLM_EXP | 下表 86B(v2) | 実験テレメトリ。**MOTOR_TEST 状態でのみ 25Hz** 送出(TLM_STATE と 8tick 位相をずらす) |
-| 0x34 | TLM_CAL_DATA | 下表 **132B**(v2+磁気オートチューン拡張) | CMD_CAL_GET への応答(キャリブ一括データ) |
+| 0x34 | TLM_CAL_DATA | 下表 **140B**(v2+磁気オートチューン拡張+2026-07-31 flowcal 2×2 化) | CMD_CAL_GET への応答(キャリブ一括データ) |
 | 0x35 | TLM_CTRL | 下表 **89B** | 制御ループ診断テレメトリ。**25Hz**(400Hzループの16分周、TLM_STATE から 4tick 位相ずらし)。**全飛行状態で常時送出**(MOTOR_TEST 中も含む) |
 
 #### TLM_STATE payload(184B、宣言順に隙間なくパック)
@@ -235,10 +247,14 @@ bit4 squal_ok、bit5 init_retry、bit6-7 予約。
 | 84 | u8 | motors_mask(CMD_MOTOR_RUN の mask と同ビット割り) |
 | 85 | u8 | flags: bit0 current_valid, bit1 mag_fresh, bit2 motors_running |
 
-#### TLM_CAL_DATA payload(132B)
+#### TLM_CAL_DATA payload(140B)
 
 磁気オートチューン/フロー拡張はオフセット 112 以降を末尾追加
 (`MAG_AUTOTUNE_DESIGN.md` §1.5)。
+**改訂 2026-07-31(flowcal 2×2 化)**: 132B → 140B。既存オフセット 124/128 の
+kx/ky は flowcal_m00/flowcal_m11 に改名(K 行列の対角成分として意味維持)、
+flowcal_m01@132・flowcal_m10@136 を末尾追加。ワイヤ順は
+**m00, m11, m01, m10**(オフセット互換維持のため行優先ではない)。
 
 | オフセット | 型 | フィールド |
 |---|---|---|
@@ -256,7 +272,10 @@ bit4 squal_ok、bit5 init_retry、bit6-7 予約。
 | 110 | u8 | ff_mode |
 | 111 | u8 | est_mode |
 | 112 | f32×3 | magbias dx, dy, dz [µT, b_cal 空間] |
-| 124 | f32×2 | flowcal kx, ky [counts/rad] |
+| 124 | f32 | flowcal_m00 [counts/rad](旧 kx。K 行列対角) |
+| 128 | f32 | flowcal_m11 [counts/rad](旧 ky。同) |
+| 132 | f32 | flowcal_m01 [counts/rad](改訂 2026-07-31 追加。K 行列非対角) |
+| 136 | f32 | flowcal_m10 [counts/rad](同) |
 
 #### TLM_CTRL payload(89B、隙間なくパック)
 
@@ -508,6 +527,6 @@ TLM_EVENT / RLY_STATS / LOG_TEXT の寄与は 0.1KB/s 未満で無視できる�
    アサートする)。
 10. 磁気オートチューン/フロー拡張(名前固定): `cmd_pos_err_low_trust`
     (flags bit3+bit4)/ `cmd_magbias_set` / `cmd_magbias_clear` /
-    `cmd_flowcal_set` / `cmd_flow_probe`。`tlm_state_full` は 184B、
-    `tlm_cal_data_full` は 132B(magbias / flowcal のオフセット 112 / 124 も
-    アサートする)。
+    `cmd_flowcal_set`(改訂 2026-07-31: 17B の 2×2 行列、非対角込み)/
+    `cmd_flow_probe`。`tlm_state_full` は 184B、`tlm_cal_data_full` は 140B
+    (magbias / flowcal のオフセット 112 / 124–136 もアサートする)。

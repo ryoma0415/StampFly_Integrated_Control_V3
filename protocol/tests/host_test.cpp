@@ -449,8 +449,10 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
   } else if (kind == "CMD_FLOWCAL_SET") {
     CmdFlowcalSet m;
     m.mode = ju8(f, "mode");
-    m.kx = jf(f, "kx");
-    m.ky = jf(f, "ky");
+    m.m00 = jf(f, "m00");
+    m.m01 = jf(f, "m01");
+    m.m10 = jf(f, "m10");
+    m.m11 = jf(f, "m11");
     ok = serialize(m, buf, sizeof(buf));
     n = CmdFlowcalSet::PAYLOAD_SIZE;
   } else if (kind == "CMD_FLOW_PROBE") {
@@ -508,7 +510,10 @@ std::vector<uint8_t> build_payload(const std::string& kind, const JVal& f) {
     m.ff_mode = ju8(f, "ff_mode");
     m.est_mode = ju8(f, "est_mode");
     jfarr(f, "magbias", m.magbias, 3);
-    jfarr(f, "flowcal", m.flowcal, 2);
+    m.flowcal_m00 = jf(f, "flowcal_m00");
+    m.flowcal_m11 = jf(f, "flowcal_m11");
+    m.flowcal_m01 = jf(f, "flowcal_m01");
+    m.flowcal_m10 = jf(f, "flowcal_m10");
     ok = serialize(m, buf, sizeof(buf));
     n = TlmCalData::PAYLOAD_SIZE;
   } else if (kind == "TLM_CTRL") {

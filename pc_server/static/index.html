@@ -276,6 +276,33 @@
         </div>
       </div>
 
+      <!-- リアルタイムモニタ(ヨー/フロー速度/2D位置。canvas 自前描画・60s窓) -->
+      <div class="exp-section">
+        <div class="rtmon-head">
+          <h3>リアルタイムモニタ <span class="unit-h">60s窓・再描画10Hz上限</span></h3>
+          <button id="btnRtmonToggle" class="btn btn-small">非表示</button>
+        </div>
+        <div id="rtmonBody" class="rtmon-body">
+          <div class="rtmon-row">
+            <div class="rtmon-chart">
+              <div class="rtmon-title">&#x2460; ヨー角 [deg](Madgwick / EKF / EKF2 / MoCap)</div>
+              <canvas id="rtmonYawCanvas" width="600" height="170"></canvas>
+            </div>
+            <div class="rtmon-chart">
+              <div class="rtmon-title">&#x2461; フロー速度 [m/s](機体系。点線=MoCap換算)</div>
+              <canvas id="rtmonVelCanvas" width="600" height="170"></canvas>
+            </div>
+            <div class="rtmon-chart">
+              <div class="rtmon-title">&#x2462; 2D位置 [m](フロー積算デッドレコニング)
+                <button id="btnRtmonReset" class="btn btn-small">積算リセット</button>
+              </div>
+              <canvas id="rtmonXyCanvas" width="260" height="260"></canvas>
+            </div>
+          </div>
+          <div id="rtmonInfo" class="exp-msg mono">--</div>
+        </div>
+      </div>
+
       <!-- スイープ -->
       <div class="exp-section">
         <h3>電流×磁場スイープ <span class="unit-h">ベンチ計測</span></h3>
@@ -458,6 +485,74 @@
           <div class="exp-msg" id="magbiasMsg">v6 飛行ログから学習した Δb を機体 NVS(magbias)へ加算適用します(地上でのみ)</div>
         </div>
 
+      </div>
+
+      <!-- フロー較正(純回転 2×2 フィット。FLIGHT_ANALYSIS_20260731.md §5) -->
+      <div class="exp-section">
+        <h3>フロー較正(純回転フィット) <span class="unit-h">TLM_STATE 25Hz → 2&times;2 K 行列</span></h3>
+        <p class="note">
+          手順: ①モーター停止・プロペラ静止を確認
+          ②テクスチャのある床/机の上 <strong>0.15〜0.5m</strong>(ToF 有効域)で機体を手持ち
+          ③ロール/ピッチを <strong>&plusmn;20〜30&deg;</strong> でゆっくり <strong>20〜30秒</strong>ゆらす
+          (ヨー回転と並進は極力入れない)。<br>
+          軸規約: trans_x = flow_x &minus; q / trans_y = flow_y + p(機体 x=前 / y=右)。
+          K は「機体系レート [rad/s] → カウントレート [counts/s]」の写像で、機上は rate = K&#x207B;&#xB9;&middot;counts を適用します。<br>
+          参考 — 未較正時の実測: スケール約 1.11/1.26 倍過大・取付回転 &minus;9.4&deg;
+          (docs/FLIGHT_ANALYSIS_20260731.md &sect;5)。
+        </p>
+        <div class="preset-row">
+          <button id="btnFlowcalStart" class="btn btn-small btn-primary">&#x25cf; 記録開始</button>
+          <button id="btnFlowcalStop" class="btn btn-small" disabled>&#x25a0; 停止&amp;フィット</button>
+          <button id="btnFlowcalApply" class="btn btn-small btn-primary" disabled>適用(NVS書込)</button>
+          <button id="btnFlowcalClear" class="btn btn-small">クリア</button>
+          <span id="flowcalRecStatus" class="mono motor-status">待機中</span>
+        </div>
+        <div class="fc-meters">
+          <div class="fc-meter">
+            <span class="fc-meter-label">サンプル数(有効)</span>
+            <div class="fc-meter-bar"><div id="fcFillSamples" class="fc-meter-fill"></div><div class="fc-meter-line" style="left:33.3%"></div></div>
+            <span id="fcValSamples" class="fc-meter-val mono">--</span>
+          </div>
+          <div class="fc-meter">
+            <span class="fc-meter-label">有効サンプル率</span>
+            <div class="fc-meter-bar"><div id="fcFillValid" class="fc-meter-fill"></div><div class="fc-meter-line" style="left:80%"></div></div>
+            <span id="fcValValid" class="fc-meter-val mono">--</span>
+          </div>
+          <div class="fc-meter">
+            <span class="fc-meter-label">励振std p(ロール)</span>
+            <div class="fc-meter-bar"><div id="fcFillStdP" class="fc-meter-fill"></div><div class="fc-meter-line" style="left:30%"></div></div>
+            <span id="fcValStdP" class="fc-meter-val mono">--</span>
+          </div>
+          <div class="fc-meter">
+            <span class="fc-meter-label">励振std q(ピッチ)</span>
+            <div class="fc-meter-bar"><div id="fcFillStdQ" class="fc-meter-fill"></div><div class="fc-meter-line" style="left:30%"></div></div>
+            <span id="fcValStdQ" class="fc-meter-val mono">--</span>
+          </div>
+          <div class="fc-meter">
+            <span class="fc-meter-label">SQUAL</span>
+            <div class="fc-meter-bar"><div id="fcFillSqual" class="fc-meter-fill"></div><div class="fc-meter-line" style="left:19.5%"></div></div>
+            <span id="fcValSqual" class="fc-meter-val mono">--</span>
+          </div>
+          <div class="fc-meter">
+            <span class="fc-meter-label">ToF距離</span>
+            <div class="fc-meter-bar"><div id="fcFillTof" class="fc-meter-fill"></div><div class="fc-meter-line" style="left:15%"></div><div class="fc-meter-line" style="left:50%"></div></div>
+            <span id="fcValTof" class="fc-meter-val mono">--</span>
+          </div>
+        </div>
+        <hr class="exp-sep">
+        <div class="fc-result-head">
+          <span id="flowcalBadge" class="badge b-dim">フィット未実施</span>
+        </div>
+        <div class="kv-list mono">
+          <span>r&sup2;(x / y)</span><span id="fcR2">--</span>
+          <span>スケール kx / ky [counts/rad]</span><span id="fcScale">--</span>
+          <span>取付回転 &phi;0 / x/y比</span><span id="fcPhi">--</span>
+          <span>採用サンプル(棄却)</span><span id="fcUsed">--</span>
+          <span>フィット K</span><span id="fcMatrix">--</span>
+          <span>機体の現在 K(CAL_GET)</span><span id="fcDroneMatrix">--</span>
+        </div>
+        <div class="ff-banner" id="flowcalApplied">flowcal: 未適用(既定 diag(450,450))</div>
+        <div class="exp-msg" id="flowcalMsg">--</div>
       </div>
     </div>
 

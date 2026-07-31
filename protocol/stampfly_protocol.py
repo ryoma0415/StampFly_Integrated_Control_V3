@@ -322,13 +322,13 @@ _CMD_FF_COMMIT_FMT = "<I"
 _CMD_FF_MODE_FMT = "<BB"
 _CMD_LED_MODE_FMT = "<B"
 _CMD_MAGBIAS_SET_FMT = "<B3f"
-_CMD_FLOWCAL_SET_FMT = "<Bff"
+_CMD_FLOWCAL_SET_FMT = "<B4f"
 _CMD_FLOW_PROBE_FMT = "<B"
 _TLM_EVENT_FMT = "<BBBBf"
 _TLM_STATE_FMT = "<IIBBB21fH9fBB9fBB2fBBB"
 _TLM_ACK_FMT = "<BIB"
 _TLM_EXP_FMT = "<I20fBB"
-_TLM_CAL_DATA_FMT = "<B26fBIBB5f"
+_TLM_CAL_DATA_FMT = "<B26fBIBB7f"
 _TLM_CTRL_FMT = "<I21fB"
 _RLY_SET_TARGET_FMT = "<6sB"
 _RLY_TARGET_ACK_FMT = "<B6sB"
@@ -355,13 +355,13 @@ assert struct.calcsize(_CMD_FF_COMMIT_FMT) == 4
 assert struct.calcsize(_CMD_FF_MODE_FMT) == 2
 assert struct.calcsize(_CMD_LED_MODE_FMT) == 1
 assert struct.calcsize(_CMD_MAGBIAS_SET_FMT) == 13
-assert struct.calcsize(_CMD_FLOWCAL_SET_FMT) == 9
+assert struct.calcsize(_CMD_FLOWCAL_SET_FMT) == 17
 assert struct.calcsize(_CMD_FLOW_PROBE_FMT) == 1
 assert struct.calcsize(_TLM_EVENT_FMT) == 8
 assert struct.calcsize(_TLM_STATE_FMT) == 184
 assert struct.calcsize(_TLM_ACK_FMT) == 6
 assert struct.calcsize(_TLM_EXP_FMT) == 86
-assert struct.calcsize(_TLM_CAL_DATA_FMT) == 132
+assert struct.calcsize(_TLM_CAL_DATA_FMT) == 140
 assert struct.calcsize(_TLM_CTRL_FMT) == 89
 assert struct.calcsize(_RLY_SET_TARGET_FMT) == 7
 assert struct.calcsize(_RLY_TARGET_ACK_FMT) == 8
@@ -797,23 +797,34 @@ class CmdMagbiasSet:
 
 @dataclass
 class CmdFlowcalSet:
-    """0x27 CMD_FLOWCAL_SET(9B)— フロースケールの適用/クリア。
+    """0x27 CMD_FLOWCAL_SET(17B)— フロー較正行列 K の適用/クリア。
 
-    kx / ky [counts/rad] を NVS `flowcal` へ保存する(mode=0 でクリア=
-    既定 450.0 に戻る)。WAIT / COMPLETE / MOTOR_TEST 状態でのみ受理
-    (TLM_ACK 応答)。MAG_AUTOTUNE_DESIGN.md §1.4。
+    K [counts/rad] は「機体系レート [rad/s] → センサーカウントレート
+    [counts/s]」の 2×2 写像(行優先 m00,m01,m10,m11)。純スケールなら
+    K=diag(kx,ky)、取付回転 φ0 込みなら K=diag(kx,ky)·R(φ0)。ファームは
+    rate = K⁻¹·counts_rate をジャイロ補償より前に適用し、NVS `flowcal`
+    (schema v2)へ保存する(mode=0 でクリア=既定 diag(450,450) に戻る)。
+    WAIT / COMPLETE / MOTOR_TEST 状態でのみ受理(TLM_ACK 応答)。
+    MAG_AUTOTUNE_DESIGN.md §1.4。
+
+    【改訂 2026-07-31】9B(u8 mode + f32 kx,ky)→ 17B の 2×2 行列化
+    (FLIGHT_ANALYSIS_20260731.md §5: 取付回転 φ0 を 2 定数では表現
+    できないため)。
     """
-    mode: int = 0    # 0=clear, 1=set
-    kx: float = 0.0  # counts/rad
-    ky: float = 0.0  # counts/rad
+    mode: int = 0     # 0=clear, 1=set
+    m00: float = 0.0  # K 行列 [counts/rad](行優先)
+    m01: float = 0.0
+    m10: float = 0.0
+    m11: float = 0.0
 
     TYPE = MsgType.CMD_FLOWCAL_SET
-    PAYLOAD_SIZE = 9
+    PAYLOAD_SIZE = 17
     MODE_CLEAR = 0
     MODE_SET = 1
 
     def to_payload(self) -> bytes:
-        return struct.pack(_CMD_FLOWCAL_SET_FMT, self.mode, self.kx, self.ky)
+        return struct.pack(_CMD_FLOWCAL_SET_FMT, self.mode,
+                           self.m00, self.m01, self.m10, self.m11)
 
     @classmethod
     def from_payload(cls, data: bytes) -> "CmdFlowcalSet":
@@ -1080,11 +1091,16 @@ class TlmExp:
 
 @dataclass
 class TlmCalData:
-    """0x34 TLM_CAL_DATA(132B)— CMD_CAL_GET への応答(キャリブ一括データ)。
+    """0x34 TLM_CAL_DATA(140B)— CMD_CAL_GET への応答(キャリブ一括データ)。
 
     磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.5):
-    magbias(Δb [µT])と flowcal(kx, ky [counts/rad])を末尾追加して
-    112B → 132B。valid_flags bit6=magbias 有効、bit7=flowcal 有効。
+    magbias(Δb [µT])と flowcal(K 行列 [counts/rad])を末尾追加して
+    112B → 140B。valid_flags bit6=magbias 有効、bit7=flowcal 有効。
+
+    【改訂 2026-07-31】flowcal 2×2 行列化で 132B → 140B: 既存オフセット
+    124/128 の kx/ky は flowcal_m00/flowcal_m11 に改名(対角成分として意味
+    維持)、flowcal_m01@132・flowcal_m10@136 を末尾追加。ワイヤ順は
+    m00, m11, m01, m10(オフセット互換維持のため行優先ではない)。
     """
     valid_flags: int = 0
     mag3d_offset: tuple = (0.0, 0.0, 0.0)
@@ -1100,10 +1116,15 @@ class TlmCalData:
     ff_mode: int = 0
     est_mode: int = 0
     magbias: tuple = (0.0, 0.0, 0.0)   # Δb dx, dy, dz [µT, b_cal 空間]
-    flowcal: tuple = (0.0, 0.0)        # kx, ky [counts/rad]
+    # flowcal K 行列 [counts/rad](機体系レート→カウントレート)。ワイヤ順
+    # m00@124, m11@128, m01@132, m10@136(オフセット互換維持)。
+    flowcal_m00: float = 0.0
+    flowcal_m11: float = 0.0
+    flowcal_m01: float = 0.0
+    flowcal_m10: float = 0.0
 
     TYPE = MsgType.TLM_CAL_DATA
-    PAYLOAD_SIZE = 132
+    PAYLOAD_SIZE = 140
     VALID_MAG3D = 0x01
     VALID_ACCEL6 = 0x02
     VALID_ATTMOUNT = 0x04
@@ -1116,8 +1137,7 @@ class TlmCalData:
     def to_payload(self) -> bytes:
         if (len(self.mag3d_offset) != 3 or len(self.mag3d_matrix) != 9 or
                 len(self.accel6_offset) != 3 or len(self.accel6_scale) != 3 or
-                len(self.geomag) != 5 or len(self.magbias) != 3 or
-                len(self.flowcal) != 2):
+                len(self.geomag) != 5 or len(self.magbias) != 3):
             raise ValueError("TLM_CAL_DATA: 配列フィールドの要素数が不正")
         return struct.pack(
             _TLM_CAL_DATA_FMT,
@@ -1128,7 +1148,9 @@ class TlmCalData:
             self.yawzero_offset_rad,
             *self.geomag,
             self.ff_nlut, self.ff_crc32, self.ff_mode, self.est_mode,
-            *self.magbias, *self.flowcal)
+            *self.magbias,
+            self.flowcal_m00, self.flowcal_m11,
+            self.flowcal_m01, self.flowcal_m10)
 
     @classmethod
     def from_payload(cls, data: bytes) -> "TlmCalData":
@@ -1149,7 +1171,10 @@ class TlmCalData:
             ff_mode=vals[29],
             est_mode=vals[30],
             magbias=tuple(vals[31:34]),
-            flowcal=tuple(vals[34:36]))
+            flowcal_m00=vals[34],
+            flowcal_m11=vals[35],
+            flowcal_m01=vals[36],
+            flowcal_m10=vals[37])
 
 
 @dataclass

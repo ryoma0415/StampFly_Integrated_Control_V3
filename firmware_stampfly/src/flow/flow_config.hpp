@@ -73,6 +73,34 @@ static const float FLOW_DEFAULT_SCALE_COUNTS_PER_RAD = 450.0f;
 static const float FLOW_SCALE_MIN_COUNTS_PER_RAD = 100.0f;
 static const float FLOW_SCALE_MAX_COUNTS_PER_RAD = 2000.0f;
 
+// 【2026-07-31 改訂】較正は 2×2 行列 K [counts/rad](「機体系レート [rad/s]
+// → センサーカウントレート [counts/s]」の写像。契約 §1.4/§2.5)。純スケール
+// なら K=diag(kx,ky)、取付回転 φ0 込みなら K=diag(kx,ky)·R(φ0)。適用は
+// rate = K⁻¹·counts_rate(ジャイロ補償より前)。対角 m00/m11 は上記スケール
+// 範囲、非対角 m01/m10(取付回転成分)は |m| ≤ FLOW_SCALE_MAX まで許容。
+// det(K) が下限未満(det≈0 含む)は K⁻¹ が数値不安定になるため拒否する。
+// 下限は最小スケール対角行列の det = MIN²(K=diag(kx,ky)·R(φ0) 形なら
+// det = kx·ky ≥ MIN² なので実用領域を狭めない)。
+static const float FLOW_SCALE_DET_MIN_COUNTS2 =
+    FLOW_SCALE_MIN_COUNTS_PER_RAD * FLOW_SCALE_MIN_COUNTS_PER_RAD;
+
+// K 行列の妥当性検査(CMD_FLOWCAL_SET 受理と NVS ロードで共用)。
+static inline bool flowcalMatrixValid(float m00, float m01, float m10, float m11) {
+    if (!(isfinite(m00) && isfinite(m01) && isfinite(m10) && isfinite(m11))) {
+        return false;
+    }
+    if (m00 < FLOW_SCALE_MIN_COUNTS_PER_RAD || m00 > FLOW_SCALE_MAX_COUNTS_PER_RAD ||
+        m11 < FLOW_SCALE_MIN_COUNTS_PER_RAD || m11 > FLOW_SCALE_MAX_COUNTS_PER_RAD) {
+        return false;
+    }
+    if (fabsf(m01) > FLOW_SCALE_MAX_COUNTS_PER_RAD ||
+        fabsf(m10) > FLOW_SCALE_MAX_COUNTS_PER_RAD) {
+        return false;
+    }
+    const float det = m00 * m11 - m01 * m10;
+    return det >= FLOW_SCALE_DET_MIN_COUNTS2;
+}
+
 // ---------------------------------------------------------------------------
 // ハードCS Motion_Burst プローブ (CMD_FLOW_PROBE) / 起動時セルフテスト
 // ---------------------------------------------------------------------------

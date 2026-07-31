@@ -208,13 +208,20 @@ class FakeDroneResponder:
                 cal.valid_flags &= ~proto.TlmCalData.VALID_MAGBIAS
                 cal.magbias = (0.0, 0.0, 0.0)
         elif t == proto.MsgType.CMD_FLOWCAL_SET:
+            # 2026-07-31 改訂: flowcal 2×2 行列(K [counts/rad])を反映
             msg = proto.CmdFlowcalSet.from_payload(frame.payload)
             if msg.mode == proto.CmdFlowcalSet.MODE_SET:
                 cal.valid_flags |= proto.TlmCalData.VALID_FLOWCAL
-                cal.flowcal = (msg.kx, msg.ky)
+                cal.flowcal_m00 = msg.m00
+                cal.flowcal_m01 = msg.m01
+                cal.flowcal_m10 = msg.m10
+                cal.flowcal_m11 = msg.m11
             else:
                 cal.valid_flags &= ~proto.TlmCalData.VALID_FLOWCAL
-                cal.flowcal = (0.0, 0.0)
+                cal.flowcal_m00 = 0.0
+                cal.flowcal_m01 = 0.0
+                cal.flowcal_m10 = 0.0
+                cal.flowcal_m11 = 0.0
 
     def __call__(self, frame: proto.Frame):
         relay = self._relay(frame)

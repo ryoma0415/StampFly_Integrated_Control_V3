@@ -10,10 +10,12 @@ import pytest
 import stampfly_protocol as proto
 from core.config import parse_mac
 from core.logger import FlightLogger
-from core.session import MODE_POSITION, MODE_POSTURE, PHASE_CONNECTED
+from core.session import (MODE_EXPERIMENT, MODE_POSITION, MODE_POSTURE,
+                          PHASE_CONNECTED)
 
 from conftest import halt_supervisor
-from fakes import make_pose, make_tlm_ctrl, wait_until
+from fakes import (FakeDroneResponder, make_mocap_frame, make_pose,
+                   make_tlm_ctrl, wait_until)
 
 
 class TestConnectAndAirframe:
@@ -228,6 +230,35 @@ class TestSnapshotContract:
 
         target = session.get_state_snapshot()["data"]["session"]["target"]
         assert set(target.keys()) == {"x", "y", "z"}
+
+    def test_mocap_display_snapshot_in_experiment_mode(self, session_factory):
+        """Experiment モードでは NatNet 直近 pose を表示専用で "mocap" に配る
+        (リアルタイムモニタの MoCap 重畳用。位置フィルタは経由しない。
+        他モード(Posture 等)は従来どおり null)。"""
+        # Experiment への遷移は CMD_MODE の ACK が要る(フェイク機体を使う)
+        session, transport, clock = session_factory(
+            responder=FakeDroneResponder())
+        session.connect("FAKE")
+        halt_supervisor(session)
+        # NatNet フレームを MocapSource へ直接流す(パッシブ受信の模擬)
+        session.mocap._receive_frame(make_mocap_frame(pos=(0.1, 0.3, 0.2)))
+
+        # Posture モードでは従来どおり null
+        assert session.get_state_snapshot()["data"]["mocap"] is None
+
+        assert session.set_mode(MODE_EXPERIMENT)
+        mocap = session.get_state_snapshot()["data"]["mocap"]
+        assert mocap is not None
+        # 既定変換: 制御x←Motive z, 制御y←−Motive x, 制御z←Motive y
+        assert mocap["x"] == pytest.approx(0.2)
+        assert mocap["y"] == pytest.approx(-0.1)
+        assert mocap["z"] == pytest.approx(0.3)
+        assert mocap["fresh"] is True
+        assert mocap["valid"] is True
+        # キー構成は Position モードの mocap_snapshot と同じ流儀
+        assert "yaw_deg" in mocap and "yaw_true_deg" in mocap
+        assert 0.0 < mocap["confidence"] <= 1.0
+        json.dumps(session.get_state_snapshot(), allow_nan=False)
 
     def test_relay_stats_in_snapshot(self, session_factory):
         session, transport, clock = session_factory()

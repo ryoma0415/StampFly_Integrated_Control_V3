@@ -35,6 +35,7 @@ from .experiment import ExperimentHub
 from .ffprofile import FfProfileManager
 from . import logger as logger_mod
 from .logger import FlightLogger
+from .flowcal import FlowcalManager
 from .magbias import MagbiasManager
 from .mocap import (DEFAULT_ATTITUDE_TRANSFORM, DEG_TO_RAD, RAD_TO_DEG,
                     MocapSource, validate_mapping, wrap_pi)
@@ -170,6 +171,10 @@ class SessionManager:
         self._divergence_error_m: float = failsafe.get("divergence_error_m", 1.0)
         self._divergence_hold_s: float = failsafe.get("divergence_hold_s", 1.0)
         self._telemetry_fresh_s: float = self.server_config["freshness"]["telemetry_fresh_s"]
+        # Experiment モードの表示専用 MoCap スナップショット
+        # (_mocap_display_snapshot)の鮮度閾値。Position モードの
+        # position.py と同じ設定キーを共有する
+        self._mocap_fresh_s: float = self.server_config["freshness"]["mocap_fresh_s"]
         # 単機テレメトリ途絶監視(リレー再起動などのサイレント断の検出)。
         # 既定値は server.json failsafe 節と同値(旧形式の設定でも動くよう
         # .get で読む)。
@@ -219,6 +224,11 @@ class SessionManager:
         # 同じ排他スロットを共有する)
         self.magbias = MagbiasManager(self.serial, self.experiment,
                                       self.calibration, notify=self.warn)
+        # フロー較正(純回転 2×2 フィット。FLIGHT_ANALYSIS_20260731.md §5)。
+        # 記録は _on_tlm_state から供給、適用は magbias と同じ排他スロット
+        self.flowcal = FlowcalManager(self.serial, self.experiment,
+                                      self.calibration, notify=self.warn,
+                                      tlm_state_provider=self._tlm_state_snapshot)
         # 移動ベースヨー推定器(契約 §3.2)。Position モードの 50Hz 送信 tick
         # (_emit_pos_err)だけが feed/estimate を呼ぶ(単一スレッド前提)。
         # スナップショット用の直近推定は self._lock 配下にキャッシュする。
@@ -1915,6 +1925,8 @@ class SessionManager:
         with self._lock:
             self._tlm_state = tlm
             self._tlm_state_t = self._clock()
+        # フロー較正の記録バッファへ供給(記録中でなければ即 return)
+        self.flowcal.on_tlm_state(tlm)
         self._update_phase_from_drone(tlm.state, tlm.flags)
 
     def _on_tlm_ctrl(self, frame: proto.Frame) -> None:
@@ -2285,6 +2297,40 @@ class SessionManager:
         self.events.put({"type": "log", "origin": LOG_ORIGIN_SERVER,
                          "line": f"[警告] {message}"})
 
+    def _mocap_display_snapshot(self) -> Optional[dict]:
+        """Experiment モード用の表示専用 MoCap スナップショット(deg/m)。
+
+        Position モードの position.mocap_snapshot(位置フィルタ経由)と違い、
+        MocapSource の直近 primary pose を直接読む — Experiment モードでは
+        NatNet がパッシブ起動(mocap_bodies 等)のことがあり、位置フィルタへ
+        pose が流入しないため。キー構成は mocap_snapshot と揃えてあり、UI は
+        モードに関わらず同じ "mocap" フィールドを読めばよい。制御には一切
+        使われない(リアルタイムモニタの重畳表示のみ)。
+        """
+        pose = self.mocap.latest_pose()
+        if pose is None:
+            return None
+        t_mono = pose.get("t_mono")
+        # pose の t_mono は mocap.py 側の time.monotonic()。self._clock は
+        # テストで差し替えられるため混ぜず、同一クロック領域で鮮度判定する
+        age_s = (time.monotonic() - t_mono) if t_mono is not None else None
+        snapshot = {
+            "x": float(pose["x"]),
+            "y": float(pose["y"]),
+            "z": float(pose["z"]),
+            "yaw_deg": pose["yaw_rad"] * RAD_TO_DEG,
+            "confidence": float(pose.get("quality", 0.0)),
+            "fresh": age_s is not None and age_s <= self._mocap_fresh_s,
+            "valid": bool(pose.get("tracking_valid", False)),
+        }
+        yaw_true = pose.get("yaw_true_rad")
+        if yaw_true is not None:
+            snapshot["yaw_true_deg"] = yaw_true * RAD_TO_DEG
+        flip_flags = pose.get("flip_flags")
+        if flip_flags is not None:
+            snapshot["flip"] = int(flip_flags)
+        return snapshot
+
     def get_state_snapshot(self) -> dict:
         """WebSocket 20Hz 配信用の状態スナップショット(UI 単位系: deg/m)。"""
         now = self._clock()
@@ -2379,8 +2425,16 @@ class SessionManager:
                 "flow_status": tlm.flow_status,
             }
 
-        # mocap: Position モード時のみ(リジッドボディ未検出なら null)
-        mocap = self.position.mocap_snapshot(now) if mode == MODE_POSITION else None
+        # mocap: Position モード時は位置制御のフィルタ済みスナップショット。
+        # Experiment モードでもリアルタイムモニタ(フロー重畳表示)用に
+        # NatNet 直近 pose を表示専用で配る(未接続/未検出なら null —
+        # 従来動作と同じ。他モードは従来どおり null)
+        if mode == MODE_POSITION:
+            mocap = self.position.mocap_snapshot(now)
+        elif mode == MODE_EXPERIMENT:
+            mocap = self._mocap_display_snapshot()
+        else:
+            mocap = None
 
         # setpoint: 現在の整形済みセットポイント(バイアス加算前、UI単位)
         trajectory = None

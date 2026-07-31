@@ -86,14 +86,14 @@ enum class MsgType : uint8_t {
   // ver=0x02 のまま。契約書記載の 0x24-0x26 は既存 CMD_POS_ERR / CMD_LED_MODE
   // と衝突するため、空きの 0x26-0x28 を同順で割当)
   CMD_MAGBIAS_SET = 0x26,  // 学習ハードアイアン残差 Δb 適用/クリア(13B)
-  CMD_FLOWCAL_SET = 0x27,  // フロースケール適用/クリア(9B)
+  CMD_FLOWCAL_SET = 0x27,  // フロー較正行列 K 適用/クリア(17B)
   CMD_FLOW_PROBE = 0x28,   // PMW3901 burst プローブ実行(1B)
   // 下り(ドローン -> PC): 0x30–0x4F
   TLM_STATE = 0x30,        // フル状態テレメトリ(184B、25Hz)
   TLM_EVENT = 0x31,        // 状態遷移イベント(8B、即時+2Hz)
   TLM_ACK = 0x32,          // 0x14–0x23, 0x25–0x28 コマンドへの応答(6B)
   TLM_EXP = 0x33,          // 実験テレメトリ(86B、MOTOR_TEST 中のみ 25Hz)
-  TLM_CAL_DATA = 0x34,     // キャリブ一括データ(132B、CMD_CAL_GET 応答)
+  TLM_CAL_DATA = 0x34,     // キャリブ一括データ(140B、CMD_CAL_GET 応答)
   TLM_CTRL = 0x35,         // 制御ループ診断テレメトリ(89B、25Hz 常時)
   // ログ(リレー/ドローン -> PC)
   LOG_TEXT = 0x40,      // 人間向けテキスト(1〜181B)
@@ -891,34 +891,46 @@ inline bool deserialize(const uint8_t* in, size_t len, CmdMagbiasSet* out) {
   return true;
 }
 
-// 0x27 CMD_FLOWCAL_SET(9B)— フロースケール [counts/rad] の適用/クリア。
-// NVS `flowcal` へ保存(mode=0 でクリア=既定 450.0 に戻る)。
+// 0x27 CMD_FLOWCAL_SET(17B)— フロー較正行列 K の適用/クリア。
+// K [counts/rad] は「機体系レート [rad/s] → センサーカウントレート [counts/s]」
+// の 2×2 写像(行優先 m00,m01,m10,m11)。純スケールなら K=diag(kx,ky)、取付
+// 回転 φ0 込みなら K=diag(kx,ky)·R(φ0)。ファームは rate = K⁻¹·counts_rate を
+// ジャイロ補償より前に適用し、NVS `flowcal`(schema v2)へ保存する
+// (mode=0 でクリア=既定 diag(450,450) に戻る)。
 // WAIT / COMPLETE / MOTOR_TEST のみ受理(MAG_AUTOTUNE_DESIGN.md §1.4)。
+// 【改訂 2026-07-31】9B(mode + kx,ky)→ 17B の 2×2 行列化
+// (FLIGHT_ANALYSIS_20260731.md §5: 取付回転を 2 定数では表現できないため)。
 struct CmdFlowcalSet {
   static constexpr MsgType TYPE = MsgType::CMD_FLOWCAL_SET;
-  static constexpr size_t PAYLOAD_SIZE = 1 + 4 + 4;
+  static constexpr size_t PAYLOAD_SIZE = 1 + 4 * 4;
   static constexpr uint8_t MODE_CLEAR = 0;
   static constexpr uint8_t MODE_SET = 1;
 
-  uint8_t mode = 0;  // 0=clear, 1=set
-  float kx = 0.0f;   // counts/rad
-  float ky = 0.0f;   // counts/rad
+  uint8_t mode = 0;   // 0=clear, 1=set
+  float m00 = 0.0f;   // K 行列 [counts/rad](行優先)
+  float m01 = 0.0f;
+  float m10 = 0.0f;
+  float m11 = 0.0f;
 };
-static_assert(CmdFlowcalSet::PAYLOAD_SIZE == 9, "PROTOCOL.md: CMD_FLOWCAL_SET payload = 9B");
+static_assert(CmdFlowcalSet::PAYLOAD_SIZE == 17, "PROTOCOL.md: CMD_FLOWCAL_SET payload = 17B");
 
 inline bool serialize(const CmdFlowcalSet& m, uint8_t* out, size_t cap) {
   if (out == nullptr || cap < CmdFlowcalSet::PAYLOAD_SIZE) return false;
   wr_u8(out + 0, m.mode);
-  wr_f32(out + 1, m.kx);
-  wr_f32(out + 5, m.ky);
+  wr_f32(out + 1, m.m00);
+  wr_f32(out + 5, m.m01);
+  wr_f32(out + 9, m.m10);
+  wr_f32(out + 13, m.m11);
   return true;
 }
 
 inline bool deserialize(const uint8_t* in, size_t len, CmdFlowcalSet* out) {
   if (in == nullptr || out == nullptr || len != CmdFlowcalSet::PAYLOAD_SIZE) return false;
   out->mode = rd_u8(in + 0);
-  out->kx = rd_f32(in + 1);
-  out->ky = rd_f32(in + 5);
+  out->m00 = rd_f32(in + 1);
+  out->m01 = rd_f32(in + 5);
+  out->m10 = rd_f32(in + 9);
+  out->m11 = rd_f32(in + 13);
   return true;
 }
 
@@ -1351,9 +1363,12 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmExp* out) {
   return true;
 }
 
-// 0x34 TLM_CAL_DATA(132B)— CMD_CAL_GET への応答(キャリブ一括データ)。
+// 0x34 TLM_CAL_DATA(140B)— CMD_CAL_GET への応答(キャリブ一括データ)。
 // 磁気オートチューン/フロー拡張(MAG_AUTOTUNE_DESIGN.md §1.5): magbias と
-// flowcal を末尾追加して 112B → 132B。
+// flowcal を末尾追加して 112B → 140B。
+// 【改訂 2026-07-31】flowcal 2×2 行列化で 132B → 140B: オフセット 124/128 の
+// kx/ky は flowcal_m00/flowcal_m11 に改名(対角成分として意味維持)、
+// flowcal_m01@132・flowcal_m10@136 を末尾追加(ワイヤ順 m00,m11,m01,m10)。
 struct TlmCalData {
   static constexpr MsgType TYPE = MsgType::TLM_CAL_DATA;
   static constexpr size_t PAYLOAD_SIZE =
@@ -1369,7 +1384,7 @@ struct TlmCalData {
       4 +          // ff_crc32
       1 + 1 +      // ff_mode, est_mode
       4 * 3 +      // magbias(磁気オートチューン拡張)
-      4 * 2;       // flowcal(同)
+      4 * 4;       // flowcal K 行列(同+2026-07-31 の 2×2 化)
   static constexpr uint8_t VALID_MAG3D = 0x01;    // bit0
   static constexpr uint8_t VALID_ACCEL6 = 0x02;   // bit1
   static constexpr uint8_t VALID_ATTMOUNT = 0x04; // bit2
@@ -1395,9 +1410,14 @@ struct TlmCalData {
   uint8_t ff_mode = 0;
   uint8_t est_mode = 0;
   float magbias[3] = {0.0f, 0.0f, 0.0f};  // Δb dx, dy, dz [µT, b_cal 空間]
-  float flowcal[2] = {0.0f, 0.0f};        // kx, ky [counts/rad]
+  // flowcal K 行列 [counts/rad](機体系レート→カウントレート)。ワイヤ順
+  // m00@124, m11@128, m01@132, m10@136(オフセット互換維持)。
+  float flowcal_m00 = 0.0f;
+  float flowcal_m11 = 0.0f;
+  float flowcal_m01 = 0.0f;
+  float flowcal_m10 = 0.0f;
 };
-static_assert(TlmCalData::PAYLOAD_SIZE == 132, "PROTOCOL.md: TLM_CAL_DATA payload = 132B");
+static_assert(TlmCalData::PAYLOAD_SIZE == 140, "PROTOCOL.md: TLM_CAL_DATA payload = 140B");
 
 inline bool serialize(const TlmCalData& m, uint8_t* out, size_t cap) {
   if (out == nullptr || cap < TlmCalData::PAYLOAD_SIZE) return false;
@@ -1415,7 +1435,10 @@ inline bool serialize(const TlmCalData& m, uint8_t* out, size_t cap) {
   wr_u8(out + 110, m.ff_mode);
   wr_u8(out + 111, m.est_mode);
   for (size_t i = 0; i < 3; ++i) wr_f32(out + 112 + 4 * i, m.magbias[i]);
-  for (size_t i = 0; i < 2; ++i) wr_f32(out + 124 + 4 * i, m.flowcal[i]);
+  wr_f32(out + 124, m.flowcal_m00);
+  wr_f32(out + 128, m.flowcal_m11);
+  wr_f32(out + 132, m.flowcal_m01);
+  wr_f32(out + 136, m.flowcal_m10);
   return true;
 }
 
@@ -1435,7 +1458,10 @@ inline bool deserialize(const uint8_t* in, size_t len, TlmCalData* out) {
   out->ff_mode = rd_u8(in + 110);
   out->est_mode = rd_u8(in + 111);
   for (size_t i = 0; i < 3; ++i) out->magbias[i] = rd_f32(in + 112 + 4 * i);
-  for (size_t i = 0; i < 2; ++i) out->flowcal[i] = rd_f32(in + 124 + 4 * i);
+  out->flowcal_m00 = rd_f32(in + 124);
+  out->flowcal_m11 = rd_f32(in + 128);
+  out->flowcal_m01 = rd_f32(in + 132);
+  out->flowcal_m10 = rd_f32(in + 136);
   return true;
 }
 

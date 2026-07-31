@@ -383,11 +383,13 @@ def build_vectors() -> dict:
         {"mode": 0, "dx": 0.0, "dy": 0.0, "dz": 0.0},
         magbias_clear.to_payload()))
 
+    # flowcal 2×2 行列(2026-07-31 改訂): K = diag(kx,ky)·R(φ0) 形の
+    # 非対角込み代表値(f32 で正確に表現できる 1/4 刻み)
     flowcal = sp.CmdFlowcalSet(mode=sp.CmdFlowcalSet.MODE_SET,
-                               kx=452.5, ky=447.25)
+                               m00=452.5, m01=36.25, m10=-33.5, m11=447.25)
     frames.append(frame_vector(
         "cmd_flowcal_set", "CMD_FLOWCAL_SET", sp.MsgType.CMD_FLOWCAL_SET, 39,
-        {"mode": 1, "kx": 452.5, "ky": 447.25},
+        {"mode": 1, "m00": 452.5, "m01": 36.25, "m10": -33.5, "m11": 447.25},
         flowcal.to_payload()))
 
     flow_probe = sp.CmdFlowProbe(n_cycles=0)  # 0=既定 200 サイクル
@@ -439,7 +441,10 @@ def build_vectors() -> dict:
         "ff_mode": 2,
         "est_mode": 2,
         "magbias": [13.2, -8.4, 2.1],
-        "flowcal": [452.5, 447.25],
+        "flowcal_m00": 452.5,
+        "flowcal_m11": 447.25,
+        "flowcal_m01": 36.25,
+        "flowcal_m10": -33.5,
     }
     cal = sp.TlmCalData(
         valid_flags=cal_fields["valid_flags"],
@@ -456,9 +461,12 @@ def build_vectors() -> dict:
         ff_mode=cal_fields["ff_mode"],
         est_mode=cal_fields["est_mode"],
         magbias=tuple(cal_fields["magbias"]),
-        flowcal=tuple(cal_fields["flowcal"]))
+        flowcal_m00=cal_fields["flowcal_m00"],
+        flowcal_m11=cal_fields["flowcal_m11"],
+        flowcal_m01=cal_fields["flowcal_m01"],
+        flowcal_m10=cal_fields["flowcal_m10"])
     cal_payload = cal.to_payload()
-    assert len(cal_payload) == 132
+    assert len(cal_payload) == 140
     frames.append(frame_vector(
         "tlm_cal_data_full", "TLM_CAL_DATA", sp.MsgType.TLM_CAL_DATA, 202,
         cal_fields, cal_payload))

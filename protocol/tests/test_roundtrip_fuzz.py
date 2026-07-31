@@ -107,8 +107,10 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
                                 dz=f32(rng.uniform(-30, 30)))
     if msg_type == sp.MsgType.CMD_FLOWCAL_SET:
         return sp.CmdFlowcalSet(mode=rng.randrange(2),
-                                kx=f32(rng.uniform(300, 600)),
-                                ky=f32(rng.uniform(300, 600)))
+                                m00=f32(rng.uniform(300, 600)),
+                                m01=f32(rng.uniform(-100, 100)),
+                                m10=f32(rng.uniform(-100, 100)),
+                                m11=f32(rng.uniform(300, 600)))
     if msg_type == sp.MsgType.CMD_FLOW_PROBE:
         return sp.CmdFlowProbe(n_cycles=rng.randrange(256))
     if msg_type == sp.MsgType.TLM_STATE:
@@ -218,7 +220,10 @@ def random_message(rng: random.Random, msg_type: sp.MsgType):
             ff_mode=rng.randrange(3),
             est_mode=rng.randrange(3),
             magbias=tuple(f32(rng.uniform(-30, 30)) for _ in range(3)),
-            flowcal=tuple(f32(rng.uniform(300, 600)) for _ in range(2)))
+            flowcal_m00=f32(rng.uniform(300, 600)),
+            flowcal_m11=f32(rng.uniform(300, 600)),
+            flowcal_m01=f32(rng.uniform(-100, 100)),
+            flowcal_m10=f32(rng.uniform(-100, 100)))
     if msg_type == sp.MsgType.TLM_CTRL:
         return sp.TlmCtrl(
             elapsed_ms=rng.randrange(2**32),
@@ -418,15 +423,16 @@ def test_utf8_truncate_len_edge_cases():
 # ---------------------------------------------------------------------------
 
 def test_mag_autotune_payload_size_contract():
-    """契約 §1 のペイロードサイズ(184/132/13/9/1B と既存不変分)。"""
+    """契約 §1 のペイロードサイズ(184/140/13/17/1B と既存不変分。
+    140/17 は 2026-07-31 の flowcal 2×2 化)。"""
     assert sp.TlmState.PAYLOAD_SIZE == 184
     assert len(sp.TlmState().to_payload()) == 184
-    assert sp.TlmCalData.PAYLOAD_SIZE == 132
-    assert len(sp.TlmCalData().to_payload()) == 132
+    assert sp.TlmCalData.PAYLOAD_SIZE == 140
+    assert len(sp.TlmCalData().to_payload()) == 140
     assert sp.CmdMagbiasSet.PAYLOAD_SIZE == 13
     assert len(sp.CmdMagbiasSet().to_payload()) == 13
-    assert sp.CmdFlowcalSet.PAYLOAD_SIZE == 9
-    assert len(sp.CmdFlowcalSet().to_payload()) == 9
+    assert sp.CmdFlowcalSet.PAYLOAD_SIZE == 17
+    assert len(sp.CmdFlowcalSet().to_payload()) == 17
     assert sp.CmdFlowProbe.PAYLOAD_SIZE == 1
     assert len(sp.CmdFlowProbe().to_payload()) == 1
     # 既存フィールドのサイズ不変(契約 §1.2)
@@ -457,11 +463,11 @@ def test_tlm_state_rejects_legacy_135b():
 
 
 def test_tlm_cal_data_rejects_legacy_112b():
-    """旧 112B TLM_CAL_DATA フレームは受理しない(長さ厳格検査)。"""
-    for bad_len in (0, 111, 112, 131, 133):
+    """旧 112B/132B TLM_CAL_DATA フレームは受理しない(長さ厳格検査)。"""
+    for bad_len in (0, 111, 112, 131, 132, 139, 141):
         with pytest.raises(ValueError):
             sp.TlmCalData.from_payload(bytes(bad_len))
-    sp.TlmCalData.from_payload(bytes(132))  # 正しい長さは受理
+    sp.TlmCalData.from_payload(bytes(140))  # 正しい長さは受理
 
 
 def test_new_cmd_length_strictness():
@@ -478,7 +484,8 @@ def test_new_cmd_boundary_values_roundtrip():
         msg = sp.CmdMagbiasSet(mode=mode, dx=f32(-1000.0), dy=0.0, dz=f32(1000.0))
         assert sp.CmdMagbiasSet.from_payload(msg.to_payload()) == msg
     for mode in (sp.CmdFlowcalSet.MODE_CLEAR, sp.CmdFlowcalSet.MODE_SET):
-        msg = sp.CmdFlowcalSet(mode=mode, kx=f32(450.0), ky=f32(0.0))
+        msg = sp.CmdFlowcalSet(mode=mode, m00=f32(450.0), m01=f32(-81.5),
+                               m10=f32(92.75), m11=f32(0.0))
         assert sp.CmdFlowcalSet.from_payload(msg.to_payload()) == msg
     for n_cycles in (0, 1, sp.CmdFlowProbe.DEFAULT_CYCLES, 255):
         msg = sp.CmdFlowProbe(n_cycles=n_cycles)
@@ -511,12 +518,18 @@ def test_tlm_state_extension_offsets():
 
 
 def test_tlm_cal_data_extension_offsets():
-    """magbias / flowcal が契約 §1.5 のオフセット(112 / 124)に載ること。"""
+    """magbias / flowcal が契約 §1.5 のオフセット(112 / 124–136)に載ること。
+
+    flowcal K 行列のワイヤ順は m00@124, m11@128, m01@132, m10@136
+    (2026-07-31 の 2×2 化: 旧 kx/ky オフセット互換維持のため行優先ではない)。
+    """
     msg = sp.TlmCalData(valid_flags=0xC0,
-                        magbias=(1.5, -2.5, 3.5), flowcal=(450.0, 451.0))
+                        magbias=(1.5, -2.5, 3.5),
+                        flowcal_m00=450.0, flowcal_m11=451.0,
+                        flowcal_m01=36.25, flowcal_m10=-33.5)
     payload = msg.to_payload()
     assert struct.unpack_from("<3f", payload, 112) == (1.5, -2.5, 3.5)
-    assert struct.unpack_from("<2f", payload, 124) == (450.0, 451.0)
+    assert struct.unpack_from("<4f", payload, 124) == (450.0, 451.0, 36.25, -33.5)
     assert sp.TlmCalData.from_payload(payload) == msg
 
 
