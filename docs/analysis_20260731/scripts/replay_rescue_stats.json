@@ -1,0 +1,98 @@
+{
+ "case_a_yawobs": {
+  "shape_rms_deg": 0.406,
+  "shape_max_deg": 1.55,
+  "innov_rms_deg": 0.42,
+  "innov_max_deg": 1.64,
+  "fused_ratio": 1.0,
+  "mag_gate_reject_flight": 0.176,
+  "bm_final_ut_after_flight_reanchor": [
+   -2.62,
+   -5.69
+  ],
+  "anchor_sensitivity": "stale/window両アンカーで shape RMS 0.406/0.407° — アンカー品質に不感"
+ },
+ "case_b_noyaw": {
+  "shape_rms_deg_vs_truth": 2.57,
+  "mean_deg_vs_truth": -5.7,
+  "vs_logged_ekf2_raw_rms_deg": 8.11,
+  "vs_logged_ekf2_shape_rms_deg": 4.75,
+  "z_gate_reject": 0.94
+ },
+ "case_c_ekf1mode": {
+  "shape_rms_deg_vs_truth": 2.73,
+  "mean_deg_vs_truth": -5.77,
+  "vs_logged_ekf1_raw_rms_deg": 7.52,
+  "vs_logged_ekf1_shape_rms_deg": 3.56
+ },
+ "logged_ekf1_vs_truth": {
+  "mean_deg": -12.39,
+  "raw_rms_deg": 13.35,
+  "shape_rms_deg": 4.97
+ },
+ "logged_ekf2_vs_truth": {
+  "mean_deg": -12.27,
+  "raw_rms_deg": 13.7,
+  "shape_rms_deg": 6.08
+ },
+ "code_identity": {
+  "db_hat_bias_ut": [
+   -0.09,
+   -0.187
+  ],
+  "db_hat_rms_ut": [
+   0.656,
+   1.307
+  ],
+  "logged_dbhat_mean_ut": 111.6,
+  "ekf2_minus_ekf1_logged_deg": {
+   "mean": 0.12,
+   "rms": 1.38
+  },
+  "replay_b_minus_c_deg": {
+   "mean": 0.07,
+   "rms": 0.2
+  },
+  "z_gate8_ratio": {
+   "logged": 0.89,
+   "replay_b": 0.94
+  },
+  "limitation": "ログがアーム後開始のためファーム実機の地上アンカー/I_idle/EMA初期状態が復元不能 — 軌跡一致は7-8°止まり、挙動クラス(z-gate支配・ドリフト極性/規模・EKF2-EKF1差<1.5°)は一致"
+ },
+ "ff_residual_direct": {
+  "c_body_ut": [
+   0.44,
+   -7.41
+  ],
+  "c_body_norm_ut": 7.42,
+  "c_body_dir_deg": -86.6,
+  "anchor_err_ut": 5.62,
+  "fit_rms_ut": [
+   3.07,
+   3.94
+  ],
+  "flight_dbhat_ut": {
+   "x": 68.1,
+   "y": 88.3,
+   "z": 21.3
+  },
+  "z_overcorrection_ut": -17.3,
+  "z_gate_ut": 12.0,
+  "comparison_0727": "13-16µT(補正の12-14%) -> 今回7.4µT(補正の~6.6%)"
+ },
+ "magbias": {
+  "delta_b_ut": [
+   -0.41,
+   -7.64,
+   0.0
+  ],
+  "fit_rms_ut": 2.51,
+  "yaw_excursion_deg": 106.2,
+  "cross_check": "独立手法(c_body直接測定 +0.44,-7.41)と0.9µT以内で一致"
+ },
+ "magbias_applied_replay_no_yawobs": {
+  "shape_rms_deg": 3.37,
+  "mean_deg": -10.2,
+  "verdict": "z過補正17µT>12µTゲートで磁気更新が開かず、水平Δb単独では改善せず(z成分がnullのため)"
+ }
+}

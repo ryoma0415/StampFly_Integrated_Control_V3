@@ -1,0 +1,135 @@
+{
+  "log": "/Users/ryoma_nishimura/Code-Projects/StampFly-Project-Develop/Developments/StampFly_MoCap_System_v2/StampFly_Integrated_Control_V3/logs/flight_logs/20260731_111906_position.csv",
+  "session": "20260731_111906",
+  "raw_yaw_definition": "yaw_raw_deg = atan2(f_x_mocap, f_z_mocap), f = R(q)*[1,0,0] (body +x in mocap world); identical to mocap_heading_deg column (RMS 0.000 deg). Flip correction already applied upstream in logged quaternion (mocap_flip is status only).",
+  "wrong_transform_used_in_session": {
+    "yaw_sign": 1,
+    "yaw_offset_deg": -91.3
+  },
+  "correct_transform": {
+    "yaw_sign": -1,
+    "yaw_offset_deg": 88.62,
+    "formula": "yaw_true_corrected_deg = wrap(-yaw_raw_deg + 88.62)",
+    "anchor": "ground-stationary window t=[0.15,1.5]s vs gyro-integrated yaw (reset to 0 at arm = onboard frame)"
+  },
+  "reference_20260727_correct": {
+    "yaw_sign": -1,
+    "yaw_offset_deg": 88.6
+  },
+  "relation_to_wrong_columns": "yaw_true_corrected_deg = wrap(-(mocap_yaw_true_deg) - 91.3 + 88.62); yaw_ref_sent_rad == -yaw_raw exactly",
+  "new_columns": {
+    "yaw_true_corrected_deg": "truth yaw in onboard yaw_est frame, deg, wrapped [-180,180)",
+    "yaw_ref_corrected_rad": "reference that should have been sent to EKF2 (wire convention = same frame as onboard yaw_est_rad), rad, wrapped [-pi,pi)"
+  },
+  "stats": {
+    "signtest_gyro_s+1": {
+      "offset_deg": -52.9,
+      "rms_deg": 55.2
+    },
+    "signtest_gyro_s-1": {
+      "offset_deg": 97.71,
+      "rms_deg": 5.54
+    },
+    "signtest_madgwick_s+1": {
+      "offset_deg": -53.6,
+      "rms_deg": 54.44
+    },
+    "signtest_madgwick_s-1": {
+      "offset_deg": 95.78,
+      "rms_deg": 4.69
+    },
+    "offset_anchor": {
+      "window_s": [
+        0.15,
+        1.5
+      ],
+      "c_vs_gyro": 88.617,
+      "c_vs_ekf1": 88.116,
+      "c_vs_ekf2": 89.301,
+      "std_in_window_vs_gyro": 0.098
+    },
+    "quality_vs_gyro": {
+      "const_residual_rms_deg": 5.53,
+      "drift_deg_per_min": 21.06,
+      "detrended_rms_deg": 0.423,
+      "detrended_max_abs_deg": 1.95
+    },
+    "quality_vs_madgwick": {
+      "drift_deg_per_min": 16.95,
+      "detrended_rms_deg": 1.498
+    },
+    "ekf1_vs_truth": {
+      "mean_deg": -11.93,
+      "rms_deg": 13.09,
+      "max_abs_deg": 24.4
+    },
+    "ekf2_vs_truth": {
+      "mean_deg": -11.76,
+      "rms_deg": 13.43,
+      "max_abs_deg": 26.81
+    },
+    "ref_sent_eq_minus_raw": {
+      "rms_deg": 0.0,
+      "max_abs_deg": 0.0
+    },
+    "innov_check": {
+      "rms_deg": 2.42,
+      "median_abs_deg": 0.25,
+      "innov_mean_abs_deg": 76.82,
+      "innov_min_deg": -91.26,
+      "innov_max_deg": 0.0
+    },
+    "hypothetical_innov_with_corrected_ref": {
+      "mean_deg": 11.76,
+      "rms_deg": 13.43,
+      "max_abs_deg": 26.81,
+      "frac_within_30deg_gate": 1.0
+    },
+    "flight": {
+      "duration_s": 54.5,
+      "hover_z_mean": 0.283,
+      "hover_z_std": 0.087,
+      "err_x_rms_m": 0.082,
+      "err_y_rms_m": 0.083,
+      "target_xy_unique": [
+        [
+          0.0,
+          0.0
+        ]
+      ]
+    },
+    "yaw_traj": {
+      "start_deg": 0.2,
+      "slow_creep": "0->about +15..20 deg over t=0..37s",
+      "turn_segments_t0_t1_yaw0_yaw1": [
+        [
+          15.6,
+          15.6,
+          12.3,
+          12.3
+        ],
+        [
+          39.2,
+          41.9,
+          21.0,
+          94.1
+        ],
+        [
+          44.8,
+          48.1,
+          101.1,
+          6.5
+        ],
+        [
+          54.4,
+          54.5,
+          9.5,
+          9.5
+        ]
+      ],
+      "peak_rate_deg_s": -36.8,
+      "peak_rate_t_s": 46.1,
+      "max_yaw_deg": 105.8
+    }
+  }
+}

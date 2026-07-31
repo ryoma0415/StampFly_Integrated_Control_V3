@@ -1,0 +1,83 @@
+{
+  "schema": "stampfly_magbias_profile",
+  "version": 1,
+  "name": "magbias_20260731_recovered",
+  "created_at": "2026-07-31T11:46:47+0900",
+  "source_logs": [
+    "log_fixed.csv"
+  ],
+  "delta_b_ut": [
+    -0.4105129938670763,
+    -7.639210981230178,
+    0.0
+  ],
+  "hover_residual_ut": {
+    "leveled_xy": [
+      -0.245115,
+      -5.413147
+    ],
+    "z": null,
+    "current_a": 3.208
+  },
+  "ff_supplement": {
+    "voltage_coeff_ut_per_v": [
+      -29.614559327680915,
+      25.984626210023038
+    ],
+    "duty_coeff": [
+      [
+        31.207922908067104,
+        -44.631993354384456,
+        46.724656195525135,
+        -42.93019273599336
+      ],
+      [
+        -2.7470861911453084,
+        -4.632563059352519,
+        -3.828303364629281,
+        -6.272792700473698
+      ]
+    ],
+    "r2": 0.45650265588765193,
+    "current_coeff_ut_per_a": [
+      -1.9360650747701416,
+      5.081198485331808
+    ],
+    "intercept_ut": [
+      117.72794581061723,
+      -96.70569238475179
+    ],
+    "r2_xy": [
+      0.35983791765072193,
+      0.9244103453826955
+    ],
+    "n_samples": 2225,
+    "duty_order": [
+      "FL",
+      "FR",
+      "RL",
+      "RR"
+    ]
+  },
+  "binding": {
+    "mag3d_hash": null,
+    "ffcal_crc": null
+  },
+  "quality": {
+    "yaw_excursion_deg": 106.1929,
+    "fit_rms_ut": 2.513814865826467,
+    "warnings": [
+      "離陸前の地上窓が無いため z 残差は null(ログが飛行中から開始)",
+      "delta_b の x/y はレベル化水平フィット値を roll/pitch≈0 のホバ近傍近似で b_cal 機体系へ同一視したもの(大チルト飛行では不正確)。z成分はホバ/地上の mag_cal_z 差で、環境鉛直勾配(高度依存)を含む(FLIGHT_ANALYSIS_20260727.md §3.2 注意1)",
+      "ff_state.json が読めないため binding は null (ff_state.json)"
+    ]
+  },
+  "provenance": {
+    "tool": "magbias_learn.py",
+    "tool_version": "1.0",
+    "log_generation": "v6",
+    "yaw_source": "mocap_yaw_true_deg",
+    "bm_source": "ekf2_bm",
+    "flight_duration_s": 54.469
+  }
+}
