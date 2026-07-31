@@ -465,3 +465,104 @@ class TestManagerRoundtrip:
         assert wait_until(
             lambda: mgr.status()["sample_count"] == before + 1)
         mgr.clear()
+
+
+class TestApplyUnverified:
+    """P2a: ACK 成功後の読み戻し失敗でも適用記録を必ず残す(applied_unverified)。
+
+    旧実装は照合失敗で記録なしのまま return し、機体 NVS だけが書き換わって
+    flowcal_state.json と乖離した。改修後は verified=False + verify_error で
+    送信行列・時刻を必ず記録し、status() の verify_warning が不一致を警告する。
+    """
+
+    def _fit_ok(self, mgr):
+        assert mgr.start_record()["ok"]
+        feed_synthetic(mgr, diag_rot_matrix(500.0, 480.0, -9.4), K_CUR_DEFAULT)
+        result = mgr.stop_and_fit()
+        assert result["ok"], result["fit"]
+        return result["fit"]
+
+    def test_readback_timeout_records_applied_unverified(self, flowcal_session):
+        session, transport, clock, responder, mgr = flowcal_session
+        fit = self._fit_ok(mgr)
+        session.calibration._cal_get_timeout_s = 0.1   # 待ち時間の短縮
+        responder.silent_types.add(int(proto.MsgType.CMD_CAL_GET))
+
+        result = mgr.apply()
+        assert result["ok"] is False
+        assert result["verified"] is False
+        assert result.get("applied_unverified") is True
+        # 機体 NVS は書き換わっている(ACK 成功 = 機体側受理)
+        assert responder.cal_data.valid_flags & proto.TlmCalData.VALID_FLOWCAL
+        # 状態ファイルに送信行列+時刻+verify_error が残る
+        state = json.loads(mgr.state_path.read_text(encoding="utf-8"))
+        applied = state["applied"]
+        assert applied["verified"] is False
+        assert applied["matrix"] == pytest.approx(fit["matrix"], abs=1e-3)
+        assert applied["applied_at"] > 0
+        assert "CAL_GET" in applied["verify_error"]
+        # status が未照合を警告する
+        status = mgr.status()
+        assert status["applied"]["verified"] is False
+        assert status["verify_warning"]
+
+    def test_readback_mismatch_records_applied_unverified(self,
+                                                          flowcal_session):
+        session, transport, clock, responder, mgr = flowcal_session
+        self._fit_ok(mgr)
+        orig = responder._update_cal_state
+
+        def corrupt(frame):
+            orig(frame)
+            if frame.type == proto.MsgType.CMD_FLOWCAL_SET:
+                responder.cal_data.flowcal_m00 += 25.0   # NVS 書込み化けの模擬
+
+        responder._update_cal_state = corrupt
+        result = mgr.apply()
+        assert result["ok"] is False
+        assert result.get("applied_unverified") is True
+        state = json.loads(mgr.state_path.read_text(encoding="utf-8"))
+        assert state["applied"]["verified"] is False
+        assert "m00" in state["applied"]["verify_error"]
+
+    def test_ack_failure_still_not_recorded(self, flowcal_session):
+        """ACK 失敗(NACK)は機体未受理 — 従来どおり記録しない。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        self._fit_ok(mgr)
+        responder.ack_status_overrides[int(proto.MsgType.CMD_FLOWCAL_SET)] = \
+            proto.TlmAck.STATUS_BAD_STATE
+        result = mgr.apply()
+        assert result["ok"] is False
+        assert not mgr.state_path.is_file()
+
+    def test_status_warns_on_drone_mismatch(self, flowcal_session):
+        """照合成功後でも、機体行列が変わったら status が警告する。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        self._fit_ok(mgr)
+        assert mgr.apply()["ok"]
+        assert mgr.status()["verify_warning"] is None
+        # 機体側で行列が変わった(別経路の書換え等)→ TLM_CAL_DATA 受信
+        responder.cal_data.flowcal_m00 += 30.0
+        target = responder.cal_data.flowcal_m00
+        transport.push(proto.MsgType.TLM_CAL_DATA,
+                       responder.cal_data.to_payload())
+        assert wait_until(
+            lambda: (lambda cal: cal is not None
+                     and abs(cal.flowcal_m00 - target) < 1e-3)(
+                         session.calibration.peek_cal_data()[0]))
+        warning = mgr.status()["verify_warning"]
+        assert warning and "一致しません" in warning
+
+    def test_unverified_clears_after_matching_readback(self, flowcal_session):
+        """未照合でも、後追いの TLM_CAL_DATA が4成分一致すれば警告は消える。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        self._fit_ok(mgr)
+        session.calibration._cal_get_timeout_s = 0.1
+        responder.silent_types.add(int(proto.MsgType.CMD_CAL_GET))
+        assert mgr.apply()["ok"] is False
+        assert mgr.status()["verify_warning"]
+        responder.silent_types.discard(int(proto.MsgType.CMD_CAL_GET))
+        transport.push(proto.MsgType.TLM_CAL_DATA,
+                       responder.cal_data.to_payload())
+        assert wait_until(lambda: (mgr.status()["drone"] or {}).get("valid"))
+        assert mgr.status()["verify_warning"] is None

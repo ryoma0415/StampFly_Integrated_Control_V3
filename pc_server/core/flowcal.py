@@ -439,7 +439,40 @@ class FlowcalManager:
             "drone": drone,
             "busy": busy,
             "message": message,
+            # P2a: 適用記録と機体行列の照合警告(不一致/未照合の可視化)
+            "verify_warning": self._verify_warning(applied, drone),
         }
+
+    @staticmethod
+    def _verify_warning(applied: Optional[dict],
+                        drone: Optional[dict]) -> Optional[str]:
+        """適用記録(flowcal_state.json)と機体行列の照合警告(P2a)。
+
+        - 直近 CAL_GET(drone)が読めるとき: 4 成分照合が正
+          — 不一致(または機体側 flowcal 無効)なら警告。一致していれば
+          applied_unverified でも警告しない(後追いの照合一致が観測済み)。
+        - drone 不明のとき: applied_unverified(verified=False)を警告。
+        """
+        if applied is None:
+            return None
+        matrix = applied.get("matrix")
+        have_matrix = isinstance(matrix, (list, tuple)) and len(matrix) == 4
+        if drone is not None and have_matrix:
+            if not drone.get("valid"):
+                return ("適用記録がありますが機体側は flowcal 未設定です"
+                        "(機体側でクリア/NVS 書込み失敗の可能性)")
+            mismatch = any(
+                abs(float(a) - float(b)) > CAL_VERIFY_TOLERANCE
+                for a, b in zip(matrix, drone.get("matrix") or []))
+            if mismatch:
+                return ("適用記録の行列と機体の現在行列が一致しません"
+                        "(機体側で変更された可能性 — 記録を確認してください)")
+            return None
+        if not applied.get("verified"):
+            return ("前回適用は読み戻し照合が未完了です(applied_unverified"
+                    f": {applied.get('verify_error', '照合未実施')})。"
+                    "機体行列が送信値と一致しているか未確認です")
+        return None
 
     def _fail(self, message: str, **extra: Any) -> dict[str, Any]:
         self._set_message(message)
@@ -542,6 +575,13 @@ class FlowcalManager:
 
         合格フィットのみ適用可(不合格は force で強制)。ただしファーム
         受理条件(flowcalMatrixValid)を満たさない行列は force でも送らない。
+
+        P2a(2026-07-31): CMD_FLOWCAL_SET の ACK 成功後に読み戻し照合が
+        失敗/タイムアウトした場合も、機体 NVS は書き換わっている可能性が
+        あるため「applied_unverified」(verified=False + verify_error)と
+        して送信行列・時刻を flowcal_state.json に必ず記録する(旧実装は
+        記録なしで機体だけ書き換わり、状態ファイルと機体が乖離した)。
+        不一致の可視化は status() の verify_warning が担う。
         """
         with self._lock:
             collecting = self._collecting
@@ -571,38 +611,49 @@ class FlowcalManager:
                                     m00=m00, m01=m01,
                                     m10=m10, m11=m11).to_payload())
             if not ok:
+                # ACK 失敗(NACK/タイムアウト)は機体側未受理とみなし記録
+                # しない(機体は NACK 時に NVS を書き換えない)
                 return self._fail(f"CMD_FLOWCAL_SET が失敗しました: {detail}")
+            # ACK 成功 = 機体 NVS は書き換わったとみなす。以降の照合失敗も
+            # 適用記録は必ず残す(P2a: applied_unverified)
+            applied = {
+                "matrix": [m00, m01, m10, m11],
+                "kx": fit.get("kx"), "ky": fit.get("ky"),
+                "phi0_deg": fit.get("phi0_deg"),
+                "r2x": fit.get("r2x"), "r2y": fit.get("r2y"),
+                "n_used": fit.get("n_used"),
+                "forced": bool(force and not fit.get("ok")),
+                "applied_at": time.time(),
+                "verified": False,
+            }
             # CAL_GET 読み戻しで valid bit7+4 成分照合(契約 §1.5)
+            verify_error: Optional[str] = None
             data = self.calibration.fetch_cal_data()
             if data is None:
-                return self._fail("CAL_GET の応答がありません", verified=False)
-            if not (data.valid_flags & proto.TlmCalData.VALID_FLOWCAL):
-                return self._fail("読み戻しで flowcal が有効になっていません",
-                                  verified=False)
-            got = (data.flowcal_m00, data.flowcal_m01,
-                   data.flowcal_m10, data.flowcal_m11)
-            mismatch = [f"{name}: sent={want:.3f} drone={float(g):.3f}"
-                        for name, want, g in zip(
-                            ("m00", "m01", "m10", "m11"),
-                            (m00, m01, m10, m11), got)
-                        if abs(float(g) - want) > CAL_VERIFY_TOLERANCE]
-            if mismatch:
+                verify_error = "CAL_GET の応答がありません"
+            elif not (data.valid_flags & proto.TlmCalData.VALID_FLOWCAL):
+                verify_error = "読み戻しで flowcal が有効になっていません"
+            else:
+                got = (data.flowcal_m00, data.flowcal_m01,
+                       data.flowcal_m10, data.flowcal_m11)
+                mismatch = [f"{name}: sent={want:.3f} drone={float(g):.3f}"
+                            for name, want, g in zip(
+                                ("m00", "m01", "m10", "m11"),
+                                (m00, m01, m10, m11), got)
+                            if abs(float(g) - want) > CAL_VERIFY_TOLERANCE]
+                if mismatch:
+                    verify_error = f"読み戻し値が一致しません: {', '.join(mismatch)}"
+            if verify_error is not None:
+                applied["verify_error"] = verify_error
+                self._save_state({"applied": applied})
                 return self._fail(
-                    f"読み戻し値が一致しません: {', '.join(mismatch)}",
-                    verified=False)
+                    f"{verify_error} — ACK は成功済みのため applied_unverified"
+                    " として記録しました(機体行列は書き換わっている可能性。"
+                    "status の照合警告を確認してください)",
+                    verified=False, applied_unverified=True)
             # 適用状態の永続化(flowcal_state.json)
-            self._save_state({
-                "applied": {
-                    "matrix": [m00, m01, m10, m11],
-                    "kx": fit.get("kx"), "ky": fit.get("ky"),
-                    "phi0_deg": fit.get("phi0_deg"),
-                    "r2x": fit.get("r2x"), "r2y": fit.get("r2y"),
-                    "n_used": fit.get("n_used"),
-                    "forced": bool(force and not fit.get("ok")),
-                    "applied_at": time.time(),
-                    "verified": True,
-                },
-            })
+            applied["verified"] = True
+            self._save_state({"applied": applied})
             forced = "(force適用)" if (force and not fit.get("ok")) else ""
             self._set_message(
                 f"適用・読み戻し照合OK{forced}: K=[{m00:.1f} {m01:.1f}; "

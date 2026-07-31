@@ -228,6 +228,18 @@ select:focus, input:focus { outline: 1px solid var(--accent); }
   gap: 10px;
   margin-bottom: 16px;
 }
+/* プリフライト・インターロック(P1-2): 離陸ボタン直下のバッジ行 */
+.interlock-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -8px 0 12px;
+}
+.interlock-row .interlock-msg {
+  flex: 1;
+  font-size: 11px;
+  color: var(--text-dim);
+}
 .btn-start, .btn-stop {
   flex: 1;
   padding: 12px 0;

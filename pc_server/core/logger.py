@@ -10,6 +10,11 @@
   列定義は docs/LOG_STRUCTURE.md(現行 v6 = 136列)と1対1で対応させること。
 - 値が未取得の列は空文字。0/1 フラグは文字列 "0"/"1"。
 - 経過時間は time.monotonic() 基準。timestamp 列のみ壁時計(ISO8601)。
+- プリロール(P2b、2026-07-31): ファイル閉鎖中に届いた行を直近 pre_roll_s
+  (既定3s)ぶんリングバッファへ保持し、start() 時に先頭へフラッシュする
+  (アーム前区間 — 地上アンカー・I_idle・Δb_z 復元に必須 — が必ずログに
+  入る。FLIGHT_ANALYSIS_20260731.md §7-B-3)。elapsed_time の基点(0)は
+  プリロール先頭行の時刻、START トリガー時刻は meta.json の pre_roll_s。
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import csv
 import json
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -114,6 +120,11 @@ COLUMNS: tuple[str, ...] = (
 FLOAT_DECIMALS = 6   # CSV 上の float 桁数
 
 MS_PER_S = 1000.0
+
+# プリロール既定値 [s](P2b)。server.json logging.pre_roll_s で上書き可。
+# ≥3s: 地上アンカー(EKF2)・I_idle・Δb_z 復元に必要なアーム前区間
+# (FLIGHT_ANALYSIS_20260731.md §7-B-3「ログはアーム前2s以上から開始」+余裕)
+PRE_ROLL_DEFAULT_S = 3.0
 
 # TLM_CTRL の PID 成分列の軸/項の並び(§2 契約: roll,pitch,yaw × p,i,d)
 _PID_AXES = ("roll", "pitch", "yaw")
@@ -249,15 +260,23 @@ def _format_cell(value) -> str:
 class FlightLogger:
     """CSV フライトロガー。log_row() はスレッド安全(50Hz送信スレッドから呼ぶ)。"""
 
-    def __init__(self, logs_dir: Path = LOGS_DIR, flush_every_rows: int = 50) -> None:
+    def __init__(self, logs_dir: Path = LOGS_DIR, flush_every_rows: int = 50,
+                 pre_roll_s: float = PRE_ROLL_DEFAULT_S) -> None:
         self._logs_dir = Path(logs_dir)
         self._flush_every_rows = flush_every_rows
+        self._pre_roll_s = max(0.0, float(pre_roll_s))
         self._lock = threading.Lock()
         self._file = None
         self._writer: Optional[csv.writer] = None
         self._file_path: Optional[Path] = None
         self._t0: Optional[float] = None
         self._rows_since_flush = 0
+        # プリロール・リングバッファ(P2b): ファイル閉鎖中に届いた行を
+        # (iso_timestamp, t_mono, row) で直近 pre_roll_s ぶん保持する。
+        # stop() では消さない(トリガー前区間の保持が目的のため)
+        self._preroll: deque = deque()
+        # meta.json サイドカーの内容(update_metadata の追記ベース)
+        self._metadata: Optional[dict] = None
 
     @property
     def active(self) -> bool:
@@ -280,6 +299,11 @@ class FlightLogger:
         (適用中の MoCap マッピング等 — 「このログはどのフレームで取った
         ものか」を CSV 列契約を変えずに恒久記録する)。書き込み失敗は
         ログ本体を妨げない(サイドカーは診断情報であり必須ではない)。
+
+        P2b: 閉鎖中にバッファされたプリロール行(直近 pre_roll_s 以内)を
+        ヘッダ直後へフラッシュする。elapsed_time の基点(0)はプリロール
+        先頭行の時刻となり、開始トリガー時点は metadata の ``pre_roll_s``
+        (トリガーまでの秒数)として記録される(プリロール行なしなら 0)。
         """
         self.stop()
         self._logs_dir.mkdir(parents=True, exist_ok=True)
@@ -290,19 +314,60 @@ class FlightLogger:
             self._file = open(path, "w", newline="", encoding="utf-8")
             self._writer = csv.writer(self._file)
             self._writer.writerow(COLUMNS)
+            # P2b: プリロール行のフラッシュ(期限切れは捨てる。log_row 側の
+            # 追記時 evict は「最後の追記から」の経過を見ないため、ここでの
+            # トリガー時刻基準の再フィルタが正)
+            trigger_mono = time.monotonic()
+            preroll = [entry for entry in self._preroll
+                       if trigger_mono - entry[1] <= self._pre_roll_s]
+            self._preroll.clear()
+            t0 = preroll[0][1] if preroll else trigger_mono
+            for iso_ts, t_mono, row in preroll:
+                values = dict(row)
+                values.setdefault("timestamp", iso_ts)
+                values.setdefault("elapsed_time", t_mono - t0)
+                self._writer.writerow(
+                    [_format_cell(values.get(col)) for col in COLUMNS])
             self._file.flush()
             self._file_path = path
-            self._t0 = time.monotonic()
+            self._t0 = t0
             self._rows_since_flush = 0
+            if metadata is not None:
+                metadata = dict(metadata)
+                metadata["pre_roll_s"] = round(trigger_mono - t0, 3)
+            self._metadata = dict(metadata) if metadata is not None else None
         if metadata is not None:
-            meta_path = path.with_suffix(".meta.json")
-            try:
-                with open(meta_path, "w", encoding="utf-8") as fp:
-                    json.dump(metadata, fp, ensure_ascii=False, indent=2)
-                    fp.write("\n")
-            except OSError:
-                pass
+            self._write_metadata(path.with_suffix(".meta.json"), metadata)
         return path
+
+    @staticmethod
+    def _write_metadata(meta_path: Path, metadata: dict) -> None:
+        """サイドカー書き出し。失敗はログ本体を妨げない(診断情報のため)。"""
+        try:
+            with open(meta_path, "w", encoding="utf-8") as fp:
+                json.dump(metadata, fp, ensure_ascii=False, indent=2)
+                fp.write("\n")
+        except OSError:
+            pass
+
+    def update_metadata(self, updates: dict) -> None:
+        """開いているログの meta.json サイドカーへキーを追記・上書きする。
+
+        ログ開始後に確定する値(例: アーム相対ヨーアンカーはアーム遷移で
+        ラッチされる — 開始時点では未定)を恒久記録するための追記経路。
+        トップレベルキーの浅いマージで全体を書き直す。ログが閉じていれば
+        何もしない。50Hz 送信スレッドから呼ばれ得るが、書くのは小さな
+        JSON 1個で頻度はイベント時のみ(log_row の flush と同等の負荷)。
+        """
+        with self._lock:
+            if self._file is None or self._file_path is None:
+                return
+            if self._metadata is None:
+                self._metadata = {}
+            self._metadata.update(updates)
+            metadata = dict(self._metadata)
+            meta_path = self._file_path.with_suffix(".meta.json")
+        self._write_metadata(meta_path, metadata)
 
     def stop(self) -> None:
         with self._lock:
@@ -311,6 +376,7 @@ class FlightLogger:
             self._writer = None
             self._file_path = None
             self._t0 = None
+            self._metadata = None
         if file is not None:
             try:
                 file.close()
@@ -321,9 +387,20 @@ class FlightLogger:
         """1行を書き込む。row は COLUMNS のキーを持つ dict(欠損キーは空欄)。
 
         timestamp / elapsed_time は本メソッドが自動付与する。
+        ファイル閉鎖中はプリロール・リングバッファへ保持する(P2b。
+        直近 pre_roll_s ぶん。次の start() で先頭へフラッシュされる)。
         """
         with self._lock:
             if self._writer is None or self._t0 is None:
+                if self._pre_roll_s <= 0.0:
+                    return
+                t_mono = time.monotonic()
+                self._preroll.append(
+                    (datetime.now().isoformat(timespec="milliseconds"),
+                     t_mono, dict(row)))
+                while (self._preroll
+                       and t_mono - self._preroll[0][1] > self._pre_roll_s):
+                    self._preroll.popleft()
                 return
             values = dict(row)
             values.setdefault("timestamp", datetime.now().isoformat(timespec="milliseconds"))

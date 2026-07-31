@@ -57,6 +57,12 @@
         <button class="btn btn-start" data-action="start">START<span class="btn-jp">離陸</span></button>
         <button class="btn btn-stop" data-action="stop">STOP<span class="btn-jp">着陸</span></button>
       </div>
+      <!-- プリフライト・インターロック(P1-2): ヨー基準整列バッジ+強制離陸 -->
+      <div class="interlock-row">
+        <span class="badge b-dim" data-interlock-badge>整列 --</span>
+        <span class="interlock-msg" data-interlock-msg></span>
+        <button class="btn btn-small hidden" data-action="force-start" title="インターロック未成立のまま CMD_START を送ります(明示的 override)">強制離陸</button>
+      </div>
 
       <div class="slider-block">
         <div class="slider-row">
@@ -89,6 +95,12 @@
       <div class="startstop">
         <button class="btn btn-start" data-action="start">START<span class="btn-jp">離陸</span></button>
         <button class="btn btn-stop" data-action="stop">STOP<span class="btn-jp">着陸</span></button>
+      </div>
+      <!-- プリフライト・インターロック(P1-2): ヨー基準整列バッジ+強制離陸 -->
+      <div class="interlock-row">
+        <span class="badge b-dim" data-interlock-badge>整列 --</span>
+        <span class="interlock-msg" data-interlock-msg></span>
+        <button class="btn btn-small hidden" data-action="force-start" title="インターロック未成立のまま CMD_START を送ります(明示的 override)">強制離陸</button>
       </div>
 
       <div class="target-block">
@@ -469,6 +481,7 @@
             <span>EKF2 &psi; / innov</span><span id="ekf2YawInfo">--</span>
             <span>EKF2 b_m [&micro;T]</span><span id="ekf2BmInfo">--</span>
             <span>EKF2 status / gate</span><span id="ekf2StatusInfo">--</span>
+            <span>ヨー観測融合</span><span id="ekf2FusedInfo">--</span>
           </div>
           <hr class="exp-sep">
           <div class="ff-quick-row">

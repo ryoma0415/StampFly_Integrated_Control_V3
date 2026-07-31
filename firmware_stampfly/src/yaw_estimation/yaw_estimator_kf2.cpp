@@ -41,6 +41,14 @@ void YawEstimatorKf2::resetYawObsState() {
     time_since_yaw_accept_s_ = 1.0e6f;
     yaw_reject_count_ = 0;
     yaw_fusion_stopped_ = false;
+    // ソフト再捕捉状態機械 (FF_EKF2_YAW_RECAPTURE_*) も初期状態へ
+    time_since_yaw_stop_s_ = 0.0f;
+    yaw_obs_gap_s_ = 0.0f;
+    yaw_recapture_streak_ = 0;
+    yaw_recapture_innov0_rad_ = 0.0f;
+    yaw_recapture_window_s_ = 0.0f;
+    yaw_recapture_active_ = false;
+    yaw_recapture_hold_s_ = 0.0f;
 }
 
 void YawEstimatorKf2::reanchor(float psi0_rad, float b0h_x, float b0h_y, const MagVector& b0_full) {
@@ -120,6 +128,11 @@ void YawEstimatorKf2::predict(
     //   喪失 (≥ 同): q_bm×FF_EKF2_Q_BM_LOST_FACTOR (準凍結ホールド =
     //   学習済み b_m でコースト)
     time_since_yaw_accept_s_ += dt_s;
+    // ソフト再捕捉の計時: 観測間隔 (updateYawObs で消費) と段階1の経過
+    yaw_obs_gap_s_ += dt_s;
+    if (yaw_fusion_stopped_) {
+        time_since_yaw_stop_s_ += dt_s;
+    }
     tau_rw_mode_ = time_since_yaw_accept_s_ < FF_EKF2_YAW_OBS_HEALTHY_S;
     const float q_bm = tau_rw_mode_
         ? FF_EKF_Q_BM_UT2_S
@@ -417,29 +430,92 @@ void YawEstimatorKf2::updateYawObs(float psi_meas_rad, bool low_trust, float dt_
     // H=[1,0,0,0]、y=wrapPi(ψ_meas−ψ) のスカラー逐次更新。4状態すべてに
     // 効かせる — b_g/b_m は P の相関経由で可観測化される (磁気2式+ヨー1式で
     // 一定ヘディングのホバ中でも b_m の2自由度が完全可観測になる。これが本体)。
-    (void)dt_s;  // 契約シグネチャ互換 (現状の数式では未使用)
+    (void)dt_s;  // 契約シグネチャ互換 (観測間隔は yaw_obs_gap_s_ で実測)
     if (!anchor_valid_ || !isfinite(psi_meas_rad)) {
         return;
     }
+    // 観測間隔 (predict 側で積算した実時間)。dt_s は 400Hz tick の周期であって
+    // 観測間隔 (実効50Hz) ではないため、再捕捉の窓/ホールド計時には使わない。
+    const float obs_dt = yaw_obs_gap_s_;
+    yaw_obs_gap_s_ = 0.0f;
 
     const float y = wrapPi(psi_meas_rad - x_[0]);
     yaw_innov_rad_ = y;  // 棄却・融合停止中もテレメトリへ残す (契約 §2.1-1)
 
     // ゲート: |y| > 30° は棄却+連続棄却カウンタ。連続 N≥25 で融合停止ラッチ
-    // (基準ヨーソースの座標系不整合などの持続異常から ψ を守る。解除は
-    //  reanchor / reseedYaw — ψ 基準を取り直すまで融合を再開しない設計判断)。
+    // (基準ヨーソースの座標系不整合などの持続異常から ψ を守る)。ラッチの
+    // 解除は reanchor / reseedYaw、またはソフト再捕捉状態機械
+    // (yaw_config.hpp FF_EKF2_YAW_RECAPTURE_*。FLIGHT_ANALYSIS_20260731:
+    //  飛行中の恒久ラッチ発動 = fused 0% への回復経路)。
     if (fabsf(y) > FF_EKF2_YAW_GATE_RAD) {
         if (yaw_reject_count_ < 255) {
             yaw_reject_count_++;
         }
-        if (yaw_reject_count_ >= FF_EKF2_YAW_GATE_STOP_COUNT) {
+        if (yaw_reject_count_ >= FF_EKF2_YAW_GATE_STOP_COUNT && !yaw_fusion_stopped_) {
             yaw_fusion_stopped_ = true;
+            time_since_yaw_stop_s_ = 0.0f;  // 再捕捉 段階1の起点
+        }
+        // ゲート外 → 段階2の窓は破棄。制限融合中 (段階3) なら段階1へ戻る
+        // (5s 待機からやり直し)
+        yaw_recapture_streak_ = 0;
+        yaw_recapture_window_s_ = 0.0f;
+        if (yaw_recapture_active_) {
+            yaw_recapture_active_ = false;
+            yaw_recapture_hold_s_ = 0.0f;
+            time_since_yaw_stop_s_ = 0.0f;
         }
         return;
     }
     yaw_reject_count_ = 0;
-    if (yaw_fusion_stopped_) {
-        return;  // ラッチ中はイノベーション更新のみ
+
+    if (yaw_fusion_stopped_ && !yaw_recapture_active_) {
+        // ---- ソフト再捕捉 段階1→2 (融合はまだ行わない) ----
+        // 段階1: stopped 遷移 (または段階3からの転落) から 5s は再入不能
+        // (誤基準のまま瞬間的にゲート内へ入るケースの様子見)。
+        if (time_since_yaw_stop_s_ < FF_EKF2_YAW_RECAPTURE_AFTER_S) {
+            yaw_recapture_streak_ = 0;
+            yaw_recapture_window_s_ = 0.0f;
+            return;
+        }
+        // 段階2: ゲート内が M 観測連続、かつ窓のイノベーションドリフトレート
+        // が閾値未満なら段階3 (制限融合) へ。観測ストリーム断 (>1s) は
+        // 「連続」が切れたとみなし窓を貯め直す (防御的継続性検査)。
+        if (obs_dt > FF_EKF2_YAW_FRESH_WINDOW_S) {
+            yaw_recapture_streak_ = 0;
+        }
+        if (yaw_recapture_streak_ == 0) {
+            yaw_recapture_innov0_rad_ = y;
+            yaw_recapture_window_s_ = 0.0f;
+        } else {
+            yaw_recapture_window_s_ += obs_dt;
+        }
+        yaw_recapture_streak_++;
+        if (yaw_recapture_streak_ >= FF_EKF2_YAW_RECAPTURE_M) {
+            // ドリフトレートは窓全体の平均 |Δinnov|/T (観測毎差分だと基準ヨー
+            // のフレームジッタ ~0.5°/20ms=25°/s で誤遮断するため)。誤基準
+            // (鏡像) のまま回頭中は d(innov)/dt≈2ψ̇ がここで遮断される。
+            const float drift_rad_s = yaw_recapture_window_s_ > 1.0e-3f
+                ? fabsf(wrapPi(y - yaw_recapture_innov0_rad_)) / yaw_recapture_window_s_
+                : 1.0e6f;
+            if (drift_rad_s < FF_EKF2_YAW_RECAPTURE_DRIFT_RAD_S) {
+                yaw_recapture_active_ = true;  // 段階3: 制限融合モードへ
+                yaw_recapture_hold_s_ = 0.0f;
+            }
+            // 判定は窓単位: 不合格なら窓を貯め直す
+            yaw_recapture_streak_ = 0;
+            yaw_recapture_window_s_ = 0.0f;
+        }
+        return;
+    }
+    if (yaw_recapture_active_ && obs_dt > FF_EKF2_YAW_FRESH_WINDOW_S) {
+        // 段階3中の観測ストリーム断: ゲート内「継続」を確認できないため
+        // 段階1へ戻る (防御的継続性検査)
+        yaw_recapture_active_ = false;
+        yaw_recapture_hold_s_ = 0.0f;
+        yaw_recapture_streak_ = 0;
+        yaw_recapture_window_s_ = 0.0f;
+        time_since_yaw_stop_s_ = 0.0f;
+        return;
     }
 
     // R_ψ = (2°)² (通常) / (6°)² (low_trust。移動ベースヨー等の低信頼基準)
@@ -467,40 +543,75 @@ void YawEstimatorKf2::updateYawObs(float psi_meas_rad, bool low_trust, float dt_
         dx0 = -FF_EKF_RECAPTURE_MAX_STEP_RAD;
         clamped = true;
     }
-    if (clamped) {
+    if (clamped || yaw_recapture_active_) {
         // クランプ発動時は制限付き更新へ切替 (磁気更新の recapture と同流儀 —
         // yaw_estimator_kf.cpp の「制限付き更新」コメント参照):
         //   - バイアス行 (b_g/b_m) の K を 0 化。reject-inflation で P00 が膨張し
         //     磁気更新由来の P02/P03 相関が stale なまま大イノベーション (最大
         //     30° = ゲート内) が来ると、フル K[r]·y がバイアスを一撃で蹴り
         //     誤配分が数十秒残るため (EKF1 recapture と同じ既知故障モード)。
-        //   - ψ 行はクランプ相当の実効ゲイン K0_eff = Δψ_clamp/y に置換し、
-        //     状態と P 更新で同じゲインを使って整合を保つ (ψ が 3° しか動いて
-        //     いないのに P00 が「全補正済み」に収縮する不整合を防ぐ。
-        //     K0_eff < K0 なので P は保守側 = 安全)。
-        K[0] = dx0 / y;  // クランプ発動 ⇒ |y| > 3° (K0≤1) のためゼロ除算なし
+        //   - ψ 行はクランプ相当の実効ゲイン K0_eff = Δψ_clamp/y に置換
+        //     (ψ が 3° しか動いていないのに P00 が「全補正済み」に収縮する
+        //     不整合を防ぐ)。
+        // ソフト再捕捉の制限融合モード (段階3) 中は未クランプでも常時この
+        // 経路 (基準の信頼が回復するまで誤補正をバイアスへ配分しない)。
+        if (clamped) {
+            K[0] = dx0 / y;  // クランプ発動 ⇒ |y| > 3° (K0≤1) のためゼロ除算なし
+        }
         K[1] = 0.0f;
         K[2] = 0.0f;
         K[3] = 0.0f;
-    }
 
-    x_[0] = wrapPi(x_[0] + dx0);
-    x_[1] += K[1] * y;
-    x_[2] += K[2] * y;
-    x_[3] += K[3] * y;
+        x_[0] = wrapPi(x_[0] + dx0);
 
-    // P = (I − K·H)·P⁻,  K·H は第0列のみ非零 → (K·H·P)[r][c] = K[r]·P[0][c]
-    float newP[4][4];
-    for (uint8_t r = 0; r < 4; r++) {
-        for (uint8_t c = 0; c < 4; c++) {
-            newP[r][c] = P_[r][c] - K[r] * P_[0][c];
+        // P 更新は Joseph 形 P=(I−KH)P(I−KH)ᵀ+KRKᵀ の K=[k0,0,0,0] 特殊化:
+        //   P00←(1−k0)²P00+k0²R_ψ, P0c←(1−k0)P0c (c≥1), 他は不変。
+        // 劣最適ゲイン (バイアス行 K=0) に簡略形 (I−KH)P を使うと ψ 行だけが
+        // 収縮して stale な P02/P03 相関が相対的に残り、反復適用で P が
+        // 非正定 (P00<0 → S≤0 → 融合恒久停止) に転落する (制限融合モードの
+        // リプレイ実証で再現)。Joseph 形は任意ゲインで PSD を保存する。
+        const float k0 = K[0];
+        const float omk = 1.0f - k0;
+        for (uint8_t c = 1; c < 4; c++) {
+            P_[0][c] *= omk;
+            P_[c][0] = P_[0][c];
+        }
+        P_[0][0] = omk * omk * P_[0][0] + k0 * k0 * r_psi;
+    } else {
+        x_[0] = wrapPi(x_[0] + dx0);
+        x_[1] += K[1] * y;
+        x_[2] += K[2] * y;
+        x_[3] += K[3] * y;
+
+        // P = (I − K·H)·P⁻,  K·H は第0列のみ非零 → (K·H·P)[r][c] = K[r]·P[0][c]
+        // (最適ゲインの標準形。制限付き更新は上の Joseph 形を使う)
+        float newP[4][4];
+        for (uint8_t r = 0; r < 4; r++) {
+            for (uint8_t c = 0; c < 4; c++) {
+                newP[r][c] = P_[r][c] - K[r] * P_[0][c];
+            }
+        }
+        // 対称化 (数値誤差の蓄積対策。磁気更新と同じ流儀)
+        for (uint8_t r = 0; r < 4; r++) {
+            for (uint8_t c = 0; c < 4; c++) {
+                P_[r][c] = 0.5f * (newP[r][c] + newP[c][r]);
+            }
         }
     }
-    // 対称化 (数値誤差の蓄積対策。磁気更新と同じ流儀)
-    for (uint8_t r = 0; r < 4; r++) {
-        for (uint8_t c = 0; c < 4; c++) {
-            P_[r][c] = 0.5f * (newP[r][c] + newP[c][r]);
+
+    if (yaw_recapture_active_) {
+        // ---- 段階3→4: 制限融合中は「受理」に数えない ----
+        // time_since_yaw_accept_ は進めたまま (= q_bm ホールド維持・
+        // yaw_obs_fused / flightReanchor 条件は成立させない。磁気更新
+        // recapture が time_since_accept_ を維持するのと同流儀)。
+        // ゲート内のまま FF_EKF2_YAW_RECAPTURE_HOLD_S 継続でラッチ完全解除。
+        yaw_recapture_hold_s_ += obs_dt;
+        if (yaw_recapture_hold_s_ >= FF_EKF2_YAW_RECAPTURE_HOLD_S) {
+            yaw_fusion_stopped_ = false;
+            yaw_recapture_active_ = false;
+            yaw_recapture_hold_s_ = 0.0f;
         }
+        return;
     }
 
     time_since_yaw_accept_s_ = 0.0f;  // τ_bm 適応 (§2.1-2)・status bit1 の根拠

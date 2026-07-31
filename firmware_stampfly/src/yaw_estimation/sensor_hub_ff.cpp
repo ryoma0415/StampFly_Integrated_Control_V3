@@ -683,7 +683,7 @@ uint8_t sensorHubFfEkf2Status(uint32_t now_ms) {
     // TLM_STATE ekf2_status(契約 §1.1): bit0 yaw_obs_fresh(受信<1s) /
     // bit1 yaw_obs_fused(直近0.5s内受理) / bit2 flight_anchor_done /
     // bit3 tau_rw_mode / bit4 bm_frozen / bit5 healthy2 /
-    // bit6 yaw_obs_low_trust / bit7 予約。
+    // bit6 yaw_obs_low_trust / bit7 yaw_recapture(ヨー観測再捕捉中=制限融合)。
     using stampfly::TlmState;
     const YawEstimatorKf2& kf2 = g_yaw_est.yaw_kf2;
     uint8_t status = 0;
@@ -709,6 +709,9 @@ uint8_t sensorHubFfEkf2Status(uint32_t now_ms) {
     }
     if (g_yaw_obs_last_low_trust) {
         status |= TlmState::EKF2_STATUS_YAW_OBS_LOW_TRUST;
+    }
+    if (kf2.yawRecaptureActive()) {
+        status |= TlmState::EKF2_STATUS_YAW_RECAPTURE;
     }
     return status;
 }

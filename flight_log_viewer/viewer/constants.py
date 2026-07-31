@@ -161,7 +161,7 @@ EKF2_STATUS_YAW_OBS_FRESH = 1 << 0  # ヨー観測受信 <1s
 EKF2_STATUS_YAW_OBS_FUSED = 1 << 1  # 直近 0.5s 内に受理
 
 # tlm_ekf2_status のビット(表示名, 説明, 描画色)を
-# bit0 から順に並べる(bit7 は予約)
+# bit0 から順に並べる
 EKF2_STATUS_BITS: tuple[tuple[str, str, str], ...] = (
     ("yaw_obs_fresh", "ヨー観測受信 <1s", "#22c55e"),
     ("yaw_obs_fused", "直近 0.5s 内に受理", "#0ea5e9"),
@@ -170,6 +170,7 @@ EKF2_STATUS_BITS: tuple[tuple[str, str, str], ...] = (
     ("bm_frozen", "b_m 凍結", "#dc2626"),
     ("healthy2", "EKF2 健全", "#16a34a"),
     ("low_trust", "ヨー観測低信頼(R_ψ 低信頼プリセット)", "#64748b"),
+    ("yaw_recapture", "ヨー観測再捕捉中(制限融合モード)", "#ec4899"),
 )
 
 # tlm_flow_status(v6・契約 §1.1)のビット(表示名, 説明, 描画色)。

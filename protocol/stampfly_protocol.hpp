@@ -1010,7 +1010,9 @@ struct TlmState {
   static constexpr uint8_t EKF2_STATUS_TAU_RW_MODE = 0x08;         // bit3: q_bm RWモード
   static constexpr uint8_t EKF2_STATUS_BM_FROZEN = 0x10;           // bit4
   static constexpr uint8_t EKF2_STATUS_HEALTHY2 = 0x20;            // bit5
-  static constexpr uint8_t EKF2_STATUS_YAW_OBS_LOW_TRUST = 0x40;   // bit6(bit7 予約)
+  static constexpr uint8_t EKF2_STATUS_YAW_OBS_LOW_TRUST = 0x40;   // bit6
+  static constexpr uint8_t EKF2_STATUS_YAW_RECAPTURE = 0x80;       // bit7: ヨー観測再捕捉中
+                                                                   // (制限融合モード)
   // flow_status ビット定義(MAG_AUTOTUNE_DESIGN.md §1.1)
   static constexpr uint8_t FLOW_STATUS_SENSOR_OK = 0x01;    // bit0
   static constexpr uint8_t FLOW_STATUS_BURST_OK = 0x02;     // bit1

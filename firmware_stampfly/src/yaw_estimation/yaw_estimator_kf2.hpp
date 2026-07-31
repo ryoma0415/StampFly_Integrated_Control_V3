@@ -18,6 +18,9 @@
 //     |y|>30° ゲート+連続棄却 N≥25 で融合停止ラッチ。Δψ は
 //     FF_EKF_RECAPTURE_MAX_STEP_RAD(3°)/更新にクランプ (クランプ発動時は
 //     recapture と同流儀の制限付き更新: バイアス行 K=0+ψ行は実効ゲイン)。
+//     ラッチは reanchor/reseedYaw に加えソフト再捕捉状態機械
+//     (yaw_config.hpp FF_EKF2_YAW_RECAPTURE_*: 5s待機→ゲート内12観測連続+
+//     窓ドリフト<20°/s→制限融合2s継続で完全解除) で飛行中も解除可能。
 //  2. τ_bm 適応: Gauss-Markov ゼロ回帰を廃止 (a=1固定)。q_bm は yaw_obs 健全
 //     (最終受理<1.0s) で現行値 (ランダムウォーク)、喪失で ×0.1 (準凍結ホールド)。
 //  3. 飛行状態再アンカー flightReanchor(): B0 を飛行中 b_corr_filt 平均 (B0f) へ
@@ -85,8 +88,11 @@ public:
     float timeSinceYawAccept() const { return time_since_yaw_accept_s_; }
     // q_bm ランダムウォークモード中か (ekf2_status bit3 = tau_rw_mode)
     bool tauRwMode() const { return tau_rw_mode_; }
-    // ヨー観測の融合停止ラッチ中か (連続棄却 N≥25。解除は reanchor/reseedYaw)
+    // ヨー観測の融合停止ラッチ中か (連続棄却 N≥25。解除は reanchor/reseedYaw
+    // またはソフト再捕捉の完全解除)
     bool yawFusionStopped() const { return yaw_fusion_stopped_; }
+    // ヨー観測再捕捉中 = 制限融合モード (段階3) か (ekf2_status bit7)
+    bool yawRecaptureActive() const { return yaw_recapture_active_; }
 
 private:
     void resetCovariance();
@@ -113,6 +119,15 @@ private:
     uint8_t yaw_reject_count_ = 0;            // ヨー観測の連続棄却カウンタ
     bool yaw_fusion_stopped_ = false;         // 連続棄却 N≥25 の融合停止ラッチ
     bool tau_rw_mode_ = false;                // q_bm ランダムウォークモード中
+
+    // ---- ヨー観測ソフト再捕捉 (FF_EKF2_YAW_RECAPTURE_* の状態機械) ----
+    float time_since_yaw_stop_s_ = 0.0f;      // stopped遷移(段階1再入)からの経過
+    float yaw_obs_gap_s_ = 0.0f;              // 直近ヨー観測からの経過(観測間隔計測)
+    uint8_t yaw_recapture_streak_ = 0;        // 段階2: ゲート内連続観測カウンタ
+    float yaw_recapture_innov0_rad_ = 0.0f;   // 段階2窓の先頭イノベーション
+    float yaw_recapture_window_s_ = 0.0f;     // 段階2窓の経過時間
+    bool yaw_recapture_active_ = false;       // 段階3: 制限融合モード中 (bit7)
+    float yaw_recapture_hold_s_ = 0.0f;       // 段階3: ゲート内継続時間
 };
 
 #endif

@@ -1,0 +1,216 @@
+{
+ "R0_noyaw": {
+  "mode": "v6-full",
+  "n_frames": 1297,
+  "n_obs": 0,
+  "fused_pct": 0.0,
+  "latch_t": null,
+  "latch_release_ts": [],
+  "align_innov_deg": null,
+  "err_vs_ref": {
+   "frame": "truth",
+   "raw_rms": 11.515529382269001,
+   "raw_mean": 4.4346126409544055,
+   "const_off_deg": 4.393390181369078,
+   "shape_rms": 10.627479803310017,
+   "shape_max": 24.807545836550673
+  },
+  "vs_logged_ekf2": {
+   "raw_rms": 10.666137154525867
+  },
+  "innov": {
+   "n_finite": 0,
+   "rms_when_accepted": null,
+   "max_when_accepted": null
+  },
+  "bm_final": [
+   1.5235091617676217,
+   -10.181298556763108
+  ],
+  "gate_reject_ratio": 0.7825751734772552,
+  "flight_anchor_t": null,
+  "warnings": [
+   "地上窓が無いため I_idle はプロファイル iid で代用",
+   "地上アンカー窓なし: 先頭フレームの b_cal でアンカー近似"
+  ]
+ },
+ "R1_deadlock": {
+  "mode": "v6-full",
+  "n_frames": 1297,
+  "n_obs": 1297,
+  "fused_pct": 0.0,
+  "latch_t": 243.952,
+  "latch_release_ts": [],
+  "align_innov_deg": null,
+  "err_vs_ref": {
+   "frame": "truth-90.434",
+   "raw_rms": 95.46200967975712,
+   "raw_mean": 94.86861264095441,
+   "const_off_deg": 94.82739018136908,
+   "shape_rms": 10.627479803310017,
+   "shape_max": 24.807545836550673
+  },
+  "vs_logged_ekf2": {
+   "raw_rms": 10.666137154525867
+  },
+  "innov": {
+   "n_finite": 1297,
+   "rms_when_accepted": null,
+   "max_when_accepted": null
+  },
+  "bm_final": [
+   1.5235091617676217,
+   -10.181298556763108
+  ],
+  "gate_reject_ratio": 0.7825751734772552,
+  "flight_anchor_t": null,
+  "warnings": [
+   "地上窓が無いため I_idle はプロファイル iid で代用",
+   "地上アンカー窓なし: 先頭フレームの b_cal でアンカー近似"
+  ],
+  "stopped_spans": [
+   [
+    243.95,
+    null
+   ]
+  ],
+  "stopped_frac_of_obs": 0.9814957594448728
+ },
+ "R2_correct": {
+  "mode": "v6-full",
+  "n_frames": 1297,
+  "n_obs": 1297,
+  "fused_pct": 100.0,
+  "latch_t": null,
+  "latch_release_ts": [],
+  "align_innov_deg": null,
+  "err_vs_ref": {
+   "frame": "truth",
+   "raw_rms": 1.689205688215866,
+   "raw_mean": 0.06756011592235701,
+   "const_off_deg": 0.06777537605073342,
+   "shape_rms": 1.6878541211177926,
+   "shape_max": 4.538939701072223
+  },
+  "vs_logged_ekf2": {
+   "raw_rms": 9.226832408178577
+  },
+  "innov": {
+   "n_finite": 1297,
+   "rms_when_accepted": 1.6026908342651172,
+   "max_when_accepted": 4.499013784025522
+  },
+  "bm_final": [
+   -0.3807700638805375,
+   -9.933994670943026
+  ],
+  "gate_reject_ratio": 0.2228218966846569,
+  "flight_anchor_t": 260.569,
+  "warnings": [
+   "地上窓が無いため I_idle はプロファイル iid で代用",
+   "地上アンカー窓なし: 先頭フレームの b_cal でアンカー近似"
+  ]
+ },
+ "R3a_fix_asis": {
+  "mode": "v6-full",
+  "n_frames": 1297,
+  "n_obs": 1297,
+  "fused_pct": 43.09946029298381,
+  "latch_t": 268.05,
+  "latch_release_ts": [],
+  "align_innov_deg": -89.45358497471831,
+  "err_vs_ref": {
+   "frame": "truth-90.434",
+   "raw_rms": 2.0343760629601,
+   "raw_mean": -0.9846443897117307,
+   "const_off_deg": -0.9842429038077194,
+   "shape_rms": 1.7802139064014704,
+   "shape_max": 5.328172085879572
+  },
+  "vs_logged_ekf2": {
+   "raw_rms": 87.13204853579194
+  },
+  "innov": {
+   "n_finite": 1297,
+   "rms_when_accepted": 0.12241998930480427,
+   "max_when_accepted": 0.6144721927931246
+  },
+  "bm_final": [
+   -1.5910965308248854,
+   -7.7571272462383485
+  ],
+  "gate_reject_ratio": 0.3184271395528142,
+  "flight_anchor_t": 260.569,
+  "warnings": [
+   "地上窓が無いため I_idle はプロファイル iid で代用",
+   "地上アンカー窓なし: 先頭フレームの b_cal でアンカー近似"
+  ],
+  "stopped_spans": [
+   [
+    268.05,
+    null
+   ]
+  ],
+  "stopped_frac_of_obs": 0.5451040863531226
+ },
+ "R3b_fix_clean": {
+  "mode": "v6-full",
+  "n_frames": 1297,
+  "n_obs": 1297,
+  "fused_pct": 100.0,
+  "latch_t": null,
+  "latch_release_ts": [],
+  "align_innov_deg": -89.4539270474419,
+  "err_vs_ref": {
+   "frame": "truth-90.434",
+   "raw_rms": 1.6887162729331373,
+   "raw_mean": 0.08534724280345439,
+   "const_off_deg": 0.08556641827304765,
+   "shape_rms": 1.6865581954539608,
+   "shape_max": 4.5602325533971
+  },
+  "vs_logged_ekf2": {
+   "raw_rms": 86.05793816798575
+  },
+  "innov": {
+   "n_finite": 1297,
+   "rms_when_accepted": 1.6021471479842728,
+   "max_when_accepted": 4.49874821147242
+  },
+  "bm_final": [
+   -0.3791699124806678,
+   -9.934426735844971
+  ],
+  "gate_reject_ratio": 0.3138010794140324,
+  "flight_anchor_t": 260.569,
+  "warnings": [
+   "地上窓が無いため I_idle はプロファイル iid で代用",
+   "地上アンカー窓なし: 先頭フレームの b_cal でアンカー近似"
+  ]
+ },
+ "code_identity_R0": {
+  "raw_rms": 10.033898575845752,
+  "raw_max": 25.432442603520542,
+  "init_off": 0.0,
+  "offrm_rms": 10.033898575845752,
+  "bm_final_replay": [
+   1.5235091617676217,
+   -10.181298556763108
+  ],
+  "bm_final_logged": [
+   0.410528,
+   -11.227594
+  ],
+  "gate_match_pct": 87.4325366229761,
+  "db_hat_x_match_rms_ut": 0.3332329263839045,
+  "db_hat_y_match_rms_ut": 0.7734901427750241,
+  "db_hat_scale_ratio_x": 0.999715059227708
+ },
+ "deadlock_reproduction": {
+  "replay_fused_pct": 0.0,
+  "flight_fused_pct": 0.0,
+  "replay_latch_t": 243.952,
+  "flight_latch_t": 1.031,
+  "innov_first": -89.45358497471831
+ }
+}

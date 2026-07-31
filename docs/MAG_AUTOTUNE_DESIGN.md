@@ -31,7 +31,7 @@
 | 159 | f32 | ekf2_bm_x_ut | EKF2のb_mx |
 | 163 | f32 | ekf2_bm_y_ut | EKF2のb_my |
 | 167 | f32 | ekf2_yaw_innov_rad | 直近ヨー観測イノベーション(未受信時0) |
-| 171 | u8 | ekf2_status | bit0 yaw_obs_fresh(<1s) / bit1 yaw_obs_fused(直近0.5s内受理) / bit2 flight_anchor_done / bit3 tau_rw_mode / bit4 bm_frozen / bit5 healthy2 / bit6 yaw_obs_low_trust / bit7 予約 |
+| 171 | u8 | ekf2_status | bit0 yaw_obs_fresh(<1s) / bit1 yaw_obs_fused(直近0.5s内受理) / bit2 flight_anchor_done / bit3 tau_rw_mode / bit4 bm_frozen / bit5 healthy2 / bit6 yaw_obs_low_trust / bit7 ~~予約~~ yaw_recapture=ヨー観測再捕捉中・制限融合モード(**改訂 2026-07-31**: §2.1 改訂注記参照。細部は実装が正) |
 | 172 | u8 | ekf2_gate | EKF2のゲートビット(ffgと同一ビット定義) |
 | 173 | f32 | flow_vx_mps | フロー機体系X速度(無効時0) |
 | 177 | f32 | flow_vy_mps | 同Y |
@@ -108,6 +108,18 @@ valid_flags: **bit6=magbias有効、bit7=flowcal有効** 新設(bit5=ffcalは既
      ψ行は実効ゲイン Δψ_clamp/y で状態・P更新を整合(磁気recaptureと同流儀。
      stale相関経由のb_g/b_m直撃とP00過収縮を防ぐ)。
    - 呼び出し: 新しいCMD_POS_ERR受信を消費した400Hz tick(実効50Hz)、bit3有効+age<100ms時。
+
+> **改訂(2026-07-31 18:20飛行解析反映 — ヨー観測ソフト再捕捉)**: 当初仕様の
+> 融合停止ラッチは解除経路が地上経路(reanchor/reseedYaw)のみで、飛行状態
+> 再アンカーの発動条件が yaw_obs_fused を要求するため、**離陸前にラッチが
+> 発動すると飛行中に永久復帰不能**(18:20飛行で t=1.0s 発動・融合0%を実証。
+> `FLIGHT_ANALYSIS_20260731_1820.md` §2)。本コミットで**飛行中の解除経路
+> (ソフト再捕捉)を追加**: ラッチ中もゲート内観測の安定成立を監視し、成立で
+> 制限融合モード経由でラッチ解除・融合再開する(磁気ソフト再捕捉と同じ設計思想)。
+> 再捕捉(制限融合)モード中は **ekf2_status bit7(旧・予約)= yaw_recapture** で
+> 示す。閾値・解除条件・bit7 の正確なセマンティクスは**本コミットの実装
+> (yaw_estimator_kf2.cpp / yaw_config.hpp の FF_EKF2_YAW_RECAPTURE_*)が正**。
+
 2. **τ_bm適応**: EKF2はGauss-Markovゼロ回帰を**廃止**(a=1固定)。
    - yaw_obs健全(最終受理<1.0s): q_bm 現行値(ランダムウォーク=b_mは自由に追従)
    - yaw_obs喪失(≥1.0s): q_bm×0.1(準凍結ホールド=学習済みb_mでコースト)
@@ -172,6 +184,25 @@ mag3d変更時: magbiasは旧b_cal空間で無効になるため**連動クリ�
 1. **ヨー基準ソース切替** `yaw_ref_source: off|mocap|motion`(server設定+ランタイムAPI+UI
    トグル)。mocap: 実測ヨー(bit4=0)。motion: 移動ベースヨー(bit4=1)。
    invalid時はbit3を落とす(ファームはコースト)。
+
+> **改訂(2026-07-31 18:20飛行解析反映 — ワイヤ較正適用・アーム相対基準・
+> 連続性ゲート)**: 当初実装は CMD_POS_ERR の `mocap_yaw` 欄へ生方位
+> (heading×wire_sign)を送っており、**attitude_transform(yaw_sign/yaw_offset
+> 較正)が表示・ログ列にしか適用されないバグ**があった(7/31両フライトで
+> 真値−88.6°/−90.4°の定数オフセット基準が機体へ届き融合0%。
+> `FLIGHT_ANALYSIS_20260731_1820.md` §1)。本コミットで以下に改修:
+> - **(a) 較正適用+アーム相対基準**: ワイヤの基準は較正適用済み yaw_true 系列
+>   から生成し、アーム検知時の yaw_true を ψ_arm として保持して
+>   `wrap(yaw_true − ψ_arm)` を送る。機上ヨーはアームで0リセットされるため
+>   フレーム原点が構造的に一致し、当日の絶対オフセット較正への依存を排除する。
+> - **(b) 連続性ゲート**: MoCapヨーのフレーム間ジャンプがジャイロ整合閾値を
+>   超える観測(実測: 約90°別解グリッチはジャンプ中央値94.9°/行 vs 正常
+>   p99=5.4°/行)を棄却する一般ゲートへ、従来の cont_flip(180°専用補正)を
+>   拡張。棄却中は bit3 を落とす(ファームはコースト)。棄却フラグはログ
+>   `mocap_flip` 列へ(LOG_STRUCTURE.md §14 注記)。
+>
+> 送信値の定義・閾値・復帰条件の最終仕様は**本コミットの実装
+> (pc_server/core/session.py / mocap.py)が正**。
 2. **移動ベースヨー計算** `core/motion_yaw.py`: 8s滑動窓LS
    ψ̂=arg Σ A·conj(u_B)。A=因果LPF(2Hz biquad)+2階差分のMoCap位置加速度、
    u_B=テレメトリroll/pitch(遅延90ms補償)。Fisher情報 J=Σ|u_B|² が閾値未満なら

@@ -55,6 +55,13 @@ PROTOCOL.md 0x35)由来の 23 列を追加、全列を論理グループ順に�
   受理)されたときに開かれ、飛行終了(着陸イベント / START 猶予切れ /
   再武装解除)・トグル OFF・切断・サーバ終了で閉じる。飛行終了で閉じた
   ときはトグルも自動 OFF になる(1ファイル = 1飛行)。
+- **プリロール(P2b、2026-07-31 追加)**: ログ予約 ON の間はファイル閉鎖中も
+  50Hz 行を組み立ててリングバッファに保持し(直近 `logging.pre_roll_s`、
+  既定 3.0s)、START でファイル先頭へフラッシュする — **アーム前区間
+  (地上アンカー・I_idle・Δb_z 復元に必須)が必ずログに入る**。
+  `elapsed_time` の基点(0)はプリロール先頭行で、START トリガー時点は
+  `*.meta.json` の `pre_roll_s`(トリガーまでの秒数。プリロール行なしなら
+  0)から求める(単機のみ。複数機は従来どおり開始時点から)。
 - 行が記録されるのは 50Hz 送信スレッドの動作中(=シリアル接続中)のみ。
   送信失敗時も行は出力され、`send_success=0`・`command_sequence` 空となる。
 - 複数機モードでは機体ごとの FlightLogger に `mode="multi"` で記録される。
@@ -237,8 +244,8 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
 
 | 列 | 型 | 単位 | 説明 |
 | --- | --- | --- | --- |
-| `mocap_yaw_true_deg` | float | deg | **正解ヨー**。前方軸の制御座標方位に `attitude_transform` の符号・オフセット・フリップ補正を適用し (-180, 180] にラップした値。ビューアの「MoCap 正解Yaw」系列・ヨー統計の基準はこの列(旧 `mocap_yaw_deg` は Z-up 前提オイラー分解で Motive が Y-up の場合は機首方位ではない — 2026-07-27 実測確定。診断用に残置)。 |
-| `mocap_flip` | int | bit | フリップ補正フラグ。bit0 = 上方軸反転補正(マーカー対称性による前方軸まわり180°別解)、bit1 = ヨー継続性ガードの180°補正。0 = 補正なし。 |
+| `mocap_yaw_true_deg` | float | deg | **正解ヨー**。前方軸の制御座標方位に `attitude_transform` の符号・オフセットを適用し (-180, 180] にラップし、**ヨー連続性フィルタ**(2026-07-31 追加、`pc_server/core/yaw_continuity.py`)を通した値。棄却中(bit1 参照)はジャイロ伝播予測でコーストする。ビューアの「MoCap 正解Yaw」系列・ヨー統計の基準はこの列で、**CMD_POS_ERR のヨー基準ワイヤ経路と単一情報源**(旧 `mocap_yaw_deg` は Z-up 前提オイラー分解で Motive が Y-up の場合は機首方位ではない — 2026-07-27 実測確定。診断用に残置)。 |
+| `mocap_flip` | int | bit | フリップ補正フラグ。bit0 = 上方軸反転補正(マーカー対称性による前方軸まわり180°別解)、bit1 = **ヨー連続性フィルタが棄却中**(出力はジャイロ伝播コースト)。0 = 補正/棄却なし。**【改訂 2026-07-31】意味拡張**: 旧実装の bit1 は「継続性ガードの180°トグル補正中」だったが、約90°別解グリッチ実測(18:20 飛行、`FLIGHT_ANALYSIS_20260731_1820.md`)を受け、180°フリップも90°グリッチも同一機構で棄却する連続性フィルタ(ジャイロ予測 ±30° ゲート、棄却 >5s で計測へ再整列)へ統合し、bit1 の意味を**連続性棄却フラグ**に拡張(ビット位置・列名は互換維持)。旧ログ(7/31以前)の bit1 は180°補正のみで、18:20飛行では90°グリッチへの誤180°補正を含む点に注意。 |
 | `mocap_qx` | float | - | Motive 生クォータニオン x(NatNet unpack 順)。 |
 | `mocap_qy` | float | - | 同 y。 |
 | `mocap_qz` | float | - | 同 z。 |
@@ -272,7 +279,7 @@ CMD_POS_ERR の `mocap_yaw`(外部ヨー基準)欄の供給状態と、PC 側で
 | 列 | 型 | 単位 | 説明 |
 | --- | --- | --- | --- |
 | `yaw_ref_source` | string | - | ヨー基準ソース(`off` / `mocap` / `motion`。行単位 — 飛行中の切替も追える)。 |
-| `yaw_ref_sent_rad` | float | rad | CMD_POS_ERR の `mocap_yaw` 欄に実際に送った値(ワイヤ規約)。bit3=0 のときは 0。 |
+| `yaw_ref_sent_rad` | float | rad | CMD_POS_ERR の `mocap_yaw` 欄に実際に送った値(ワイヤ規約)。bit3=0 のときは 0。**【改訂 2026-07-31 P0-1】** mocap ソースの送信値は `heading×wire_sign`(較正が乗らない旧経路 — 7/31 の基準鏡像化事故の原因)から、**連続性フィルタ後の正解ヨー(`mocap_yaw_true_deg` と同一情報源)+整列方式**へ変更: `align=arm`(既定)は `wrap(yaw_true + anchor)`(anchor はアーム遷移時に機体ヨー `tlm_yaw_est_rad` へ整列 — 値は meta.json の `yaw_ref.anchor` に記録)、`align=absolute` は `yaw_true` そのまま。連続性棄却中・MoCap 途絶中・アンカー未ラッチ時は bit3=0。 |
 | `yaw_ref_valid` | 0/1 | - | flags bit3(FLAG_MOCAP_YAW_VALID)を立てて送信したか。 |
 | `motion_yaw_rad` | float | rad | 移動ベースヨー推定(ワイヤ規約変換済み — `yaw_ref_sent_rad` と直接比較可能)。ソースが mocap の間も常時記録する(切替前の妥当性検証用)。推定 invalid(励振不足)時は空。 |
 | `motion_yaw_J` | float | (m/s²)²·samples | Fisher情報 Σ\|u_B\|²(8s 窓)。ゲート閾値は `control.json` の `motion_yaw.j_min`。 |

@@ -76,9 +76,11 @@
     "latency_pending_max_age_s": 2.0
   },
   "logging": {
-    "flush_every_rows": 50
+    "flush_every_rows": 50,
+    "pre_roll_s": 3.0
   },
   "yaw_ref": {
-    "source": "mocap"
+    "source": "mocap",
+    "align": "arm"
   }
 }

@@ -11,6 +11,12 @@
   ⑤ 飛行状態再アンカー (契約 §2.1(3)): 発動条件成立で B0f 再取得、
      以後 b_m≈0・status bit2。
   ⑥ v5 制限モード: 合成観測+受理マスクで EKF1 ログ軌跡を再現 (RMS<3°)。
+  ⑦ ヨー観測ソフト再捕捉 (FF_EKF2_YAW_RECAPTURE_*): 誤基準でラッチ →
+     正解化 → 段階2(12観測連続) → 段階3(制限融合 bit7) → 2s 継続で完全解除。
+  ⑧ 再捕捉の誤再入防止: 鏡像基準 (sent=−ψ) は回頭中 d(innov)/dt≈2ψ̇ が
+     ドリフトゲートで遮断され、静止中はゲート外のまま再入しない。
+  ⑨ v6 パイプライン再捕捉: 90°オフセット基準 → t=15s 正解化 → bit7 →
+     通常融合復帰 (FLIGHT_ANALYSIS_20260731 の 18:20 飛行シナリオ相当)。
 
 実行: cd data_analysis && .venv/bin/python tests/test_ekf2_replay.py
 """
@@ -302,6 +308,132 @@ def test_v5_restricted() -> None:
            "v5制限モードの警告が無い")
 
 
+# ============================================================ ⑦〜⑨ 再捕捉 ====
+def test_yaw_recapture() -> None:
+    print("[⑦] ソフト再捕捉: 誤基準ラッチ→正解化→制限融合(bit7)→2s継続で解除")
+    DT = 0.02  # 実効50Hz相当
+    kf = rep.YawEstimatorKf2Replay()
+    kf.reanchor(0.0, 28.0, 0.0, [28.0, 0.0, -35.0])
+
+    def step(obs_rad: float) -> bool:
+        kf.predict(0.0, 0.0, 0.0, 0.0, DT)
+        return kf.update_yaw_obs(obs_rad, low_trust=False)
+
+    # (a) 誤基準 (+90°) を10s継続 → 25連続棄却でラッチ、ψ は動かない
+    for _ in range(int(10.0 / DT)):
+        step(90.0 * DEG)
+    _check(kf.yaw_obs_stopped, "誤基準10sでラッチが立たない")
+    _check(not kf.yaw_recapture_active, "誤基準継続中に制限融合へ入った")
+    _check(abs(kf.x[0]) < 1.0 * DEG,
+           f"ラッチ中に ψ が動いた: {math.degrees(kf.x[0]):.2f}°")
+
+    # (b) 正解化 → 段階2 (M=12 観測連続+ドリフト窓) → 段階3 (制限融合)
+    n_to_active = 0
+    for i in range(100):
+        step(0.5 * DEG)
+        if kf.yaw_recapture_active:
+            n_to_active = i + 1
+            break
+    _check(kf.yaw_recapture_active, "正解化後に制限融合モードへ入らない")
+    _check(n_to_active == rep.FF_EKF2_YAW_RECAPTURE_M,
+           f"制限融合入りが {n_to_active} 観測目 "
+           f"(期待 {rep.FF_EKF2_YAW_RECAPTURE_M})")
+    _check((kf.status_bits() & 0x80) != 0, "制限融合中に status bit7 が立たない")
+    _check(kf.yaw_obs_stopped, "制限融合中は stopped 継続のはず")
+
+    # (c) 制限融合: バイアス行 K=0・「受理」(fused/τ適応) には数えない
+    bg0, bmx0 = kf.x[1], kf.x[2]
+    step(0.5 * DEG)
+    _check(kf.x[1] == bg0 and kf.x[2] == bmx0, "制限融合でバイアスが動いた")
+    _check((kf.status_bits() & 0x02) == 0,
+           "制限融合が yaw_obs_fused (bit1) に数えられた")
+
+    # (d) ゲート外へ出たら段階1へ戻る (5s 待機やり直し) → 再度正解化で再入
+    step(80.0 * DEG)
+    _check(not kf.yaw_recapture_active, "ゲート外で制限融合が解除されない")
+    _check(kf.yaw_obs_stopped, "ゲート外転落でラッチまで解除された")
+    for _ in range(int(2.0 / DT)):  # 5s 未満はゲート内でも再入しない
+        step(0.5 * DEG)
+    _check(not kf.yaw_recapture_active, "段階1の5s待機を待たず再入した")
+    for _ in range(int(3.5 / DT)):
+        step(0.5 * DEG)
+    _check(kf.yaw_recapture_active, "5s経過+ゲート内連続で再入しない")
+
+    # (e) ゲート内 2s 継続でラッチ完全解除 → 通常融合 (fused bit1)
+    for _ in range(int(rep.FF_EKF2_YAW_RECAPTURE_HOLD_S / DT) + 5):
+        step(0.5 * DEG)
+    _check(not kf.yaw_obs_stopped, "制限融合2s継続後もラッチが解除されない")
+    _check(not kf.yaw_recapture_active, "解除後も制限融合フラグが残留")
+    step(0.5 * DEG)
+    _check((kf.status_bits() & 0x02) != 0, "解除後の通常融合で fused が立たない")
+
+
+def test_yaw_recapture_no_reentry_wrong_ref() -> None:
+    print("[⑧] 再捕捉の誤再入防止: 鏡像基準は回頭中もドリフトゲートで遮断")
+    DT = 0.02
+    kf = rep.YawEstimatorKf2Replay()
+    kf.reanchor(0.0, 28.0, 0.0, [28.0, 0.0, -35.0])
+    # まず誤オフセット基準でラッチ (18:20 飛行のフレーム差 −90° 相当)
+    for _ in range(int(6.0 / DT)):
+        kf.predict(0.0, 0.0, 0.0, 0.0, DT)
+        kf.update_yaw_obs(-90.0 * DEG, low_trust=False)
+    _check(kf.yaw_obs_stopped, "前段: ラッチが立たない")
+    # 鏡像基準 (sent=−ψ_true) のまま ψ̇=30°/s で回頭: innov=wrap(−2ψ) が
+    # ゲート帯 (±30°) を 60°/s で横切る間 (≈1s=50観測 ≫ M=12) も、
+    # 窓ドリフトレート≈2ψ̇=60°/s > 20°/s がドリフトゲートで遮断される
+    psi_rate = 30.0 * DEG
+    psi_true = 0.0
+    reentered = False
+    for _ in range(int(12.0 / DT)):  # 360° 回頭 = ゲート帯通過 2 回
+        kf.predict(psi_rate, 0.0, 0.0, 0.0, DT)
+        psi_true = rep.wrap_pi(psi_true + psi_rate * DT)
+        kf.update_yaw_obs(rep.wrap_pi(-psi_true), low_trust=False)
+        reentered |= kf.yaw_recapture_active
+    _check(not reentered, "鏡像基準の回頭中に制限融合へ再入した")
+    _check(kf.yaw_obs_stopped, "鏡像基準でラッチが解除された")
+    # 静止+誤オフセット基準の継続でも再入しない (ゲート外のまま)
+    for _ in range(int(6.0 / DT)):
+        kf.predict(0.0, 0.0, 0.0, 0.0, DT)
+        kf.update_yaw_obs(90.0 * DEG, low_trust=False)
+    _check(not kf.yaw_recapture_active and kf.yaw_obs_stopped,
+           "静止・誤基準継続で再入した")
+
+
+def test_yaw_recapture_pipeline() -> None:
+    print("[⑨] v6 パイプライン再捕捉: 誤基準→t=15s正解化→bit7→融合復帰")
+    data = make_synth_v6(bias=(0.0, 0.0, 0.0), duration_s=40.0)
+    t = data["elapsed_time"]
+    data["yaw_ref_rad"] = np.where(t < 15.0, PSI_TRUE + 90.0 * DEG, PSI_TRUE)
+    res = rep.run_replay(data, yaw_obs_mode="yaw_ref_rad",
+                         enable_flight_anchor=False, align_yaw_obs=False)
+    st = np.nan_to_num(res["status"], nan=0.0).astype(np.int64)
+    tt = res["t_s"] - res["t_s"][0]
+    pre = tt < 15.0
+    _check(not ((st[pre] & 0x80) != 0).any(), "正解化前に bit7 が立った")
+    mid = (tt > 5.0) & (tt < 15.0)
+    _check(not ((st[mid] & 0x02) != 0).any(),
+           "誤基準期間に fused (bit1) が立ち続けた (ラッチ不発)")
+    post = tt >= 15.0
+    _check(((st[post] & 0x80) != 0).any(), "正解化後に bit7 が現れない")
+    k7 = np.where((st & 0x80) != 0)[0]
+    k1 = np.where(post & ((st & 0x02) != 0))[0]
+    _check(len(k1) > 0, "正解化後に通常融合が復帰しない")
+    if len(k7) and len(k1):
+        t7, t1 = tt[k7[0]], tt[k1[0]]
+        print(f"  制限融合開始 t={t7:.1f}s → 通常融合復帰 t={t1:.1f}s")
+        _check(t1 > t7 + rep.FF_EKF2_YAW_RECAPTURE_HOLD_S - 0.2,
+               "ホールド時間を待たずラッチが解除された")
+    tail = tt > 20.0
+    fused_ratio = float(np.mean((st[tail] & 0x02) != 0))
+    print(f"  復帰後 (t>20s) fused 率 {fused_ratio:.2f}")
+    _check(fused_ratio > 0.9, f"復帰後 fused 率 {fused_ratio:.2f} が低い")
+    fly = res["flying"]
+    psi = res["psi_ekf2_rad"]
+    err = np.degrees(np.abs(rep._wrap_arr(psi[fly & tail] - PSI_TRUE)))
+    _check(err.size > 0 and float(np.sqrt(np.mean(err ** 2))) < 2.0,
+           "復帰後の ψ が基準へ収束していない")
+
+
 def main() -> int:
     test_yaw_obs_unit()
     test_v6_no_yaw_obs()
@@ -309,6 +441,9 @@ def main() -> int:
     test_v6_ff_profile_reconstruction()
     test_flight_anchor()
     test_v5_restricted()
+    test_yaw_recapture()
+    test_yaw_recapture_no_reentry_wrong_ref()
+    test_yaw_recapture_pipeline()
     if _fail_count:
         print(f"\nNG: {_fail_count} 件の FAIL")
         return 1

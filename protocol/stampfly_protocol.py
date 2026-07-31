@@ -944,7 +944,7 @@ class TlmState:
     EKF2_STATUS_BM_FROZEN = 0x10          # bit4
     EKF2_STATUS_HEALTHY2 = 0x20           # bit5
     EKF2_STATUS_YAW_OBS_LOW_TRUST = 0x40  # bit6
-    # bit7 予約
+    EKF2_STATUS_YAW_RECAPTURE = 0x80      # bit7: ヨー観測再捕捉中(制限融合モード)
     # flow_status ビット定義(契約 §1.1)
     FLOW_STATUS_SENSOR_OK = 0x01    # bit0
     FLOW_STATUS_BURST_OK = 0x02     # bit1

@@ -189,7 +189,8 @@ static const float FF_EKF2_R_PSI_LOW_TRUST_RAD2 =
 // [§2.1-1] ヨー観測イノベーションゲート: |y| > 30° は棄却+連続棄却カウンタ
 static const float FF_EKF2_YAW_GATE_RAD = 30.0f * DEG_TO_RAD;
 // [§2.1-1] 連続棄却がこの回数 (N≥25) に達したら融合停止ラッチ
-// (イノベーション値はテレメトリに残す。解除は reanchor / reseedYaw)
+// (イノベーション値はテレメトリに残す。解除は reanchor / reseedYaw、
+//  または下記 FF_EKF2_YAW_RECAPTURE_* のソフト再捕捉)
 static const uint8_t FF_EKF2_YAW_GATE_STOP_COUNT = 25;
 // [§2.1-1] ヨー観測の消費許容 age: CMD_POS_ERR 受信からこの時間以内の
 // ステージ分のみ EKF2 へ融合する(consume-once の防御的鮮度検査)
@@ -211,3 +212,22 @@ static const float FF_EKF2_FLIGHT_ANCHOR_ALT_TOL_M = 0.1f;
 static const float FF_EKF2_FLIGHT_ANCHOR_ALT_HOLD_S = 2.0f;
 static const float FF_EKF2_FLIGHT_ANCHOR_MIN_CURRENT_A = 1.0f;
 static const float FF_EKF2_FLIGHT_ANCHOR_P_BM_UT2 = 4.0f;  // (2 µT)²
+
+// [§2.1-1改] ヨー観測ソフト再捕捉 (融合停止ラッチの状態機械化。
+// FLIGHT_ANALYSIS_20260731: 誤基準ワイヤ送信+MoCap約90°別解グリッチにより
+// ラッチが飛行中に恒久発動し fused 0% となった事故への回復経路):
+//   段階1: stopped 遷移 (または段階3からの転落) から
+//          FF_EKF2_YAW_RECAPTURE_AFTER_S 経過を待つ
+//   段階2: ゲート内 (|y|≤30°) が FF_EKF2_YAW_RECAPTURE_M 観測連続、かつその
+//          窓のイノベーションドリフトレート |d(innov)/dt| が
+//          FF_EKF2_YAW_RECAPTURE_DRIFT_RAD_S 未満なら段階3へ
+//   段階3: 制限融合モード (Δψ±3°/更新クランプ+バイアス行 K=0。
+//          ekf2_status bit7) をゲート内のまま FF_EKF2_YAW_RECAPTURE_HOLD_S
+//          継続したらラッチ完全解除 (通常融合へ)。途中でゲート外に出たら
+//          段階1へ戻る
+// 誤基準 (鏡像/オフセット) への耐性: 静止中はゲート外のまま再入不能、
+// 回頭中は d(innov)/dt≈2ψ̇ がドリフトゲートで遮断。
+static const float FF_EKF2_YAW_RECAPTURE_AFTER_S = 5.0f;
+static const uint8_t FF_EKF2_YAW_RECAPTURE_M = 12;
+static const float FF_EKF2_YAW_RECAPTURE_DRIFT_RAD_S = 20.0f * DEG_TO_RAD;
+static const float FF_EKF2_YAW_RECAPTURE_HOLD_S = 2.0f;

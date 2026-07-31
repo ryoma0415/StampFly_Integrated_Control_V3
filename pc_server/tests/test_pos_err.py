@@ -34,6 +34,9 @@ def _position_meta(**overrides) -> dict:
         "yaw_ref_rad": 0.5,
         "yaw_ctrl_on": True,
         "mocap_heading_rad": 1.62,
+        # 連続性フィルタ後の正解ヨー(P0-1 以降のヨー基準ワイヤ経路の入力)
+        "mocap_yaw_true_rad": 1.62,
+        "mocap_flip": 0,
     }
     meta.update(overrides)
     return meta
@@ -56,6 +59,9 @@ def _connect_quiet(session, transport):
 class TestEmitPosErr:
     def test_position_meta_emits_cmd_pos_err(self, session_factory):
         session, transport, _clock = session_factory()
+        # ヨー基準は absolute 整列で決定的に(arm 整列のアンカー挙動は
+        # test_yaw_ref.py が検証する)
+        assert session.set_yaw_ref_align("absolute")["ok"]
         _connect_quiet(session, transport)
 
         session._emit_setpoint(0.01, 0.02, 0.5, _position_meta())
@@ -67,7 +73,7 @@ class TestEmitPosErr:
         assert pe.err_y == pytest.approx(-0.2)
         assert pe.alt_ref == pytest.approx(0.5)
         assert pe.yaw_ref == pytest.approx(0.5)
-        assert pe.mocap_yaw == pytest.approx(1.62)
+        assert pe.mocap_yaw == pytest.approx(1.62)   # 連続性フィルタ後 yaw_true
         assert pe.flags & proto.CmdPosErr.FLAG_ALT_REF_VALID
         assert pe.flags & proto.CmdPosErr.FLAG_YAW_REF_VALID
         assert pe.flags & proto.CmdPosErr.FLAG_XY_ERR_VALID
@@ -113,12 +119,13 @@ class TestEmitPosErr:
         assert pe.err_x == pytest.approx(clamp)
         assert pe.err_y == pytest.approx(-clamp)
 
-    def test_heading_missing_clears_mocap_yaw_flag(self, session_factory):
+    def test_yaw_true_missing_clears_mocap_yaw_flag(self, session_factory):
         session, transport, _clock = session_factory()
+        assert session.set_yaw_ref_align("absolute")["ok"]
         _connect_quiet(session, transport)
 
         meta = _position_meta()
-        del meta["mocap_heading_rad"]
+        del meta["mocap_yaw_true_rad"]
         session._emit_setpoint(0.0, 0.0, 0.3, meta)
 
         pe = _sent_pos_errs(transport)[0]

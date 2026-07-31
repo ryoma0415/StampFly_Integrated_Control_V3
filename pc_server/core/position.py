@@ -13,8 +13,11 @@
   最近傍点に位相を合わせ、滑らかに合流する。
 - v2 ヨー指令: UI のヨー角スライダ(±180°)+「進行方向を向く」オプション
   (円軌道中かつヨー角制御 ON のとき yaw_ref を接線方向に追従)。
-- MoCap の yaw_rad はログ列 mocap_yaw_deg として meta に載せ、制御座標系
-  ヨー(heading_rad)は CMD_POS_ERR の mocap_yaw 欄(機上ヨー回転補償)に使う。
+- MoCap の yaw_rad はログ列 mocap_yaw_deg として meta に載せる。CMD_POS_ERR の
+  mocap_yaw 欄(外部ヨー基準)は連続性フィルタ後の yaw_true_rad
+  (meta["mocap_yaw_true_rad"])を session 層がパネル較正準拠で整形して送る
+  (2026-07-31 改修: heading×wire_sign の旧経路は較正がワイヤに乗らず廃止)。
+  heading_rad は診断列 mocap_heading_deg 用の生値として残る。
 
 フェイルセーフ(PROTOCOL.md):
 - MoCap 途絶 > mocap_dropout_level_s(300ms)→ data_valid を落として送信を
@@ -568,14 +571,20 @@ class PositionController:
             if heading is not None:
                 meta["mocap_heading_rad"] = heading
                 meta["mocap_heading_deg"] = heading * RAD_TO_DEG
-            # 正解ヨー(符号/オフセット/フリップ補正済み)+生クォータニオン
-            # (ログ列 mocap_yaw_true_deg / mocap_flip / mocap_q*)
+            # 正解ヨー(符号/オフセット補正+連続性フィルタ後)+生クォータ
+            # ニオン(ログ列 mocap_yaw_true_deg / mocap_flip / mocap_q*)。
+            # rad 値は CMD_POS_ERR のヨー基準ワイヤ経路(session._emit_pos_err)
+            # が使う — 表示列と同一値(単一情報源)
             yaw_true = pose.get("yaw_true_rad")
             if yaw_true is not None:
                 meta["mocap_yaw_true_deg"] = yaw_true * RAD_TO_DEG
+                meta["mocap_yaw_true_rad"] = yaw_true
             flip_flags = pose.get("flip_flags")
             if flip_flags is not None:
                 meta["mocap_flip"] = flip_flags
+            realign = pose.get("yaw_cont_realign")
+            if realign is not None:
+                meta["mocap_yaw_realign"] = realign
             quat = pose.get("quat")
             if quat is not None:
                 (meta["mocap_qx"], meta["mocap_qy"],

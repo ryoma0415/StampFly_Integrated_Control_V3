@@ -75,6 +75,11 @@ const REASONS = [
 /* TLM_STATE flags ビット定義 */
 const FLAG_FLYING = 0x04; // bit2 = flying
 
+/* TLM_STATE ekf2_status ビット(MAG_AUTOTUNE_DESIGN.md 契約 §1.1) */
+const EKF2_STATUS_FUSED = 0x02;      // bit1: ヨー観測を直近0.5s内に受理
+const EKF2_STATUS_RECAPTURE = 0x80;  // bit7: ソフト再捕捉(制限融合)中
+const EKF2_FUSED_WIN_N = 100;        // fused率の窓(20Hz×100 ≈ 直近5s)
+
 /* FF/推定モードの表示名(CMD_FF_MODE の enum に対応) */
 const FF_MODE_NAMES = ["off", "A", "B"];
 
@@ -176,7 +181,11 @@ const els = {
   // 磁気オートチューン(EKF2)パネル
   yawRefSelect: $("yawRefSelect"), yawRefMotionInfo: $("yawRefMotionInfo"),
   ekf2YawInfo: $("ekf2YawInfo"), ekf2BmInfo: $("ekf2BmInfo"),
-  ekf2StatusInfo: $("ekf2StatusInfo"),
+  ekf2StatusInfo: $("ekf2StatusInfo"), ekf2FusedInfo: $("ekf2FusedInfo"),
+  // プリフライト・インターロック(P1-2: Posture/Position 両タブに同型)
+  interlockBadges: document.querySelectorAll("[data-interlock-badge]"),
+  interlockMsgs: document.querySelectorAll("[data-interlock-msg]"),
+  forceStartBtns: document.querySelectorAll("[data-action=force-start]"),
   magbiasLogSelect: $("magbiasLogSelect"), btnMagbiasExtract: $("btnMagbiasExtract"),
   magbiasSelect: $("magbiasSelect"), btnMagbiasApply: $("btnMagbiasApply"),
   btnMagbiasClear: $("btnMagbiasClear"),
@@ -237,6 +246,7 @@ let magbiasStatus = null;          // /api/magbias の状態
 let flowcalStatus = null;          // /api/flowcal の状態
 let flowcalPollTimer = null;       // 記録中のライブメーターポーリング
 let yawRefSentAt = -Infinity;      // ヨー基準ソース送信時刻(echo抑制用)
+const ekf2FusedWin = [];           // fused ビット履歴(20Hz、直近 EKF2_FUSED_WIN_N)
 let geomagStatus = null;           // /api/geomag の状態
 let calprofStatus = null;          // /api/calprofile の状態
 let accel6Status = null;           // /api/accel6 の状態
@@ -836,11 +846,66 @@ function renderSession() {
       ? `0x${d.ekf2_gate.toString(16).padStart(2, "0")}` : "--";
     els.ekf2StatusInfo.textContent =
       `${st} / ${gate}${d.est_mode_ekf2 ? "(アクティブ)" : "(シャドー)"}`;
+    // ヨー観測融合の明示(P1-2): fused ビット+再捕捉 bit7+直近 fused率
+    const fused = (d.ekf2_status & EKF2_STATUS_FUSED) !== 0;
+    const recap = (d.ekf2_status & EKF2_STATUS_RECAPTURE) !== 0;
+    ekf2FusedWin.push(fused ? 1 : 0);
+    if (ekf2FusedWin.length > EKF2_FUSED_WIN_N) ekf2FusedWin.shift();
+    const fusedPct = 100 * ekf2FusedWin.reduce((a, b) => a + b, 0)
+      / ekf2FusedWin.length;
+    els.ekf2FusedInfo.textContent =
+      `${fused ? "融合中" : "停止中"}${recap ? "(再捕捉中 bit7)" : ""}` +
+      ` / fused率 ${fusedPct.toFixed(0)}%(直近${(ekf2FusedWin.length / 20).toFixed(0)}s)`;
   } else {
     els.ekf2YawInfo.textContent = "--";
     els.ekf2BmInfo.textContent = "--";
     els.ekf2StatusInfo.textContent = "--";
+    els.ekf2FusedInfo.textContent = "--";
+    ekf2FusedWin.length = 0;
   }
+
+  // プリフライト・インターロック(P1-2)バッジ(Posture/Position 両タブ)
+  renderInterlock(s.yaw_interlock);
+}
+
+/* プリフライト・インターロック(P1-2): 離陸ボタン付近のバッジ+強制離陸。
+   サーバの session.yaw_interlock(state/blocking/message)が正 —
+   ブロック判定は必ずサーバ側 start() ゲートが行う(UI は表示のみ)。 */
+function renderInterlock(il) {
+  let text = "整列 --";
+  let cls = "badge b-dim";
+  let msg = "";
+  let showForce = false;
+  if (il && il.source !== "off") {
+    if (il.state === "ok") {
+      text = "整列OK";
+      cls = "badge b-ok";
+    } else if (il.state === "waiting") {
+      const hold = typeof il.hold_s === "number" ? il.hold_s.toFixed(1) : "-";
+      text = `整列待ち ${hold}/${il.hold_required_s ?? 3}s`;
+      cls = "badge b-warn";
+    } else if (il.state === "no_fused") {
+      text = il.recapture ? "再捕捉中" : "融合なし";
+      cls = "badge b-warn";
+    } else {   // no_telemetry
+      text = "TLM未受信";
+      cls = "badge b-dim";
+    }
+    if (il.blocking) {
+      msg = `${il.message || ""}(EKF2制御: 離陸ブロック中)`;
+      showForce = true;
+    } else if (il.state === "no_telemetry") {
+      msg = il.message || "";
+    } else if (il.state !== "ok") {
+      msg = `${il.message || ""}(シャドー: 警告のみ・離陸可)`;
+    }
+  }
+  for (const el of els.interlockBadges) {
+    el.textContent = text;
+    el.className = cls;
+  }
+  for (const el of els.interlockMsgs) el.textContent = msg;
+  for (const btn of els.forceStartBtns) btn.classList.toggle("hidden", !showForce);
 }
 
 function renderDrone() {
@@ -2786,7 +2851,13 @@ function renderFlowcal() {
       `${a.forced ? "(force適用)" : ""}${a.verified ? "" : "(未検証)"}`
     : "flowcal: 未適用(既定 diag(450,450))";
   els.flowcalApplied.classList.toggle("applied", !!a);
-  if (st.message) els.flowcalMsg.textContent = st.message;
+  // P2a: 適用記録と機体行列の照合警告(applied_unverified/不一致)を優先表示
+  if (st.verify_warning) {
+    els.flowcalMsg.textContent =
+      (st.message ? `${st.message} / ` : "") + `⚠ ${st.verify_warning}`;
+  } else if (st.message) {
+    els.flowcalMsg.textContent = st.message;
+  }
 
   // ボタン活性(適用は「フィット結果あり」が条件。合否はサーバが判定し、
   // 不合格は confirm 経由の force で強制適用できる)
@@ -3084,6 +3155,17 @@ function wireEvents() {
   }
   for (const btn of document.querySelectorAll("[data-action=stop]")) {
     btn.addEventListener("click", doStop);
+  }
+  // プリフライト・インターロックの強制離陸(P1-2: 明示的 override)
+  for (const btn of els.forceStartBtns) {
+    btn.addEventListener("click", () => {
+      if (window.confirm(
+          "インターロック未成立のまま強制離陸します(EKF2 ヨー基準の融合が"
+          + "未確認 — ヨー観測なしのコースト飛行になる可能性)。よろしいですか?")) {
+        sendCommand("start", { force: true });
+        appendConsole("ui", "START 送信(force: インターロック解除)");
+      }
+    });
   }
   els.btnRearm.addEventListener("click", () => {
     if (window.confirm("Re-arm(RESET)します。機体が静止し高度0.15m未満であることを確認してください。")) {

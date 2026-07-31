@@ -13,7 +13,9 @@
 - yaw_rad(Z-up 前提オイラー分解)は UI 表示専用の旧値(Motive が Y-up の
   場合は機首方位ではない — 2026-07-27 実測確定)。機首方位は heading_rad
   (前方軸の制御座標方位・生値)と yaw_true_rad(AttitudeMapper で符号/
-  オフセット/フリップ補正済みの「正解ヨー」)を使う。
+  オフセット補正+ヨー連続性フィルタ(yaw_continuity.py: 180°別解も
+  90°級ソルバグリッチも棄却してコースト)を通した「正解ヨー」)を使う。
+  yaw_true_rad は表示列と CMD_POS_ERR ワイヤ経路の単一情報源。
 - 座標変換と姿勢マッピングは実行時差し替え可能(set_mapping)。適用は
   地上限定・位置フィルタのリセットとセット(session 層が保証する)。
 
@@ -27,6 +29,8 @@ import threading
 import time
 from math import asin, atan2, copysign, pi
 from typing import Callable, Optional
+
+from .yaw_continuity import YawContinuityFilter
 
 RAD_TO_DEG = 180.0 / pi
 DEG_TO_RAD = pi / 180.0
@@ -50,15 +54,13 @@ DEFAULT_ATTITUDE_TRANSFORM = {
 }
 
 # フリップ補正の構造定数(挙動の性質を決める閾値であり運用調整項ではない)。
-# ヨー継続性ガード: フレーム間で |Δyaw| がこれ以上なら 180° 反転とみなす。
-# 実機のヨーレートでは 100Hz 1フレームに 120° は物理的に到達不能
-# (12000deg/s)なので誤検出しない。
-_YAW_JUMP_RAD = pi * 2.0 / 3.0
-# 受信ギャップがこれを超えたら継続性を主張しない(蓄積した反転補正を破棄)
-_YAW_JUMP_MAX_GAP_S = 0.5
 # 前方軸が鉛直に近い(|sin(仰角)| がこれ以上)間は方位が不定のため
 # 継続性判定を更新しない(sin 75°)
 _YAW_JUMP_ELEV_GATE_SIN = 0.966
+
+# テレメトリ由来ヨーレート(YawContinuityFilter の伝播入力)の鮮度上限 [s]。
+# 25Hz 供給の途絶時はレート伝播を止める(フィルタはホールド予測に落ちる)
+_YAW_RATE_FRESH_S = 0.5
 
 # リジッドボディ品質(0-1)算出時、tracking_valid でない場合の減衰率
 _QUALITY_INVALID_SCALE = 0.5
@@ -262,9 +264,12 @@ class AttitudeMapper:
       (前方軸まわり反転 = 上方軸が下を向く)を検出し、上方軸を
       反転して姿勢の整合を回復する。前方軸自体は不変のためヨーには
       影響しない。ヒステリシス付き(|鉛直成分| < flip_gate では保留)。
-    - ヨー継続性ガード: 鉛直軸まわりの180°別解(上方軸では検出不能)
-      をフレーム間 |Δyaw| >= _YAW_JUMP_RAD で検出し、180°補正を
-      トグルする。受信ギャップ・前方軸が鉛直に近い間は判定しない。
+    - ヨー連続性フィルタ(YawContinuityFilter): ジャイロ予測 ±30°
+      ゲートで計測を受理判定する。鉛直軸まわりの180°別解も 90° 級の
+      ソルバグリッチ(2026-07-31 実測)も同一機構で棄却し、棄却中は
+      予測でコーストする(旧 cont_flip の 180° トグル補正はこの
+      フィルタに統合・廃止)。受信ギャップ・前方軸が鉛直に近い間は
+      判定しない(復帰フレームで再シード)。
 
     インスタンスは不変(構築後に設定を書き換えない)。実行時変更は
     MocapSource.set_mapping() でオブジェクトごと差し替える。
@@ -315,31 +320,40 @@ class AttitudeMapper:
 
     @staticmethod
     def new_state() -> dict:
-        """リジッドボディ1体ぶんのフリップ判定状態を生成する。"""
-        return {"up_flipped": False, "cont_flip": False,
-                "last_yaw": None, "last_t": None}
+        """リジッドボディ1体ぶんのフリップ/連続性判定状態を生成する。"""
+        return {"up_flipped": False, "yaw_filter": YawContinuityFilter()}
 
     # フリップフラグ(pose["flip_flags"] / ログ mocap_flip 列のビット)
     FLIP_UP_INVERTED = 0x01    # 上方軸ガードが反転解を補正中
-    FLIP_YAW_JUMP = 0x02       # ヨー継続性ガードが180°補正中
+    # bit1: ヨー連続性フィルタが棄却中(コースト)。旧実装では「継続性
+    # ガードの180°補正中」だったが、2026-07-31 の 90° 級グリッチ実測を受け
+    # 意味を「連続性棄却フラグ」に拡張(ビット位置・ログ列名は互換維持。
+    # LOG_STRUCTURE.md §14 参照)
+    FLIP_YAW_JUMP = 0x02
 
     def derive(self, rotation: tuple, transformer: CoordinateTransformer,
                state: dict, now: float,
-               tracking_valid: bool = True) -> tuple[float, float, int]:
+               tracking_valid: bool = True,
+               yaw_rate_rad_s: Optional[float] = None
+               ) -> tuple[float, float, int]:
         """クォータニオン → (heading_rad, yaw_true_rad, flip_flags)。
 
         heading_rad: 設定された前方軸の制御座標系方位(生値。符号・
-          オフセット・フリップ補正を掛けない — 既定設定では従来の
-          heading_rad と同値で、CMD_POS_ERR / mocap_heading_deg の
+          オフセット・フリップ補正を掛けない — mocap_heading_deg の
           既存契約を維持する)。
-        yaw_true_rad: sign*heading + offset にフリップ補正を適用し
-          (-pi, pi] にラップした「正解ヨー」。ログ・表示・将来の制御用。
+        yaw_true_rad: sign*heading + offset を (-pi, pi] にラップし、
+          ヨー連続性フィルタ(棄却中はジャイロ予測コースト)を通した
+          「正解ヨー」。表示列(mocap_yaw_true_deg)と CMD_POS_ERR
+          ワイヤ経路の両方がこの値を使う(単一情報源)。
+        yaw_rate_rad_s: 最新テレメトリのヨーレート r(機体ワイヤ規約)。
+          yaw_true は yaw_sign 較正によりワイヤ規約に一致しているため
+          符号変換なしでフィルタの伝播に使う。None ならホールド予測。
 
         tracking_valid=False(オクルージョン等でソルバが外挿中)の間は
-        フリップ判定状態を一切更新しない(保持中の補正は適用し続ける)。
-        姿勢が信用できないフレームで継続性を更新すると、遮蔽越しに実機が
-        回転した場合に恒久的な180°誤補正が残るため、遮蔽はギャップとして
-        扱い、再捕捉時に既存のギャップリセット経路で観測を信じ直す。
+        判定状態を一切更新しない(生値を返す)。姿勢が信用できない
+        フレームで連続性を更新すると、遮蔽越しに実機が回転した場合に
+        誤った予測が残るため、遮蔽はギャップとして扱い、再捕捉時に
+        フィルタのギャップ再シード経路で観測を信じ直す。
 
         NatNet 受信スレッド上で毎フレーム呼ばれる: ロック・ブロッキング
         禁止。state はボディ別 dict(呼び出し側が保持、受信スレッド
@@ -369,38 +383,20 @@ class AttitudeMapper:
 
         yaw = wrap_pi(self._yaw_sign * heading + self._yaw_offset_rad)
         if self._flip_correction:
-            if state["cont_flip"]:
-                yaw = wrap_pi(yaw + pi)
+            yaw_filter: YawContinuityFilter = state["yaw_filter"]
             elev_sin = max(-1.0, min(1.0, fwd_ctrl[2]))
             if not tracking_valid:
-                # 遮蔽中: 状態を触らない(last_t が経過し、再捕捉が
-                # 0.5s 超ならギャップリセットで補正破棄)
+                # 遮蔽中: フィルタを触らない(再捕捉時、経過が
+                # GAP_RESEED_S 超ならフィルタが計測で再シードする)
                 pass
             elif abs(elev_sin) >= _YAW_JUMP_ELEV_GATE_SIN:
-                # 前方軸が鉛直に近い: 方位不定のため継続性を明示的に
-                # 破棄する(凍結時間の長短に関わらず、復帰フレームは
-                # ギャップ扱い → 蓄積補正リセットで観測を信じ直す)
-                state["last_yaw"] = None
-                state["last_t"] = None
+                # 前方軸が鉛直に近い: 方位不定のため連続性を明示破棄
+                # (復帰フレームは計測で再シード = 観測を信じ直す)
+                yaw_filter.invalidate()
             else:
-                last_yaw = state["last_yaw"]
-                last_t = state["last_t"]
-                gap_ok = (last_t is not None
-                          and (now - last_t) <= _YAW_JUMP_MAX_GAP_S)
-                if gap_ok and last_yaw is not None:
-                    if abs(wrap_pi(yaw - last_yaw)) >= _YAW_JUMP_RAD:
-                        state["cont_flip"] = not state["cont_flip"]
-                        yaw = wrap_pi(yaw + pi)
-                elif not gap_ok:
-                    # ギャップ越し(または初回)は継続性を主張できない:
-                    # 蓄積した180°補正を破棄して現在の観測を信じる
-                    if state["cont_flip"]:
-                        state["cont_flip"] = False
-                        yaw = wrap_pi(yaw + pi)
-                state["last_yaw"] = yaw
-                state["last_t"] = now
-            if state["cont_flip"]:
-                flags |= self.FLIP_YAW_JUMP
+                yaw, rejecting = yaw_filter.update(yaw, now, yaw_rate_rad_s)
+                if rejecting:
+                    flags |= self.FLIP_YAW_JUMP
         return heading, yaw, flags
 
 
@@ -508,6 +504,13 @@ class MocapSource:
             0,
         )
         self._client_factory = client_factory or self._default_client_factory
+
+        # primary 機のテレメトリヨーレート r [rad/s](ワイヤ規約)。
+        # session の RX スレッドが set_primary_yaw_rate() で書き、NatNet
+        # スレッドが毎フレーム読む(タプル1個の属性代入 = アトミック)。
+        # ヨー連続性フィルタの伝播入力(primary ボディのみに適用 —
+        # 他ボディの実レートではないため。適用外は None = ホールド予測)。
+        self._yaw_rate: Optional[tuple[float, float]] = None   # (rate, t_mono)
 
         self._client: Optional[object] = None
         self._on_pose: Optional[Callable[[dict], None]] = None
@@ -729,17 +732,25 @@ class MocapSource:
         tracking_valid = bool(getattr(rigid_body, "tracking_valid", False))
         # 制御座標系ヨー: 設定された前方軸(既定 +X)を Motive 座標で
         # 回してから位置と同じ軸マップで制御座標系へ変換し、水平面内の
-        # 方位角をとる。heading_rad は生値(既存契約: CMD_POS_ERR /
-        # mocap_heading_deg)、yaw_true_rad は符号・オフセット・フリップ
-        # 補正済みの「正解ヨー」(ログ・表示用)。
+        # 方位角をとる。heading_rad は生値(既存契約: mocap_heading_deg)、
+        # yaw_true_rad は符号・オフセット補正+ヨー連続性フィルタ後の
+        # 「正解ヨー」(表示列・CMD_POS_ERR ワイヤの単一情報源)。
         t_mono = time.monotonic()
         state = att_states.get(rb_id)
         if state is None:
             state = AttitudeMapper.new_state()
             att_states[rb_id] = state
+        # 連続性フィルタの伝播レートは primary 機のテレメトリのみ
+        # (他ボディの実レートではない)。鮮度切れはホールド予測に落とす
+        yaw_rate = None
+        if rb_id == self._rigid_body_id:
+            rate_entry = self._yaw_rate
+            if (rate_entry is not None
+                    and (t_mono - rate_entry[1]) <= _YAW_RATE_FRESH_S):
+                yaw_rate = rate_entry[0]
         heading_rad, yaw_true_rad, flip_flags = attitude.derive(
             rotation, transformer, state, t_mono,
-            tracking_valid=tracking_valid)
+            tracking_valid=tracking_valid, yaw_rate_rad_s=yaw_rate)
         error = getattr(rigid_body, "error", None)
         marker_count = len(getattr(rigid_body, "rb_marker_list", []) or [])
 
@@ -763,6 +774,9 @@ class MocapSource:
             "heading_rad": heading_rad,
             "yaw_true_rad": yaw_true_rad,
             "flip_flags": flip_flags,
+            # ヨー連続性フィルタの再整列累計(棄却 >5s → 計測へ再整列。
+            # session 層が増加を警告に変換する)
+            "yaw_cont_realign": state["yaw_filter"].realign_count,
             "quat": rotation,
             "mapping_gen": mapping_gen,
             "tracking_valid": tracking_valid,
@@ -810,6 +824,21 @@ class MocapSource:
         フィルタのアンカーに残るため)。
         """
         self._rigid_body_id = int(rigid_body_id)
+
+    def set_primary_yaw_rate(self, rate_rad_s: Optional[float]) -> None:
+        """primary 機のヨーレート r [rad/s](機体ワイヤ規約)を供給する。
+
+        session の TLM_STATE 受信ハンドラ(RX スレッド)が 25Hz で呼ぶ。
+        ヨー連続性フィルタの棄却中コースト伝播に使う(タプル1個の属性
+        代入なので NatNet 受信スレッドに対してアトミック)。時刻印は
+        pose の t_mono と同じ time.monotonic() 領域(鮮度判定を同一
+        クロックで行うため、session 側の注入クロックとは混ぜない)。
+        None でクリア(伝播なしのホールド予測に落ちる)。
+        """
+        if rate_rad_s is None:
+            self._yaw_rate = None
+        else:
+            self._yaw_rate = (float(rate_rad_s), time.monotonic())
 
     @property
     def machine_wire_y_sign(self) -> Optional[float]:

@@ -488,7 +488,9 @@ async def _handle_command(message: dict) -> None:
     elif action == "set_mode":
         await asyncio.to_thread(session.set_mode, str(message.get("mode", "")))
     elif action == "start":
-        await asyncio.to_thread(session.start)
+        # force: プリフライト・インターロック(P1-2)の明示的解除
+        # (UI「強制離陸」ボタン。省略時は通常ゲート)
+        await asyncio.to_thread(session.start, bool(message.get("force")))
     elif action == "stop":
         await asyncio.to_thread(session.stop)
     elif action == "reset":

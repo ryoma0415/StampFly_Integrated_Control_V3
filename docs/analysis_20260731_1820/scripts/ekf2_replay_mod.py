@@ -96,26 +96,21 @@ FF_EKF_PSI_DOT_CLAMP_RAD_S = 720.0 * DEG         # L156
 FF_EKF_RECAPTURE_AFTER_S = 5.0                   # L161
 FF_EKF_RECAPTURE_MAX_STEP_RAD = 3.0 * DEG        # L164
 
-# ---- EKF2 追加定数 (契約 §2.1 = yaw_config.hpp L179-233 と同名・同値) ----
+# ---- EKF2 追加定数 (契約 §2.1 = yaw_config.hpp L179-213 と同名・同値) ----
 FF_EKF2_R_PSI_RAD2 = (2.0 * DEG) ** 2            # L185 R_ψ 通常 = (2°)²
 FF_EKF2_R_PSI_LOW_TRUST_RAD2 = (6.0 * DEG) ** 2  # L187 low_trust = (6°)²
 FF_EKF2_YAW_GATE_RAD = 30.0 * DEG                # L190 |y|>30° 棄却
-FF_EKF2_YAW_GATE_STOP_COUNT = 25                 # L194 連続棄却N≥25で融合停止
-FF_EKF2_YAW_OBS_HEALTHY_S = 1.0                  # L200 yaw_obs健全(最終受理<1.0s)
-FF_EKF2_Q_BM_LOST_FACTOR = 0.1                   # L201 喪失時 q_bm×0.1(準凍結)
-FF_EKF2_YAW_FRESH_WINDOW_S = 1.0                 # L203 status bit0(受信<1s)
-FF_EKF2_YAW_FUSED_WINDOW_S = 0.5                 # L206 status bit1(受理<0.5s)
-FF_EKF2_FLIGHT_ANCHOR_MIN_FLY_S = 5.0            # L210 flying遷移後>5s
-FF_EKF2_FLIGHT_ANCHOR_ALT_TOL_M = 0.1            # L211 |alt_est−alt_ref|<0.1m
-FF_EKF2_FLIGHT_ANCHOR_ALT_HOLD_S = 2.0           # L212 が2s継続
-FF_EKF2_FLIGHT_ANCHOR_MIN_CURRENT_A = 1.0        # L213 電流>1.0A
-FF_EKF2_FLIGHT_ANCHOR_P_BM_UT2 = 4.0             # L214 P_bm←(2µT)²
+FF_EKF2_YAW_GATE_STOP_COUNT = 25                 # L193 連続棄却N≥25で融合停止
+FF_EKF2_YAW_OBS_HEALTHY_S = 1.0                  # L199 yaw_obs健全(最終受理<1.0s)
+FF_EKF2_Q_BM_LOST_FACTOR = 0.1                   # L200 喪失時 q_bm×0.1(準凍結)
+FF_EKF2_YAW_FRESH_WINDOW_S = 1.0                 # L202 status bit0(受信<1s)
+FF_EKF2_YAW_FUSED_WINDOW_S = 0.5                 # L205 status bit1(受理<0.5s)
+FF_EKF2_FLIGHT_ANCHOR_MIN_FLY_S = 5.0            # L209 flying遷移後>5s
+FF_EKF2_FLIGHT_ANCHOR_ALT_TOL_M = 0.1            # L210 |alt_est−alt_ref|<0.1m
+FF_EKF2_FLIGHT_ANCHOR_ALT_HOLD_S = 2.0           # L211 が2s継続
+FF_EKF2_FLIGHT_ANCHOR_MIN_CURRENT_A = 1.0        # L212 電流>1.0A
+FF_EKF2_FLIGHT_ANCHOR_P_BM_UT2 = 4.0             # L213 P_bm←(2µT)²
 FF_EKF2_FLIGHT_ANCHOR_RING_S = 2.0               # §2.1(3) b_corr_filt の2sリング平均
-# ヨー観測ソフト再捕捉 (融合停止ラッチの状態機械化。FLIGHT_ANALYSIS_20260731)
-FF_EKF2_YAW_RECAPTURE_AFTER_S = 5.0              # L230 段階1: stopped遷移から5s
-FF_EKF2_YAW_RECAPTURE_M = 12                     # L231 段階2: ゲート内12観測連続
-FF_EKF2_YAW_RECAPTURE_DRIFT_RAD_S = 20.0 * DEG   # L232 段階2: 窓ドリフト<20°/s
-FF_EKF2_YAW_RECAPTURE_HOLD_S = 2.0               # L233 段階3: 制限融合2s継続で解除
 
 # EKF ゲートビット (yaw_estimator_kf.hpp L21-31 FfEkfGateBits と同一)
 GATE_R_INFLATED = 1 << 0
@@ -168,8 +163,14 @@ class YawEstimatorKf2Replay:
     (受入基準 #6 の「v5ログで EKF1 相当挙動を再現」検証用)。
     """
 
-    def __init__(self, ekf1_compat: bool = False):
+    def __init__(self, ekf1_compat: bool = False, initial_align: bool = False):
         self.ekf1_compat = ekf1_compat
+        # ---- 改造(scratch専用): 初回整列 — 一度も受理していない状態で
+        # 最初の有効ヨー観測が届いたら、30°ゲートの前に ψ を観測へ reseed して
+        # フレーム整列する(ブートストラップ・デッドロック対策案の効果実証用)。
+        self.initial_align = initial_align
+        self.yaw_align_done = False
+        self.align_event_innov_rad = None
         self.x = np.zeros(4)
         self.P = np.zeros((4, 4))
         self.psi0 = 0.0
@@ -190,14 +191,6 @@ class YawEstimatorKf2Replay:
         self.yaw_obs_stopped = False            # 連続棄却N≥25の融合停止フラグ
         self.yaw_obs_innov = 0.0                # 直近イノベーション (テレメトリ用)
         self.flight_anchor_done = False         # 1フライト1回
-        # ---- ヨー観測ソフト再捕捉 (kf2.hpp L123-131 の状態機械) ----
-        self.yaw_stop_elapsed_s = 0.0           # stopped遷移(段階1再入)からの経過
-        self.yaw_obs_gap_s = 0.0                # 直近ヨー観測からの経過(観測間隔)
-        self.yaw_recapture_streak = 0           # 段階2: ゲート内連続観測カウンタ
-        self.yaw_recapture_innov0 = 0.0         # 段階2窓の先頭イノベーション
-        self.yaw_recapture_window_s = 0.0       # 段階2窓の経過時間
-        self.yaw_recapture_active = False       # 段階3: 制限融合モード (status bit7)
-        self.yaw_recapture_hold_s = 0.0         # 段階3: ゲート内継続時間
 
     # ---- yaw_estimator_kf.cpp L16-26 resetCovariance ----
     def _reset_covariance(self):
@@ -207,22 +200,14 @@ class YawEstimatorKf2Replay:
         self.P[2][2] = FF_EKF_P0_BM_UT2
         self.P[3][3] = FF_EKF_P0_BM_UT2
 
-    # ---- yaw_estimator_kf2.cpp L39-52 resetYawObsState ----
+    # ---- yaw_estimator_kf2.cpp L39-44 resetYawObsState ----
     # ψ が飛ぶ操作 (reanchor / reseedYaw) では連続棄却・融合停止ラッチを解除。
     # time_since_yaw_accept は「未受理」(=τ_bm ホールド側 = 安全側) へ戻す。
-    # ソフト再捕捉状態機械 (FF_EKF2_YAW_RECAPTURE_*) も初期状態へ。
     def _reset_yaw_obs_state(self):
         self.yaw_obs_innov = 0.0
         self.yaw_obs_last_accept_s = math.inf
         self.yaw_obs_reject_count = 0
         self.yaw_obs_stopped = False
-        self.yaw_stop_elapsed_s = 0.0
-        self.yaw_obs_gap_s = 0.0
-        self.yaw_recapture_streak = 0
-        self.yaw_recapture_innov0 = 0.0
-        self.yaw_recapture_window_s = 0.0
-        self.yaw_recapture_active = False
-        self.yaw_recapture_hold_s = 0.0
 
     # ---- yaw_estimator_kf.cpp L28-44 reanchor (地上アンカー) ----
     def reanchor(self, psi0_rad: float, b0h_x: float, b0h_y: float, b0_full):
@@ -340,13 +325,9 @@ class YawEstimatorKf2Replay:
                 self.P[3][3] = min(self.P[3][3] * factor,
                                    max(self.P[3][3], bm_cap))
 
-        # EKF2 追加: ヨー観測タイマの前進 (kf2.cpp L131-135: 観測間隔と
-        # ソフト再捕捉 段階1の経過もここで計時)
+        # EKF2 追加: ヨー観測タイマの前進
         self.yaw_obs_last_accept_s += dt_s
         self.yaw_obs_last_recv_s += dt_s
-        self.yaw_obs_gap_s += dt_s
-        if self.yaw_obs_stopped:
-            self.yaw_stop_elapsed_s += dt_s
 
     # ---- yaw_estimator_kf.cpp L145-382 update (磁気観測) — 完全同一 ----
     def update(self, b_corr_filt, roll_rad, pitch_rad,
@@ -488,81 +469,34 @@ class YawEstimatorKf2Replay:
             bits |= GATE_DRIFT_WARN
         self.gate_bits = bits
 
-    # ---- yaw_estimator_kf2.cpp L428-618 updateYawObs (契約 §2.1-1) ----
+    # ---- yaw_estimator_kf2.cpp L415-507 updateYawObs (契約 §2.1-1) ----
     def update_yaw_obs(self, psi_meas_rad: float, low_trust: bool) -> bool:
         """H=[1,0,0,0] のスカラー逐次更新(4状態全てに効かせる — b_g/b_m は
-        P の相関経由で可観測化。これが本体)。戻り値: 状態を更新したか
-        (制限融合を含む。「受理」= yaw_obs_last_accept_s リセットは通常融合のみ)。"""
+        P の相関経由で可観測化。これが本体)。戻り値: 受理したか。"""
         if not self.anchor_valid or not math.isfinite(psi_meas_rad):
             return False
         self.yaw_obs_last_recv_s = 0.0
-        # 観測間隔 (predict 側で積算した実時間。kf2.cpp L437-440)
-        obs_dt = self.yaw_obs_gap_s
-        self.yaw_obs_gap_s = 0.0
         y = wrap_pi(psi_meas_rad - self.x[0])
         self.yaw_obs_innov = y  # 棄却・融合停止中もテレメトリへ残す
 
-        # ゲート: |y|>30° は棄却+カウンタ。連続 N≥25 で融合停止ラッチ。
-        # 解除は reanchor / reseedYaw、またはソフト再捕捉状態機械
-        # (FF_EKF2_YAW_RECAPTURE_*。kf2.cpp L445-521。FLIGHT_ANALYSIS_20260731:
-        #  飛行中の恒久ラッチ発動 = fused 0% への回復経路)。
+        # ---- 改造: 初回整列 (未融合なら初回有効観測で ψ を reseed) ----
+        if self.initial_align and not self.yaw_align_done:
+            self.yaw_align_done = True
+            if abs(y) > FF_EKF2_YAW_GATE_RAD:
+                self.align_event_innov_rad = float(y)
+                self.reseed_yaw(psi_meas_rad)   # P0リセット+ラッチ解除込み
+                self.yaw_obs_last_accept_s = 0.0
+                return True
+
+        # ゲート: |y|>30° は棄却+カウンタ。連続 N≥25 で融合停止ラッチ
+        # (解除は reanchor / reseedYaw — kf2.cpp L428-443)。
         if abs(y) > FF_EKF2_YAW_GATE_RAD:
             self.yaw_obs_reject_count = min(self.yaw_obs_reject_count + 1, 255)
-            if (self.yaw_obs_reject_count >= FF_EKF2_YAW_GATE_STOP_COUNT and
-                    not self.yaw_obs_stopped):
+            if self.yaw_obs_reject_count >= FF_EKF2_YAW_GATE_STOP_COUNT:
                 self.yaw_obs_stopped = True
-                self.yaw_stop_elapsed_s = 0.0  # 再捕捉 段階1の起点
-            # ゲート外 → 段階2の窓は破棄。制限融合中 (段階3) なら段階1へ戻る
-            # (5s 待機からやり直し。kf2.cpp L458-467)
-            self.yaw_recapture_streak = 0
-            self.yaw_recapture_window_s = 0.0
-            if self.yaw_recapture_active:
-                self.yaw_recapture_active = False
-                self.yaw_recapture_hold_s = 0.0
-                self.yaw_stop_elapsed_s = 0.0
             return False
         self.yaw_obs_reject_count = 0
-
-        if self.yaw_obs_stopped and not self.yaw_recapture_active:
-            # ---- ソフト再捕捉 段階1→2 (融合はまだ行わない。kf2.cpp L471-509) ----
-            # 段階1: stopped 遷移 (または段階3からの転落) から 5s は再入不能。
-            if self.yaw_stop_elapsed_s < FF_EKF2_YAW_RECAPTURE_AFTER_S:
-                self.yaw_recapture_streak = 0
-                self.yaw_recapture_window_s = 0.0
-                return False
-            # 段階2: ゲート内が M 観測連続、かつ窓のイノベーションドリフト
-            # レートが閾値未満なら段階3 (制限融合) へ。観測ストリーム断 (>1s)
-            # は「連続」が切れたとみなし窓を貯め直す (防御的継続性検査)。
-            if obs_dt > FF_EKF2_YAW_FRESH_WINDOW_S:
-                self.yaw_recapture_streak = 0
-            if self.yaw_recapture_streak == 0:
-                self.yaw_recapture_innov0 = y
-                self.yaw_recapture_window_s = 0.0
-            else:
-                self.yaw_recapture_window_s += obs_dt
-            self.yaw_recapture_streak += 1
-            if self.yaw_recapture_streak >= FF_EKF2_YAW_RECAPTURE_M:
-                # ドリフトレートは窓全体の平均 |Δinnov|/T (観測毎差分だと基準
-                # ヨーのフレームジッタで誤遮断)。誤基準 (鏡像) のまま回頭中は
-                # d(innov)/dt≈2ψ̇ がここで遮断される (kf2.cpp L494-507)。
-                drift_rad_s = (abs(wrap_pi(y - self.yaw_recapture_innov0)) /
-                               self.yaw_recapture_window_s
-                               if self.yaw_recapture_window_s > 1.0e-3 else 1.0e6)
-                if drift_rad_s < FF_EKF2_YAW_RECAPTURE_DRIFT_RAD_S:
-                    self.yaw_recapture_active = True  # 段階3: 制限融合モードへ
-                    self.yaw_recapture_hold_s = 0.0
-                # 判定は窓単位: 不合格なら窓を貯め直す
-                self.yaw_recapture_streak = 0
-                self.yaw_recapture_window_s = 0.0
-            return False
-        if self.yaw_recapture_active and obs_dt > FF_EKF2_YAW_FRESH_WINDOW_S:
-            # 段階3中の観測ストリーム断: ゲート内「継続」を確認できないため
-            # 段階1へ戻る (kf2.cpp L510-520)
-            self.yaw_recapture_active = False
-            self.yaw_recapture_hold_s = 0.0
-            self.yaw_recapture_streak = 0
-            self.yaw_recapture_window_s = 0.0
-            self.yaw_stop_elapsed_s = 0.0
+        if self.yaw_obs_stopped:
             return False
 
         r_psi = FF_EKF2_R_PSI_LOW_TRUST_RAD2 if low_trust else FF_EKF2_R_PSI_RAD2
@@ -573,44 +507,17 @@ class YawEstimatorKf2Replay:
         # Δψ クランプ ±3°/更新 (FF_EKF_RECAPTURE_MAX_STEP_RAD 流用。§2.1(1))
         dx0 = K[0] * y
         clamped = abs(dx0) > FF_EKF_RECAPTURE_MAX_STEP_RAD
-        if clamped or self.yaw_recapture_active:
-            # クランプ発動時は制限付き更新 (kf2.cpp の制限付き更新ブロック。
+        if clamped:
+            # クランプ発動時は制限付き更新 (kf2.cpp updateYawObs と同一。
             # recapture と同流儀): バイアス行 K=0 (stale 相関経由の一撃防止)、
-            # ψ 行は実効ゲイン K0_eff=Δψ_clamp/y。ソフト再捕捉の制限融合モード
-            # (段階3) 中は未クランプでも常時この経路。
-            if clamped:
-                dx0 = math.copysign(FF_EKF_RECAPTURE_MAX_STEP_RAD, dx0)
-                k0 = dx0 / y  # |y|>3° のためゼロ除算なし
-            else:
-                k0 = float(K[0])
-            self.x[0] = wrap_pi(self.x[0] + dx0)
-            # P 更新は Joseph 形 (I−KH)P(I−KH)ᵀ+KRKᵀ の K=[k0,0,0,0] 特殊化:
-            # P00←(1−k0)²P00+k0²R_ψ, P0c←(1−k0)P0c, 他は不変。劣最適ゲインに
-            # 簡略形 (I−KH)P を使うと stale 相関が残って P が非正定に転落し
-            # 融合が恒久停止する (kf2.cpp 同ブロックのコメント参照)。
-            omk = 1.0 - k0
-            self.P[0, 1:] *= omk
-            self.P[1:, 0] = self.P[0, 1:]
-            self.P[0][0] = omk * omk * self.P[0][0] + k0 * k0 * r_psi
-        else:
-            self.x[0] = wrap_pi(self.x[0] + dx0)
-            self.x[1:] += K[1:] * y
-            # P = (I − K·H)·P, H=[1,0,0,0] → 対称化 (最適ゲインの標準形)
-            newP = self.P - np.outer(K, self.P[0])
-            self.P = 0.5 * (newP + newP.T)
-
-        if self.yaw_recapture_active:
-            # ---- 段階3→4: 制限融合中は「受理」に数えない (kf2.cpp L602-615:
-            # yaw_obs_last_accept_s は進めたまま = q_bm ホールド維持・
-            # yaw_obs_fused / 飛行状態再アンカー条件は成立させない)。
-            # ゲート内のまま HOLD_S 継続でラッチ完全解除 → 通常融合へ。
-            self.yaw_recapture_hold_s += obs_dt
-            if self.yaw_recapture_hold_s >= FF_EKF2_YAW_RECAPTURE_HOLD_S:
-                self.yaw_obs_stopped = False
-                self.yaw_recapture_active = False
-                self.yaw_recapture_hold_s = 0.0
-            return True
-
+            # ψ 行は実効ゲイン K0_eff=Δψ_clamp/y (状態と P 更新の整合。保守側)。
+            dx0 = math.copysign(FF_EKF_RECAPTURE_MAX_STEP_RAD, dx0)
+            K = np.array([dx0 / y, 0.0, 0.0, 0.0])  # |y|>3° のためゼロ除算なし
+        self.x[0] = wrap_pi(self.x[0] + dx0)
+        self.x[1:] += K[1:] * y
+        # P = (I − K·H)·P, H=[1,0,0,0] → 対称化
+        newP = self.P - np.outer(K, self.P[0])
+        self.P = 0.5 * (newP + newP.T)
         self.yaw_obs_last_accept_s = 0.0
         return True
 
@@ -627,8 +534,6 @@ class YawEstimatorKf2Replay:
             bits |= 0x08                       # tau_rw_mode (RW側)
         if self.mag_frozen:
             bits |= 0x10
-        if self.yaw_recapture_active:
-            bits |= 0x80                       # yaw_recapture (制限融合モード)
         return bits
 
 
@@ -778,7 +683,8 @@ def run_replay(data: dict, *,
                b0h_ut: float = 27.9,
                enable_flight_anchor: bool = True,
                align_yaw_obs: bool = True,
-               ekf1_compat: bool = False) -> dict:
+               ekf1_compat: bool = False,
+               initial_align: bool = False) -> dict:
     """飛行ログ dict → リプレイ結果 dict(時系列と統計)。
 
     yaw_obs_mode: "none" / "mocap"(mocap_yaw_true_deg) / 任意のrad列名。
@@ -821,7 +727,8 @@ def run_replay(data: dict, *,
     if magbias is not None and magbias.get("delta_b_ut"):
         dbias = np.asarray(magbias["delta_b_ut"], float)
 
-    kf = YawEstimatorKf2Replay(ekf1_compat=ekf1_compat)
+    kf = YawEstimatorKf2Replay(ekf1_compat=ekf1_compat,
+                               initial_align=initial_align)
     if ekf1_compat:
         enable_flight_anchor = False
         warnings.append("EKF1互換モード: τ_bm GM減衰・固定q_bm・飛行再アンカー無効")
@@ -916,7 +823,7 @@ def run_replay(data: dict, *,
     last_fresh_t = None
     out = {k: np.full(n, np.nan) for k in
            ("psi", "bm_x", "bm_y", "nis", "gate", "status", "yaw_innov",
-            "zx", "zy", "db_hat_x", "db_hat_y")}
+            "zx", "zy", "db_hat_x", "db_hat_y", "obs_accept", "obs_stopped")}
     fly_since = None
     alt_ok_since = None
     ring: list[tuple[float, np.ndarray]] = []   # 飛行中 b_corr_filt 2s リング
@@ -987,8 +894,10 @@ def run_replay(data: dict, *,
 
         # ---- ヨー擬似観測 (bit3有効+age<100ms 相当 = フレーム毎) ----
         if math.isfinite(yaw_obs[k]):
-            kf.update_yaw_obs(float(yaw_obs[k]), low_trust)
+            acc = kf.update_yaw_obs(float(yaw_obs[k]), low_trust)
             out["yaw_innov"][k] = kf.yaw_obs_innov
+            out["obs_accept"][k] = 1.0 if acc else 0.0
+            out["obs_stopped"][k] = 1.0 if kf.yaw_obs_stopped else 0.0
 
         # ---- 飛行状態再アンカー (契約 §2.1(3)) ----
         if enable_flight_anchor and is_v6 and not kf.flight_anchor_done:
@@ -1032,6 +941,8 @@ def run_replay(data: dict, *,
         "psi_ekf2_rad": out["psi"], "bm_x_ut": out["bm_x"], "bm_y_ut": out["bm_y"],
         "nis": out["nis"], "gate": out["gate"], "status": out["status"],
         "yaw_innov_rad": out["yaw_innov"],
+        "obs_accept": out["obs_accept"], "obs_stopped": out["obs_stopped"],
+        "align_innov_rad": kf.align_event_innov_rad,
         "zx_ut": out["zx"], "zy_ut": out["zy"],
         "db_hat_x_ut": out["db_hat_x"], "db_hat_y_ut": out["db_hat_y"],
         "psi_ekf1_log_rad": yaw_est_log, "mocap_true_rad": mocap_true_rad,

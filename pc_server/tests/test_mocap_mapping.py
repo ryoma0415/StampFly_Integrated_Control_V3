@@ -23,6 +23,7 @@ from core.mocap import (
     CoordinateTransformer,
     MocapSource,
     validate_mapping,
+    wrap_pi,
 )
 
 DEG = math.pi / 180.0
@@ -136,11 +137,12 @@ def test_up_axis_guard_holds_state_near_gate(transformer, mapper):
     assert not (flags & AttitudeMapper.FLIP_UP_INVERTED)
 
 
-def test_yaw_continuity_guard_corrects_180_jump(transformer):
-    """鉛直軸まわりの180°別解(上方軸では検出不能)を継続性で補正する。
+def test_yaw_continuity_filter_rejects_180_jump(transformer):
+    """鉛直軸まわりの180°別解(上方軸では検出不能)を連続性フィルタが棄却する。
 
-    フレーム間で +180° 跳んだヨーは補正されて連続に保たれ、
-    反転が解けたフレームで補正も自動解除される。
+    フレーム間で +180° 跳んだヨーは棄却され予測(直近受理値)でコースト、
+    反転が解けたフレームで計測が受理に戻る(2026-07-31 改修: 旧180°トグル
+    補正は連続性フィルタへ統合。静止中の出力は旧実装と同値)。
     """
     mapper = AttitudeMapper(None)
     state = mapper.new_state()
@@ -151,14 +153,14 @@ def test_yaw_continuity_guard_corrects_180_jump(transformer):
     _, y2, f2 = mapper.derive(q_vflip, transformer, state, 0.01)
     assert f2 & AttitudeMapper.FLIP_YAW_JUMP
     assert math.degrees(y2) == pytest.approx(math.degrees(y1), abs=1e-6)
-    # 別解が解けたフレーム: 再び180°跳ぶ → トグル解除で連続のまま
+    # 別解が解けたフレーム: 計測が予測±30°内へ戻る → 再受理・フラグ解除
     _, y3, f3 = mapper.derive(q, transformer, state, 0.02)
     assert not (f3 & AttitudeMapper.FLIP_YAW_JUMP)
     assert math.degrees(y3) == pytest.approx(math.degrees(y1), abs=1e-6)
 
 
-def test_yaw_continuity_guard_resets_after_gap(transformer):
-    """受信ギャップ(>0.5s)を跨いだら継続性を主張しない(補正破棄)。"""
+def test_yaw_continuity_filter_reseeds_after_gap(transformer):
+    """受信ギャップ(>0.5s)を跨いだら連続性を主張しない(計測で再シード)。"""
     mapper = AttitudeMapper(None)
     state = mapper.new_state()
     q = quat_about_y(10.0 * DEG)
@@ -166,7 +168,7 @@ def test_yaw_continuity_guard_resets_after_gap(transformer):
     q_vflip = quat_mul(quat_about_y(math.pi), q)
     _, _, f2 = mapper.derive(q_vflip, transformer, state, 0.01)
     assert f2 & AttitudeMapper.FLIP_YAW_JUMP
-    # 1.0s のギャップ後: 蓄積補正は破棄され、観測をそのまま信じる
+    # 1.0s のギャップ後: 予測は破棄され、観測をそのまま信じる
     _, y3, f3 = mapper.derive(q_vflip, transformer, state, 1.01)
     assert not (f3 & AttitudeMapper.FLIP_YAW_JUMP)
     _, y_raw, _ = AttitudeMapper(None).derive(
@@ -178,11 +180,14 @@ def test_flip_correction_disabled(transformer):
     mapper = AttitudeMapper({"flip_correction": False})
     state = mapper.new_state()
     q = quat_about_y(10.0 * DEG)
-    mapper.derive(q, transformer, state, 0.00)
+    _, y1, _ = mapper.derive(q, transformer, state, 0.00)
     q_vflip = quat_mul(quat_about_y(math.pi), q)
     _, y2, f2 = mapper.derive(q_vflip, transformer, state, 0.01)
-    assert f2 == 0   # 補正なし: 跳んだまま(生の観測)
-    assert state["last_yaw"] is None
+    assert f2 == 0   # フィルタなし: 跳んだまま(生の観測)
+    assert math.degrees(abs(wrap_pi(y2 - y1))) == pytest.approx(180.0,
+                                                                abs=1e-6)
+    # 連続性フィルタは一切触られていない(未シードのまま)
+    assert state["yaw_filter"]._y_pred is None
 
 
 # ----------------------------------------------------------------------
@@ -363,24 +368,24 @@ def test_mocap_mapping_status_shape(session_factory):
 # ----------------------------------------------------------------------
 
 def test_continuity_guard_frozen_while_tracking_invalid(transformer):
-    """tracking_valid=0(オクルージョン)中は継続性状態を更新しない。
+    """tracking_valid=0(オクルージョン)中は連続性フィルタを更新しない。
 
     遮蔽中に実機が回転しても、再捕捉時はギャップ扱いで観測を信じ直す
-    (遮蔽中の外挿姿勢で180°誤補正を蓄積しない)。
+    (遮蔽中の外挿姿勢で誤った予測を蓄積しない)。
     """
     mapper = AttitudeMapper(None)
     state = mapper.new_state()
     q0 = quat_about_y(10.0 * DEG)
     mapper.derive(q0, transformer, state, 0.00)
-    t_before = state["last_t"]
-    # 遮蔽中: ソルバ外挿の擬似的な大ジャンプが来ても状態は不変
+    t_before = state["yaw_filter"]._last_t
+    # 遮蔽中: ソルバ外挿の擬似的な大ジャンプが来てもフィルタ状態は不変
     q_flip = quat_mul(quat_about_y(math.pi), q0)
     _, _, flags = mapper.derive(q_flip, transformer, state, 0.01,
                                 tracking_valid=False)
     assert not (flags & AttitudeMapper.FLIP_YAW_JUMP)
-    assert state["cont_flip"] is False
-    assert state["last_t"] == t_before          # 更新されていない
-    # 0.6s 遮蔽ののち反対側で再捕捉: ギャップリセットで観測をそのまま信じる
+    assert state["yaw_filter"]._last_t == t_before   # 更新されていない
+    assert state["yaw_filter"].rejecting is False
+    # 0.6s 遮蔽ののち反対側で再捕捉: ギャップ再シードで観測をそのまま信じる
     q1 = quat_about_y(-170.0 * DEG)
     _, yaw, flags = mapper.derive(q1, transformer, state, 0.61)
     assert not (flags & AttitudeMapper.FLIP_YAW_JUMP)
@@ -402,17 +407,17 @@ def test_up_guard_frozen_while_tracking_invalid(transformer, mapper):
 
 
 def test_continuity_guard_short_vertical_episode_resets(transformer, mapper):
-    """前方軸が鉛直付近を通過したら(0.5s 未満でも)継続性を破棄する。
+    """前方軸が鉛直付近を通過したら(0.5s 未満でも)連続性を破棄する。
 
-    鉛直中の方位は不定のため、復帰フレームはギャップ扱いになり
-    蓄積した180°補正は残らない。
+    鉛直中の方位は不定のため、復帰フレームは計測での再シードになり
+    誤った予測は残らない。
     """
     state = mapper.new_state()
     mapper.derive(quat_about_y(10.0 * DEG), transformer, state, 0.00)
     # 前方軸を鉛直へ(Motive Y-up: ボディ+X が上を向く回転 = Z まわり +90°)
     q_vert = (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0))
     mapper.derive(q_vert, transformer, state, 0.05)
-    assert state["last_t"] is None              # 継続性を明示破棄
+    assert state["yaw_filter"]._y_pred is None      # 連続性を明示破棄
     # 0.1s 後(ギャップ 0.5s 未満)に水平で復帰 + 180° 跳んだ観測
     q_back = quat_about_y(-170.0 * DEG)
     _, yaw, flags = mapper.derive(q_back, transformer, state, 0.15)
@@ -498,7 +503,13 @@ def test_machine_wire_y_sign_classification():
 
 
 class TestWireFrameConversion:
-    """CMD_POS_ERR 送信時の機体フレーム変換(単機 session 経路)。"""
+    """CMD_POS_ERR 送信時の機体フレーム変換(単機 session 経路)。
+
+    2026-07-31 改修(P0-1)後の契約: wire_sign(machine_wire_y_sign)は
+    err_y(と接線ヨー)にのみ適用され、ヨー基準(mocap_yaw 欄)は
+    連続性フィルタ後の yaw_true(パネル較正変換 = 表示列と同一)を
+    整列方式に従い送る — heading×wire_sign の旧経路は廃止。
+    """
 
     def _meta(self, **overrides) -> dict:
         meta = {
@@ -506,6 +517,7 @@ class TestWireFrameConversion:
             "mocap_dropout": False, "error_x": 0.35, "error_y": -0.2,
             "yaw_ref_rad": 0.5, "yaw_ctrl_on": True,
             "mocap_heading_rad": 1.62,
+            "mocap_yaw_true_rad": 1.62,   # 既定較正(sign=1, offset=0)相当
         }
         meta.update(overrides)
         return meta
@@ -523,9 +535,10 @@ class TestWireFrameConversion:
         transport.sent_frames.clear()
 
     def test_legacy_mapping_unchanged(self, session_factory):
-        """レガシーフレーム(det=−1)は無変換 = 従来とビット一致。"""
+        """レガシーフレーム(det=−1)+absolute 整列: 送信値は yaw_true。"""
         import stampfly_protocol as proto
         session, transport, _ = session_factory()
+        assert session.set_yaw_ref_align("absolute")["ok"]
         self._connect_quiet(session, transport)
         session._emit_setpoint(0.0, 0.0, 0.5, self._meta())
         pe = self._sent(transport)[0]
@@ -533,27 +546,31 @@ class TestWireFrameConversion:
         assert pe.mocap_yaw == pytest.approx(1.62)
         assert pe.flags & proto.CmdPosErr.FLAG_XY_ERR_VALID
 
-    def test_right_handed_mapping_negates_err_y_and_heading(
+    def test_right_handed_mapping_negates_err_y_only(
             self, session_factory, control_json_path):
-        """右手系マッピング適用中は err_y と方位角を反転して送る。
+        """右手系マッピング適用中は err_y のみ反転して送る。
 
         検証済みフレーム代数: wire = diag(1,−1)·e_ctrl = e_legacy により
         機上XY制御は全ヨー角で負帰還に戻る(y=+0.2 目標で −y へ飛ぶ
-        正帰還の修正)。
+        正帰還の修正)。ヨー基準はパネル較正済み yaw_true が単一情報源の
+        ため wire_sign を掛けない(旧実装の heading×wire_sign は較正が
+        乗らず 7/31 の基準鏡像化事故を招いた — P0-1)。
         """
         import stampfly_protocol as proto
         session, transport, _ = session_factory()
         result = session.update_mocap_mapping(
             {"coordinate_transform": RIGHT_HANDED_TRANSFORM,
-             "attitude_transform": {}})
+             "attitude_transform": {"yaw_sign": -1}})
         assert result["ok"], result
         assert result["machine_frame"] == "mirrored_y"
+        assert session.set_yaw_ref_align("absolute")["ok"]
         self._connect_quiet(session, transport)
-        session._emit_setpoint(0.0, 0.0, 0.5, self._meta())
+        session._emit_setpoint(0.0, 0.0, 0.5, self._meta(
+            mocap_yaw_true_rad=-1.62))   # 較正(yaw_sign=−1)適用済みの値
         pe = self._sent(transport)[0]
         assert pe.err_x == pytest.approx(0.35)      # x は不変
         assert pe.err_y == pytest.approx(+0.2)      # 反転
-        assert pe.mocap_yaw == pytest.approx(-1.62)  # 方位角も反転
+        assert pe.mocap_yaw == pytest.approx(-1.62)  # 較正済み値そのまま
         assert pe.yaw_ref == pytest.approx(0.5)     # スライダ由来ヨーは不変
         assert pe.flags & proto.CmdPosErr.FLAG_XY_ERR_VALID
 
