@@ -18,7 +18,8 @@
 //
 // 【V2変更】移植元 (StampFly_Telemetry flow_persistence) は軸マッピング
 // (xsrc/ysrc/xsig/ysig) も永続化していたが、契約 §2.5 のスキーマは行列のみ。
-// 軸マッピング・符号は flow_hub の既定値 (x=dx/+, y=dy/+) に固定する。
+// 軸マッピング・符号は flow_hub の既定値に固定する(【2026-07-31 修正】
+// StampFly 実装の検証済み搭載向き 機体x=−dy / 機体y=+dx。flow_hub.hpp 参照)。
 
 void saveFlowcal(bool valid, float m00, float m01, float m10, float m11);
 void clearFlowcal();

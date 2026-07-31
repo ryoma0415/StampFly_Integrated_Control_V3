@@ -42,9 +42,15 @@
 // flowcalMatrixValid が事前に拒否)。
 struct FlowCalibration {
     bool valid = false;    // NVS 較正済みか(false でも既定行列で換算は行う)
-    uint8_t x_src = 0;     // 0=dx, 1=dy(V2: 既定固定。ワイヤ設定なし)
-    uint8_t y_src = 1;
-    float x_sign = 1.0f;   // ±1(V2: 既定固定)
+    // 軸マッピング(V2: 既定固定。ワイヤ設定なし)。StampFly 実装の搭載向きは
+    // 機体x = −dy / 機体y = +dx(Telemetry drone3 純回転較正で実機検証済み:
+    // flowcal_20260713_111537.json xsrc=1/xsig=-1/ysrc=0/ysig=+1)。
+    // 【2026-07-31 修正】移植時に恒等 (x=dx/+, y=dy/+) へ誤って固定されており、
+    // フロー較正パネル初回実行で φ0≈−92° として検出された(欠落90°+実ひねり)。
+    // 90°級の入替はここで持ち、K 行列は微小回転・スケールのみを担う。
+    uint8_t x_src = 1;     // 0=dx, 1=dy
+    uint8_t y_src = 0;
+    float x_sign = -1.0f;  // ±1
     float y_sign = 1.0f;
     // K 行列 [counts/rad](既定 diag(450,450))
     float m00 = FLOW_DEFAULT_SCALE_COUNTS_PER_RAD;

@@ -147,6 +147,11 @@ valid_flags: **bit6=magbias有効、bit7=flowcal有効** 新設(bit5=ffcalは既
   (既定固定)適用後のカウントレートに rate = K⁻¹·counts_rate(ジャイロ補償より
   前)。K⁻¹ は NVS ロード/CMD_FLOWCAL_SET 適用時に一度計算してキャッシュ
   (det≈0 は flowcalMatrixValid が事前拒否+computeInverse の二重ガード)。
+- **【2026-07-31 修正】軸マッピング既定は 機体x=−dy / 機体y=+dx**(Telemetry
+  drone3 純回転較正で実機検証済みの搭載向き)。移植時に恒等へ誤固定されており、
+  フロー較正パネル初回実行が φ0≈−92°(欠落90°+実ひねり)として検出した。
+  90°級の入替はマッピング定数が持ち、K 行列は微小回転・スケールのみを担う。
+  ※修正前のログ(7/31飛行含む)の tlm_flow_vx/vy は旧軸(90°回り)である点に注意。
 - **PC側較正フィット(core/flowcal.py)の距離復元**: ファームの v=trans·d は
   ToF **生スラント距離**を使うが、TLM_STATE の altitude_tof はチルト補正+LPF後。
   フィットでは d_slant = altitude_tof / max(cosφ·cosθ, 0.2) で復元して整合させる
