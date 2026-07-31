@@ -41,3 +41,8 @@ data_analysis/replay/out/
 
 # 参照用の別プロジェクトコピー(正本は ../StampFly_Telemetry。199MB・ビルド生成物含むため管理外)
 /StampFly_Telemetry/
+
+# サーバーが管理する適用状態の記録(実行時状態。プロファイルJSONは管理対象)
+pc_server/data/ff_state.json
+pc_server/data/flowcal_state.json
+pc_server/data/magbias_state.json
