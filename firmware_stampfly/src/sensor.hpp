@@ -74,6 +74,8 @@ float sensor_read(void);
 void sensor_reset_offset(void);
 void sensor_calc_offset_avarage(void);
 void ahrs_reset(void);
+// Madgwickヨーのみゼロ化(ロール/ピッチ無傷)+ジャイロ積算0(ヨーゼロ設定用)
+void ahrs_zero_yaw(void);
 uint8_t scan_i2c(void);
 
 #endif

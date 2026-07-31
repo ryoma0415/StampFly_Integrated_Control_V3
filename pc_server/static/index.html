@@ -564,6 +564,16 @@
           <span>フィット K</span><span id="fcMatrix">--</span>
           <span>機体の現在 K(CAL_GET)</span><span id="fcDroneMatrix">--</span>
         </div>
+        <hr class="exp-sep">
+        <div class="ff-quick-row">
+          <span class="mlabel">プロファイル</span>
+          <select id="flowcalSelect" title="フィット合格時に data/flowcal_profiles/ へ自動保存されたプロファイル"></select>
+          <button id="btnFlowcalProfileApply" class="btn btn-small btn-primary" disabled>選択を適用(NVS書込)</button>
+          <button id="btnFlowcalProfileDelete" class="btn btn-small" disabled>削除</button>
+        </div>
+        <p class="note">フィット合格時はプロファイル(flowcal_&lt;日時&gt;.json)が自動保存されます。
+          過去の較正はここから選択して再適用できます(適用の流れは通常適用と同じ:
+          CMD送信 &rarr; CAL_GET 読み戻し照合 &rarr; 適用状態記録)。</p>
         <div class="ff-banner" id="flowcalApplied">flowcal: 未適用(既定 diag(450,450))</div>
         <div class="exp-msg" id="flowcalMsg">--</div>
       </div>
@@ -753,7 +763,7 @@
       <div class="preset-row wrap">
         <button class="btn btn-small" data-quickcal-action="attitude_zero">Attitude 0</button>
         <button class="btn btn-small" data-quickcal-action="attitude_clear">Attitude Clear</button>
-        <button class="btn btn-small" data-quickcal-action="yaw_zero" title="FF を一時停止してヨーゼロを設定し、FFモード復元+アンカー再取得まで自動実行します">Yaw 0</button>
+        <button class="btn btn-small" data-quickcal-action="yaw_zero" title="FF を一時停止してヨーゼロを設定し、FFモード復元+アンカー再取得まで自動実行します(機体側で Madgwick ヨーとジャイロ積算も同時にゼロ化。ロール/ピッチは無傷)">Yaw 0</button>
         <button class="btn btn-small" data-quickcal-action="yaw_clear" title="FF を一時停止してヨーゼロを解除し、FFモード復元+アンカー再取得まで自動実行します">Yaw Clear</button>
       </div>
       <div class="exp-msg" id="quickcalMsg">現在姿勢/ヨーをゼロ基準として機体に設定します(全モード・地上でのみ)</div>

@@ -1,0 +1,31 @@
+{
+  "schema": "stampfly_flowcal_profile",
+  "version": 2,
+  "name": "flowcal_20260731_DroneX",
+  "memo": "研究室_DroneX 7/31 軸修正後較正(φ0=-1.04°)。適用検証済み",
+  "created_at": "2026-07-31T21:12:13.550699+09:00",
+  "matrix": [
+    491.928,
+    2.138,
+    -15.986,
+    500.559
+  ],
+  "kx": 492.19,
+  "ky": 500.56,
+  "phi0_deg": -1.04,
+  "ratio": 1.017,
+  "det": 246273.2,
+  "r2x": 0.9043,
+  "r2y": 0.9244,
+  "excitation_q_rad_s": null,
+  "excitation_p_rad_s": null,
+  "n_used": 768,
+  "n_rejected": null,
+  "n_valid": null,
+  "n_total": null,
+  "k_cur": null,
+  "provenance": {
+    "imported_from": "flowcal_state.json applied(適用時刻 1785499933 = 2026-07-31 21:12 JST)",
+    "note": "蓄積型プロファイル導入前の較正結果を新スキーマへ正規化した初回取込み"
+  }
+}

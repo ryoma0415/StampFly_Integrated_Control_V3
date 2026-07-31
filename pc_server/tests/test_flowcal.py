@@ -17,10 +17,12 @@ import pytest
 
 import stampfly_protocol as proto
 
+from core import config as cfg
 from core.flowcal import (
     FLOWCAL_DEFAULT_SCALE, FLOWCAL_MIN_SAMPLES,
+    FLOWCAL_PROFILE_SCHEMA, FLOWCAL_PROFILE_VERSION,
     flowcal_fit, flowcal_live_metrics, flowcal_matrix_fw_valid,
-    flowcal_sample_valid,
+    flowcal_profile_matrix, flowcal_sample_valid,
 )
 from core.session import MODE_EXPERIMENT
 
@@ -283,6 +285,7 @@ def flowcal_session(server_config, session_factory, tmp_path):
     assert session.set_mode(MODE_EXPERIMENT)
     mgr = session.flowcal
     mgr.state_path = tmp_path / "flowcal_state.json"
+    mgr.profile_dir = tmp_path / "flowcal_profiles"
     # TLM_STATE を 1 フレーム届けておく(記録開始ゲートの鮮度要件)
     transport.push(proto.MsgType.TLM_STATE, make_flow_tlm().to_payload())
     assert wait_until(lambda: session._tlm_state_snapshot()[0] is not None)
@@ -566,3 +569,174 @@ class TestApplyUnverified:
                        responder.cal_data.to_payload())
         assert wait_until(lambda: (mgr.status()["drone"] or {}).get("valid"))
         assert mgr.status()["verify_warning"] is None
+
+
+# ---------------------------------------------------------------------------
+# 蓄積型プロファイル(保存/一覧/選択適用/削除。magbias/ff と同じ管理様式)
+# ---------------------------------------------------------------------------
+
+def write_profile(mgr, name, matrix, **extra):
+    """テスト用にプロファイル JSON を直接書く(schema は既定で正)。"""
+    mgr.profile_dir.mkdir(parents=True, exist_ok=True)
+    data = {"schema": FLOWCAL_PROFILE_SCHEMA,
+            "version": FLOWCAL_PROFILE_VERSION,
+            "name": name, "memo": "", "created_at": "2026-07-31T00:00:00+09:00",
+            "matrix": list(matrix), **extra}
+    (mgr.profile_dir / f"{name}.json").write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return data
+
+
+class TestProfiles:
+    def _fit_ok(self, mgr, k_true=None):
+        assert mgr.start_record()["ok"]
+        feed_synthetic(mgr, k_true or diag_rot_matrix(500.0, 480.0, -9.4),
+                       K_CUR_DEFAULT)
+        result = mgr.stop_and_fit()
+        assert result["ok"], result["fit"]
+        return result
+
+    def test_pass_fit_saves_profile(self, flowcal_session):
+        """合格フィットは flowcal_profiles/<name>.json へ自動保存される。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        result = self._fit_ok(mgr)
+        name = result.get("profile_saved")
+        assert name and name.startswith("flowcal_")
+        path = mgr.profile_dir / f"{name}.json"
+        assert path.is_file()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["schema"] == FLOWCAL_PROFILE_SCHEMA
+        assert data["version"] == FLOWCAL_PROFILE_VERSION
+        assert data["name"] == name
+        assert isinstance(data["created_at"], str) and data["created_at"]
+        fit = result["fit"]
+        assert data["matrix"] == pytest.approx(fit["matrix"], abs=1e-6)
+        for key in ("kx", "ky", "phi0_deg", "r2x", "r2y", "n_used",
+                    "excitation_q_rad_s", "excitation_p_rad_s"):
+            assert data[key] == fit[key]
+        assert "applied" not in data          # 適用履歴は含めない
+        # status の一覧に載る+メッセージに保存が明示される
+        status = mgr.status()
+        assert [p["name"] for p in status["profiles"]] == [name]
+        assert status["profiles"][0]["kx"] == fit["kx"]
+        assert "プロファイル保存" in status["message"]
+
+    def test_failed_fit_saves_no_profile(self, flowcal_session):
+        """不合格フィットは保存しない(蓄積は合格のみ)。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        assert mgr.start_record()["ok"]
+        feed_synthetic(mgr, (650.0, 0.0, 0.0, 650.0), K_CUR_DEFAULT)
+        result = mgr.stop_and_fit()
+        assert result["ok"] is False
+        assert "profile_saved" not in result
+        assert not mgr.profile_dir.is_dir() \
+            or not list(mgr.profile_dir.glob("*.json"))
+        assert mgr.status()["profiles"] == []
+
+    def test_apply_profile_roundtrip(self, flowcal_session):
+        """選択プロファイルからの適用が現行 apply と同じ往復で完了する。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        result = self._fit_ok(mgr)
+        name = result["profile_saved"]
+        matrix = list(result["fit"]["matrix"])
+        mgr.clear()                            # 直近フィットなしでも適用できる
+        transport.clear_sent()
+        applied = mgr.apply_profile(name)
+        assert applied["ok"], applied["message"]
+        assert applied["verified"] is True
+        assert applied["name"] == name
+        frames = transport.frames_of_type(proto.MsgType.CMD_FLOWCAL_SET)
+        assert len(frames) == 1
+        msg = proto.CmdFlowcalSet.from_payload(frames[0].payload)
+        assert (msg.m00, msg.m01, msg.m10, msg.m11) == \
+            pytest.approx(tuple(matrix), abs=1e-3)
+        assert responder.cal_data.valid_flags & proto.TlmCalData.VALID_FLOWCAL
+        state = json.loads(mgr.state_path.read_text(encoding="utf-8"))
+        assert state["applied"]["name"] == name
+        assert state["applied"]["verified"] is True
+        assert state["applied"]["matrix"] == pytest.approx(matrix, abs=1e-3)
+        assert mgr.status()["applied"]["name"] == name
+
+    def test_apply_profile_missing_or_invalid(self, flowcal_session):
+        session, transport, clock, responder, mgr = flowcal_session
+        result = mgr.apply_profile("no_such_profile")
+        assert result["ok"] is False
+        assert "見つかりません" in result["message"]
+        # schema 不正は適用不可
+        write_profile(mgr, "bad_schema", (450.0, 0.0, 0.0, 450.0))
+        path = mgr.profile_dir / "bad_schema.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["schema"] = "stampfly_ff_profile"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        result = mgr.apply_profile("bad_schema")
+        assert result["ok"] is False
+        assert "形式が不正" in result["message"]
+
+    def test_apply_profile_fw_invalid_not_sent(self, flowcal_session):
+        """ファーム受理範囲外の行列を持つプロファイルは送信しない。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        write_profile(mgr, "fw_invalid", (50.0, 0.0, 0.0, 450.0))
+        transport.clear_sent()
+        result = mgr.apply_profile("fw_invalid")
+        assert result["ok"] is False
+        assert "受理範囲外" in result["message"]
+        assert transport.frames_of_type(proto.MsgType.CMD_FLOWCAL_SET) == []
+
+    def test_apply_profile_rejected_while_collecting(self, flowcal_session):
+        """記録中の適用は拒否(行列変更は K_cur 復元を壊す)。"""
+        session, transport, clock, responder, mgr = flowcal_session
+        write_profile(mgr, "prof", (460.0, 0.0, 0.0, 470.0))
+        assert mgr.start_record()["ok"]
+        result = mgr.apply_profile("prof")
+        assert result["ok"] is False
+        assert "記録中" in result["message"]
+        mgr.clear()
+
+    def test_delete_profile(self, flowcal_session):
+        session, transport, clock, responder, mgr = flowcal_session
+        write_profile(mgr, "prof_a", (460.0, 0.0, 0.0, 470.0))
+        write_profile(mgr, "prof_b", (455.0, 0.0, 0.0, 465.0))
+        assert len(mgr.status()["profiles"]) == 2
+        result = mgr.delete_profile("prof_a")
+        assert result["ok"], result["message"]
+        assert not (mgr.profile_dir / "prof_a.json").exists()
+        assert [p["name"] for p in mgr.status()["profiles"]] == ["prof_b"]
+        result = mgr.delete_profile("prof_a")
+        assert result["ok"] is False
+        assert "見つかりません" in result["message"]
+
+
+class TestInitialProfile:
+    """初回取込みプロファイル(7/31 適用済み較正の新スキーマ正規化)の検証。"""
+
+    PATH = cfg.FLOWCAL_PROFILES_DIR / "flowcal_20260731_DroneX.json"
+    MATRIX = (491.928, 2.138, -15.986, 500.559)
+
+    def test_schema_and_values(self):
+        assert self.PATH.is_file(), f"初回プロファイルがありません: {self.PATH}"
+        data = json.loads(self.PATH.read_text(encoding="utf-8"))
+        assert data["schema"] == FLOWCAL_PROFILE_SCHEMA
+        assert data["version"] == FLOWCAL_PROFILE_VERSION
+        assert data["name"] == "flowcal_20260731_DroneX"
+        assert "DroneX" in data["memo"]
+        # 適用検証器を通る(=UI から選択適用できる)+ファーム受理範囲内
+        matrix = flowcal_profile_matrix(data)
+        assert matrix == pytest.approx(self.MATRIX)
+        assert flowcal_matrix_fw_valid(*matrix)
+        # flowcal_state.json の applied と同値(取込み元との一致)
+        assert data["kx"] == pytest.approx(492.19)
+        assert data["ky"] == pytest.approx(500.56)
+        assert data["phi0_deg"] == pytest.approx(-1.04)
+        assert data["r2x"] == pytest.approx(0.9043)
+        assert data["r2y"] == pytest.approx(0.9244)
+        assert data["n_used"] == 768
+
+    def test_implied_params_consistent(self):
+        """kx/ky/φ0 が matrix の含意パラメータと整合(正規化の検算)。"""
+        data = json.loads(self.PATH.read_text(encoding="utf-8"))
+        m00, m01, m10, m11 = data["matrix"]
+        assert data["kx"] == pytest.approx(math.hypot(m00, m10), abs=0.01)
+        assert data["ky"] == pytest.approx(math.hypot(m01, m11), abs=0.01)
+        phi = 0.5 * (math.degrees(math.atan2(-m01, m00))
+                     + math.degrees(math.atan2(m10, m11)))
+        assert data["phi0_deg"] == pytest.approx(phi, abs=0.01)

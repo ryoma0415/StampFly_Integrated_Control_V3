@@ -427,6 +427,9 @@ async def api_flowcal(body: dict) -> dict:
 
     start_record はモーター停止・非飛行時のみ受理(core/flowcal.py の
     ゲート)。apply は合格フィットのみ(不合格は force で強制)。
+    合格フィットは data/flowcal_profiles/ へ自動保存され、apply {name} で
+    保存済みプロファイルから選択適用・delete {name} で削除できる
+    (magbias/ff プロファイルと同じ管理様式)。
     clear は PC 側の記録/フィット破棄(機体 NVS のクリアは /api/flow)。
     """
     action = body.get("action")
@@ -435,11 +438,17 @@ async def api_flowcal(body: dict) -> dict:
     if action == "stop_and_fit":
         return await asyncio.to_thread(session.flowcal.stop_and_fit)
     if action == "apply":
+        if body.get("name"):
+            return await asyncio.to_thread(session.flowcal.apply_profile,
+                                           body.get("name"))
         return await asyncio.to_thread(session.flowcal.apply,
                                        bool(body.get("force")))
+    if action == "delete":
+        return await asyncio.to_thread(session.flowcal.delete_profile,
+                                       body.get("name"))
     if action == "clear":
         return await asyncio.to_thread(session.flowcal.clear)
-    if action == "status":
+    if action in ("status", "profiles"):
         return await asyncio.to_thread(session.flowcal.status)
     return _UNKNOWN_ACTION
 

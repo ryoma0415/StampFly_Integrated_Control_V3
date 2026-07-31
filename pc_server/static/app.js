@@ -203,6 +203,9 @@ const els = {
   fcR2: $("fcR2"), fcScale: $("fcScale"), fcPhi: $("fcPhi"),
   fcUsed: $("fcUsed"), fcMatrix: $("fcMatrix"), fcDroneMatrix: $("fcDroneMatrix"),
   flowcalApplied: $("flowcalApplied"), flowcalMsg: $("flowcalMsg"),
+  flowcalSelect: $("flowcalSelect"),
+  btnFlowcalProfileApply: $("btnFlowcalProfileApply"),
+  btnFlowcalProfileDelete: $("btnFlowcalProfileDelete"),
   // 設定タブ(UI専用: MoCap マッピング)
   tabSettings: $("tabSettings"), panelSettings: $("panelSettings"),
   mapAxisSel: { x: $("mapXAxis"), y: $("mapYAxis"), z: $("mapZAxis") },
@@ -2843,10 +2846,34 @@ function renderFlowcal() {
       ? fcMatrixLabel(drone.matrix) + fcImpliedLabel(drone.matrix)
       : "未設定(既定 diag(450,450))");
 
+  // 保存済みプロファイル一覧(magbias パネルと同様式。適用中を優先選択)
+  const profileOpts = (st.profiles || []).map((p) => ({
+    value: p.name,
+    label: p.error ? `${p.name}(読込不可)` : p.name,
+    title: p.kx != null && p.ky != null
+      ? `kx=${p.kx.toFixed(0)} ky=${p.ky.toFixed(0)}` +
+        (p.phi0_deg != null
+          ? ` φ0=${p.phi0_deg >= 0 ? "+" : ""}${p.phi0_deg.toFixed(1)}°` : "") +
+        (p.r2x != null && p.r2y != null
+          ? ` r²=${p.r2x.toFixed(2)}/${p.r2y.toFixed(2)}` : "") +
+        (p.memo ? ` — ${p.memo}` : "")
+      : (p.memo || ""),
+  }));
+  const preferredProfile = st.applied && st.applied.name
+    ? st.applied.name : null;
+  rebuildSelect(els.flowcalSelect, profileOpts, preferredProfile);
+  if (profileOpts.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(プロファイルなし — フィット合格時に自動保存)";
+    els.flowcalSelect.appendChild(opt);
+  }
+
   // 適用状態バナー+メッセージ
   const a = st.applied;
   els.flowcalApplied.textContent = a
-    ? `flowcal適用中: K=${fcMatrixLabel(a.matrix)} ` +
+    ? `flowcal適用中: ${a.name ? `${a.name} ` : ""}` +
+      `K=${fcMatrixLabel(a.matrix)} ` +
       `φ0=${a.phi0_deg >= 0 ? "+" : ""}${(a.phi0_deg ?? 0).toFixed(1)}°` +
       `${a.forced ? "(force適用)" : ""}${a.verified ? "" : "(未検証)"}`
     : "flowcal: 未適用(既定 diag(450,450))";
@@ -2865,6 +2892,10 @@ function renderFlowcal() {
   els.btnFlowcalStop.disabled = !st.collecting;
   els.btnFlowcalApply.disabled = !!(st.collecting || st.busy || !hasMatrix);
   els.btnFlowcalClear.disabled = !!st.busy;
+  const profileName = els.flowcalSelect.value;
+  els.btnFlowcalProfileApply.disabled =
+    !!(st.collecting || st.busy || !profileName);
+  els.btnFlowcalProfileDelete.disabled = !!(st.busy || !profileName);
 }
 
 function flowcalEnsurePolling() {
@@ -3651,6 +3682,45 @@ function wireEvents() {
     }
     els.btnFlowcalClear.disabled = false;
     renderFlowcal();
+  });
+  // 保存済みプロファイルの選択適用/削除(magbias パネルと同様式)
+  els.flowcalSelect.addEventListener("change", renderFlowcal);
+  els.btnFlowcalProfileApply.addEventListener("click", async () => {
+    const name = els.flowcalSelect.value;
+    if (!name) {
+      appendConsole("ui", "flowcal プロファイルが選択されていません");
+      return;
+    }
+    els.btnFlowcalProfileApply.disabled = true;
+    const resp = await apiPost("/api/flowcal", { action: "apply", name });
+    if (resp) {
+      appendConsole("ui", resp.ok
+        ? `flowcal プロファイルを適用しました: ${name}(読み戻し照合OK)`
+        : `flowcal プロファイル適用失敗: ${resp.message || "不明なエラー"}`);
+      setFlowcalStatus(resp);
+    }
+    renderFlowcal();
+    if (!flowcalStatus) els.btnFlowcalProfileApply.disabled = false;
+  });
+  els.btnFlowcalProfileDelete.addEventListener("click", async () => {
+    const name = els.flowcalSelect.value;
+    if (!name) {
+      appendConsole("ui", "flowcal プロファイルが選択されていません");
+      return;
+    }
+    if (!window.confirm(
+      `flowcal プロファイル「${name}」を削除しますか?\n` +
+      "(機体 NVS と適用状態は変更されません)")) return;
+    els.btnFlowcalProfileDelete.disabled = true;
+    const resp = await apiPost("/api/flowcal", { action: "delete", name });
+    if (resp) {
+      appendConsole("ui", resp.ok
+        ? `flowcal プロファイルを削除しました: ${name}`
+        : `flowcal プロファイル削除失敗: ${resp.message || "不明なエラー"}`);
+      setFlowcalStatus(resp);
+    }
+    renderFlowcal();
+    if (!flowcalStatus) els.btnFlowcalProfileDelete.disabled = false;
   });
 
   // SPACE = どこからでも緊急STOP(Experiment 中はモーター停止も送出)

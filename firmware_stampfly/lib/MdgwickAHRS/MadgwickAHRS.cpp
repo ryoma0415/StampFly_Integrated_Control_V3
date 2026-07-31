@@ -56,6 +56,57 @@ void Madgwick::reset(void) {
 }
 
 
+//-------------------------------------------------------------------------------------------
+// ヨー成分のみゼロ化(ロール/ピッチ無傷・過渡なし)
+//
+// computeAngles() の抽出式
+//   roll  = atan2(q0q1+q2q3, 0.5-q1^2-q2^2)
+//   pitch = asin(-2(q1q3-q0q2))
+//   yaw   = atan2(q1q2+q0q3, 0.5-q2^2-q3^2)
+// は、Hamilton 規約のクォータニオン q を ZYX(ヨー→ピッチ→ロール)オイラー角へ
+// 分解したもの、すなわち q = q_z(ψ) ⊗ q_y(θ) ⊗ q_x(φ) に対応する。
+// (検算: 純ヨー q=(cos(ψ/2),0,0,sin(ψ/2)) を上式に入れると
+//  yaw = atan2(0.5 sinψ, 0.5 cosψ) = ψ)
+//
+// したがってワールドZ回りの回転を「左から」合成すると
+//   q' = q_z(-ψ) ⊗ q = q_z(-ψ) ⊗ q_z(ψ) ⊗ q_y(θ) ⊗ q_x(φ) = q_y(θ) ⊗ q_x(φ)
+// となり、ZYX 分解は (yaw=0, pitch=θ, roll=φ)。ヨーだけが厳密に 0 になり、
+// ロール/ピッチは抽出式の値がそのまま保存される(右から掛けるとボディZ回り
+// になりロール/ピッチが汚れるため、必ず左から掛けること)。
+//
+// q_z(-ψ) = (c, 0, 0, -s), c = cos(ψ/2), s = sin(ψ/2) との Hamilton 積
+//   (a ⊗ b: w = a0b0-a1b1-a2b2-a3b3, x = a0b1+a1b0+a2b3-a3b2,
+//            y = a0b2-a1b3+a2b0+a3b1, z = a0b3+a1b2-a2b1+a3b0)
+// を a=(c,0,0,-s), b=q に展開すると下記の4行になる:
+//   q0' = c q0 + s q3
+//   q1' = c q1 + s q2
+//   q2' = c q2 - s q1
+//   q3' = c q3 - s q0
+//
+// 机上検証(倍精度; ψ,θ,φ → zeroYaw 後の roll/pitch/yaw):
+//   ( 90°, 20°, 10°) → (10.000°, 20.000°, 6.8e-15 rad)
+//   (135°,-15°,  5°) → ( 5.000°,-15.000°, 3.2e-15 rad)
+//   (-170°,  3°, -8°) → (-8.000°,  3.000°, 8.7e-16 rad)
+//   ( 10°, 60°,-30°) → (-30.000°, 60.000°, 6.4e-15 rad)
+// いずれもロール/ピッチ保存・|q'|=1(単位クォータニオン同士の積のため
+// ノルムも保存されるが、float 丸め対策で念のため再正規化する)。
+void Madgwick::zeroYaw(void) {
+	// 現在ヨー ψ をキャッシュ(anglesComputed)に依存せず q から直接抽出
+	float psi = atan2f(q1 * q2 + q0 * q3, 0.5f - q2 * q2 - q3 * q3);
+	float c = cosf(0.5f * psi);
+	float s = sinf(0.5f * psi);
+	float nq0 = c * q0 + s * q3;
+	float nq1 = c * q1 + s * q2;
+	float nq2 = c * q2 - s * q1;
+	float nq3 = c * q3 - s * q0;
+	float recipNorm = invSqrt(nq0 * nq0 + nq1 * nq1 + nq2 * nq2 + nq3 * nq3);
+	q0 = nq0 * recipNorm;
+	q1 = nq1 * recipNorm;
+	q2 = nq2 * recipNorm;
+	q3 = nq3 * recipNorm;
+	anglesComputed = 0;
+}
+
 void Madgwick::update(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz) {
 	float recipNorm;
 	float s0, s1, s2, s3;

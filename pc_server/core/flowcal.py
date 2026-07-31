@@ -31,6 +31,10 @@ MagbiasManager と同型のマネージャ:
 - 適用: CMD_FLOWCAL_SET(17B)→ CAL_GET 読み戻し(140B)4 成分照合 →
   flowcal_state.json 記録。排他はキャリブ/FF プロファイルと同じスロット
   (hub.calprofile_begin/end)を共有する。
+- プロファイル: 合格フィットは data/flowcal_profiles/<name>.json
+  (schema "stampfly_flowcal_profile" v2 = 2×2 行列版)へ自動蓄積し、
+  一覧(status)/選択適用(apply_profile)/削除(delete_profile)を
+  magbias/ff プロファイルと同じ管理様式で提供する。
 """
 
 from __future__ import annotations
@@ -40,14 +44,23 @@ import math
 import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import stampfly_protocol as proto  # sys.path シム(core/__init__.py)経由
 
 from . import config as cfg
-from .calibration import CAL_VERIFY_TOLERANCE, ack_detail, ack_ok
+from .calibration import (
+    CAL_VERIFY_TOLERANCE, ack_detail, ack_ok, mtime_or_zero,
+    sanitize_profile_name,
+)
 from .serial_link import SerialLink, SerialLinkError
+
+# ---- 蓄積型プロファイル(magbias/ff と同じ管理様式) ----
+# version 2 = 2×2 行列版(StampFly_Telemetry 時代の kx/ky 2 定数 = v1 と区別)
+FLOWCAL_PROFILE_SCHEMA = "stampfly_flowcal_profile"
+FLOWCAL_PROFILE_VERSION = 2
 
 # ---- 受入基準(StampFly_Telemetry pc_server の FLOWCAL_* を踏襲) ----
 FLOWCAL_MIN_SAMPLES = 200            # 最低有効サンプル数(25Hz × 8s 相当)
@@ -98,6 +111,24 @@ def flowcal_matrix_fw_valid(m00: float, m01: float,
     if abs(m01) > FLOWCAL_FW_SCALE_MAX or abs(m10) > FLOWCAL_FW_SCALE_MAX:
         return False
     return (m00 * m11 - m01 * m10) >= FLOWCAL_FW_DET_MIN
+
+
+def flowcal_profile_matrix(profile: dict[str, Any]
+                           ) -> tuple[float, float, float, float]:
+    """プロファイル JSON から適用する K 行列を取り出し検証する。
+
+    schema/matrix のみ必須(fit 品質フィールドは表示用 — 欠けていても
+    適用可能。初回取込みプロファイル等は励振 std を持たない)。
+    """
+    if profile.get("schema") != FLOWCAL_PROFILE_SCHEMA:
+        raise ValueError(f"schema が {FLOWCAL_PROFILE_SCHEMA} ではありません")
+    matrix = profile.get("matrix")
+    if not isinstance(matrix, (list, tuple)) or len(matrix) != 4:
+        raise ValueError("matrix は f32×4(m00,m01,m10,m11 行優先)が必要です")
+    values = tuple(float(v) for v in matrix)
+    if any(not math.isfinite(v) for v in values):
+        raise ValueError("matrix に非有限値があります")
+    return values
 
 
 def flowcal_sample_valid(sample: dict[str, Any]) -> bool:
@@ -339,7 +370,8 @@ class FlowcalManager:
     def __init__(self, link: SerialLink, hub, calibration,
                  notify: Callable[[str], None],
                  tlm_state_provider: Optional[Callable] = None,
-                 state_path: Path = cfg.FLOWCAL_STATE_PATH) -> None:
+                 state_path: Path = cfg.FLOWCAL_STATE_PATH,
+                 profile_dir: Path = cfg.FLOWCAL_PROFILES_DIR) -> None:
         self.link = link
         self.hub = hub                   # ExperimentHub(モーター状態+排他スロット)
         self.calibration = calibration   # CalibrationManager(CAL_GET 用)
@@ -347,6 +379,7 @@ class FlowcalManager:
         # session._tlm_state_snapshot: () -> (TlmState|None, age_s|None)
         self.tlm_state_provider = tlm_state_provider
         self.state_path = Path(state_path)
+        self.profile_dir = Path(profile_dir)
 
         self._lock = threading.Lock()
         self._collecting = False
@@ -383,6 +416,79 @@ class FlowcalManager:
         tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2),
                        encoding="utf-8")
         os.replace(tmp, self.state_path)
+
+    # ---- プロファイル(magbias/ff と同じ管理様式: 保存/一覧/選択適用/削除) ----
+
+    def _save_profile(self, fit: dict[str, Any]) -> Optional[str]:
+        """合格フィットを flowcal_profiles/<name>.json へ蓄積保存する。
+
+        name 既定: flowcal_<日時>(同秒衝突は _2, _3 … で回避)。
+        applied 履歴は含めない(適用状態は flowcal_state.json の責務)。
+        保存失敗はフィット自体の成否に影響させない(notify 警告のみ)。
+        """
+        now = datetime.now().astimezone()
+        base = sanitize_profile_name(f"flowcal_{now.strftime('%Y%m%d_%H%M%S')}")
+        profile = {
+            "schema": FLOWCAL_PROFILE_SCHEMA,
+            "version": FLOWCAL_PROFILE_VERSION,
+            "name": base,
+            "memo": "",
+            "created_at": now.isoformat(),
+            "matrix": [float(v) for v in fit["matrix"]],
+            # ---- fit 品質一式(表示用。適用には matrix のみ必須) ----
+            "kx": fit.get("kx"), "ky": fit.get("ky"),
+            "phi0_deg": fit.get("phi0_deg"),
+            "ratio": fit.get("ratio"), "det": fit.get("det"),
+            "r2x": fit.get("r2x"), "r2y": fit.get("r2y"),
+            "excitation_q_rad_s": fit.get("excitation_q_rad_s"),
+            "excitation_p_rad_s": fit.get("excitation_p_rad_s"),
+            "n_used": fit.get("n_used"), "n_rejected": fit.get("n_rejected"),
+            "n_valid": fit.get("n_valid"), "n_total": fit.get("n_total"),
+            "k_cur": fit.get("k_cur"),   # 記録中に機体が適用していた行列
+        }
+        try:
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            name = base
+            counter = 2
+            while (self.profile_dir / f"{name}.json").exists():
+                name = f"{base}_{counter}"
+                counter += 1
+            profile["name"] = name
+            path = self.profile_dir / f"{name}.json"
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(profile, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.notify(f"[警告] flowcal プロファイルを保存できませんでした: {exc}")
+            return None
+        return name
+
+    def _profiles_list(self) -> list[dict[str, Any]]:
+        """保存済みプロファイルの一覧(新しい順。magbias.status と同型)。"""
+        profiles: list[dict[str, Any]] = []
+        if not self.profile_dir.is_dir():
+            return profiles
+        for path in sorted(self.profile_dir.glob("*.json"),
+                           key=mtime_or_zero, reverse=True):
+            entry: dict[str, Any] = {"name": path.stem, "created_at": None,
+                                     "memo": "", "kx": None, "ky": None,
+                                     "phi0_deg": None, "r2x": None,
+                                     "r2y": None, "n_used": None}
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("schema") != FLOWCAL_PROFILE_SCHEMA:
+                    entry["error"] = "schema"
+                else:
+                    for key in ("created_at", "memo", "kx", "ky", "phi0_deg",
+                                "r2x", "r2y", "n_used"):
+                        entry[key] = data.get(key)
+            except FileNotFoundError:
+                continue
+            except (OSError, json.JSONDecodeError):
+                entry["error"] = "unreadable"
+            profiles.append(entry)
+        return profiles
 
     # ---- TLM_STATE 流入(RX スレッド上: 追記のみ・ブロッキング禁止) ----
 
@@ -436,6 +542,7 @@ class FlowcalManager:
             "k_cur": {"matrix": list(k_cur), "source": k_cur_source},
             "fit": fit,
             "applied": applied,
+            "profiles": self._profiles_list(),
             "drone": drone,
             "busy": busy,
             "message": message,
@@ -546,7 +653,7 @@ class FlowcalManager:
         return {"ok": True, **self.status()}
 
     def stop_and_fit(self) -> dict[str, Any]:
-        """記録停止 → 2×2 フィット+品質判定。"""
+        """記録停止 → 2×2 フィット+品質判定(合格時はプロファイル自動保存)。"""
         with self._lock:
             was_collecting = self._collecting
             self._collecting = False
@@ -555,18 +662,27 @@ class FlowcalManager:
         if not was_collecting:
             return self._fail("記録していません")
         fit = flowcal_fit(samples, k_cur)
+        profile_name: Optional[str] = None
+        if fit.get("ok"):
+            # 合格フィットは flowcal_profiles/ へ蓄積保存(magbias/ff と同様式)
+            profile_name = self._save_profile(fit)
         with self._lock:
             self._fit = fit
         if fit.get("ok"):
+            saved = (f" → プロファイル保存: {profile_name}" if profile_name
+                     else "(プロファイル保存失敗 — ログ参照)")
             self._set_message(
                 f"フィット完了(合格): kx={fit['kx']:.0f} ky={fit['ky']:.0f} "
                 f"counts/rad, φ0={fit['phi0_deg']:+.1f}° "
                 f"(r²={fit['r2x']:.3f}/{fit['r2y']:.3f}, "
-                f"n={fit['n_used']})")
+                f"n={fit['n_used']}){saved}")
         else:
             self._set_message("フィットに警告があります: "
                               + " / ".join(fit.get("warnings") or ["不明"]))
-        return {"ok": bool(fit.get("ok")), **self.status()}
+        result: dict[str, Any] = {"ok": bool(fit.get("ok")), **self.status()}
+        if profile_name:
+            result["profile_saved"] = profile_name
+        return result
 
     # ---- 適用 / クリア ----
 
@@ -595,7 +711,51 @@ class FlowcalManager:
                 "フィットに警告があります(force で強制適用可): "
                 + " / ".join(fit.get("warnings") or []),
                 quality_warning=True, warnings=fit.get("warnings") or [])
-        m00, m01, m10, m11 = (float(v) for v in fit["matrix"])
+        quality = {key: fit.get(key)
+                   for key in ("kx", "ky", "phi0_deg", "r2x", "r2y", "n_used")}
+        return self._apply_matrix(fit["matrix"], quality,
+                                  forced=bool(force and not fit.get("ok")))
+
+    def apply_profile(self, name: Any) -> dict[str, Any]:
+        """保存済みプロファイルを機体へ適用する(magbias.apply と同様式)。
+
+        流れは apply() と同一(CMD_FLOWCAL_SET → 読み戻し照合 →
+        flowcal_state.json)で、行列の出所が「直近フィット」ではなく
+        「選択プロファイル」になるだけ。プロファイルは合格フィットのみ
+        保存されるため品質ゲートはない(ファーム受理条件のみ検査)。
+        """
+        clean = sanitize_profile_name(name)
+        path = self.profile_dir / f"{clean}.json"
+        if not clean or not path.is_file():
+            return self._fail(f"flowcal プロファイルが見つかりません: {clean}")
+        try:
+            profile = json.loads(path.read_text(encoding="utf-8"))
+            matrix = flowcal_profile_matrix(profile)
+        except (OSError, json.JSONDecodeError) as exc:
+            return self._fail(f"flowcal プロファイル読み込み失敗: {exc}")
+        except (ValueError, TypeError) as exc:
+            return self._fail(
+                f"flowcal プロファイル形式が不正です: {clean}({exc})")
+        with self._lock:
+            collecting = self._collecting
+        if collecting:
+            # 記録中の行列変更は K_cur 復元を壊す(start_record 参照)
+            return self._fail("記録中は適用できません(先に停止&フィット)")
+        quality = {key: profile.get(key)
+                   for key in ("kx", "ky", "phi0_deg", "r2x", "r2y", "n_used")}
+        return self._apply_matrix(matrix, quality, forced=False,
+                                  profile_name=clean)
+
+    def _apply_matrix(self, matrix: Any, quality: dict[str, Any],
+                      forced: bool,
+                      profile_name: Optional[str] = None) -> dict[str, Any]:
+        """K 行列を機体へ適用する共通経路(NVS 書込み+読み戻し照合)。
+
+        呼び出し元(apply=直近フィット / apply_profile=選択プロファイル)が
+        品質ゲートを済ませていること。ファーム受理条件はここで最終検査する
+        (force でも受理範囲外は送らない)。
+        """
+        m00, m01, m10, m11 = (float(v) for v in matrix)
         if not flowcal_matrix_fw_valid(m00, m01, m10, m11):
             return self._fail("K が機体の受理範囲外のため適用できません"
                               "(force でも不可 — 収集をやり直してください)")
@@ -618,11 +778,9 @@ class FlowcalManager:
             # 適用記録は必ず残す(P2a: applied_unverified)
             applied = {
                 "matrix": [m00, m01, m10, m11],
-                "kx": fit.get("kx"), "ky": fit.get("ky"),
-                "phi0_deg": fit.get("phi0_deg"),
-                "r2x": fit.get("r2x"), "r2y": fit.get("r2y"),
-                "n_used": fit.get("n_used"),
-                "forced": bool(force and not fit.get("ok")),
+                **({"name": profile_name} if profile_name else {}),
+                **quality,
+                "forced": forced,
                 "applied_at": time.time(),
                 "verified": False,
             }
@@ -654,16 +812,36 @@ class FlowcalManager:
             # 適用状態の永続化(flowcal_state.json)
             applied["verified"] = True
             self._save_state({"applied": applied})
-            forced = "(force適用)" if (force and not fit.get("ok")) else ""
+            source = f" {profile_name}" if profile_name else ""
+            forced_note = "(force適用)" if forced else ""
+            phi0 = quality.get("phi0_deg")
+            phi0_note = (f"(φ0={float(phi0):+.1f}°)"
+                         if phi0 is not None else "")
             self._set_message(
-                f"適用・読み戻し照合OK{forced}: K=[{m00:.1f} {m01:.1f}; "
-                f"{m10:.1f} {m11:.1f}] counts/rad "
-                f"(φ0={fit.get('phi0_deg', 0):+.1f}°)")
-            return {"ok": True, "verified": True, **self.status()}
+                f"適用・読み戻し照合OK{forced_note}:{source} "
+                f"K=[{m00:.1f} {m01:.1f}; {m10:.1f} {m11:.1f}] counts/rad "
+                f"{phi0_note}")
+            return {"ok": True, "verified": True,
+                    **({"name": profile_name} if profile_name else {}),
+                    **self.status()}
         finally:
             with self._lock:
                 self.busy = False
             self.hub.calprofile_end()
+
+    def delete_profile(self, name: Any) -> dict[str, Any]:
+        """保存済みプロファイルを削除する(PC 側ファイルのみ。機体 NVS と
+        flowcal_state.json の適用記録は変更しない)。"""
+        clean = sanitize_profile_name(name)
+        path = self.profile_dir / f"{clean}.json"
+        if not clean or not path.is_file():
+            return self._fail(f"flowcal プロファイルが見つかりません: {clean}")
+        try:
+            path.unlink()
+        except OSError as exc:
+            return self._fail(f"flowcal プロファイルを削除できませんでした: {exc}")
+        self._set_message(f"プロファイルを削除しました: {clean}")
+        return {"ok": True, **self.status()}
 
     def clear(self) -> dict[str, Any]:
         """PC 側の記録・フィット結果を破棄する(機体 NVS は変更しない —

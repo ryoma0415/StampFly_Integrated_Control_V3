@@ -74,6 +74,7 @@ StampFly_Integrated_Control_V2/
     data/
       sweep_results/                  # スイープCSV+meta(取得元)
       ff_profiles/                    # プロファイルJSON置き場
+      flowcal_profiles/               # フロー較正プロファイル(stampfly_flowcal_profile v2。core/flowcal.py が同様式で管理)
       ff_state.json                   # 適用状態(サーバーが管理)
       yaw_eval_results/               # 旧形式yawログ置き場(レガシー)
     tests/test_ffprofile.py           # フェイクserialでの適用/CRC/リトライ試験

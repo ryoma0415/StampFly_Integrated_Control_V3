@@ -1246,6 +1246,17 @@ uint8_t handle_cmd_yawzero_set(const stampfly::CmdYawzeroSet& m) {
         // 推定器が実際に保持したラップ済み値を永続化(NVSとRAMの乖離防止)
         saveYawZero(true, g_yaw_est.yaw_estimator.magYawOffsetRad());
         g_yaw_est.yaw_zero_save_pending = false;
+        // ヨーゼロ設定と同時に Madgwick ヨー(ヨー成分のみ回転。ロール/ピッチ
+        // 無傷)とジャイロ積算も 0 基準へ揃える(3系統のヨー基準統一)。
+        // 本コマンドは dispatch 側の非飛行ガード(WAIT/COMPLETE/MOTOR_TEST)を
+        // 通過済みだが、MOTOR_TEST はモーター回転中があり得るため、実PWM出力
+        // なし(直近tickの motors_running=false)のときのみ実行する。
+        // なお UI「Yaw 0」以外にプロファイル適用(calprofile)でも valid=1 が
+        // 届くが、Madgwickヨーの0基準はもともと任意(WAIT静定/START で全リセット)
+        // のため現在方位への再基準化は無害。
+        if (!g_yaw_est.motors_running) {
+            ahrs_zero_yaw();
+        }
     } else {
         g_yaw_est.yaw_estimator.clearYawZero();
         g_yaw_est.yaw_zero_save_pending = false;

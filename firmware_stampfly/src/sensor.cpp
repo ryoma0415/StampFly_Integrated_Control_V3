@@ -100,6 +100,22 @@ void ahrs_reset(void) {
     sensor_state.Yaw_gyro_integral = 0.0f;
 }
 
+// ヨーゼロ設定(CMD_YAWZERO_SET valid=1)と同時に、Madgwickヨーとジャイロ積算の
+// 0基準も現在方位へ揃える(3系統のヨー[CF/EKF・Madgwick・ジャイロ積算]の基準統一)。
+// ahrs_reset() と違いクォータニオンはヨー成分のみ回転(q ← q_z(-ψ_M) ⊗ q)する
+// ため、ロール/ピッチは無傷・収束過渡も発生しない。
+//
+// 軸入替規約との整合(本ファイル sensor_read 参照):
+//   Madgwick へは gx=Pitch_rate, gy=Roll_rate, gz=-Yaw_rate を入力しており、
+//   Madgwick内部フレームは (X_M=機体右, Y_M=機体前, Z_M=機体上) の右手系。
+//   表示ヨーは Yaw_angle = wrapPi(-getYawRadians()) すなわち ψ_M の符号反転。
+//   zeroYaw() は Madgwick 内部ヨー ψ_M を 0 にするので、Yaw_angle = -0 = 0 と
+//   なり「表示ヨーが0になる」仕様を満たす(符号反転は 0 を不変に保つ)。
+void ahrs_zero_yaw(void) {
+    Drone_ahrs.zeroYaw();
+    sensor_state.Yaw_gyro_integral = 0.0f;
+}
+
 void sensor_init() {
     // beep_init();
 

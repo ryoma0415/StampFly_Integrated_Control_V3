@@ -1,0 +1,5 @@
+
+# サーバーが管理する適用状態の記録(実行時状態。プロファイルJSONは管理対象)
+pc_server/data/ff_state.json
+pc_server/data/flowcal_state.json
+pc_server/data/magbias_state.json
