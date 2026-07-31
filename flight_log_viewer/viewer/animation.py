@@ -417,12 +417,18 @@ class _AnimationBuilder:
             wrap_angle=True)
 
         # --- 姿勢パネル ---
+        # 指令は機体適用値 tlm_*_ref_deg を優先(Position モードでは PC は角度
+        # 指令を送らないため roll_ref_deg は常に 0。旧ログのみフォールバック)
+        roll_ref_col = ("tlm_roll_ref_deg" if self.log.has("tlm_roll_ref_deg")
+                        else "roll_ref_deg")
+        pitch_ref_col = ("tlm_pitch_ref_deg" if self.log.has("tlm_pitch_ref_deg")
+                         else "pitch_ref_deg")
         self.ax_att = self.fig.add_subplot(gs[2, 0:2])
         self.att_lines = self._make_ts_panel(
             self.ax_att, "姿勢 [deg]",
-            (("roll_ref_deg", "Roll指令", COLORS["cmd_roll"], "--"),
+            ((roll_ref_col, "Roll指令", COLORS["cmd_roll"], "--"),
              ("tlm_roll_deg", "Roll実測", COLORS["meas_roll"], "-"),
-             ("pitch_ref_deg", "Pitch指令", COLORS["cmd_pitch"], "--"),
+             (pitch_ref_col, "Pitch指令", COLORS["cmd_pitch"], "--"),
              ("tlm_pitch_deg", "Pitch実測", COLORS["meas_pitch"], "-")))
 
         # --- duty パネル ---

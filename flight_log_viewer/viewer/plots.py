@@ -82,20 +82,37 @@ def _fig_xy_trajectory(log: FlightLog, out_dir: Path) -> Path | None:
 
 
 def _fig_attitude(log: FlightLog, out_dir: Path) -> Path | None:
-    """02: 姿勢(Roll/Pitch 指令 vs 実測)。"""
-    if not (log.has("roll_ref_deg") or log.has("tlm_roll_deg")):
+    """02: 姿勢(Roll/Pitch 指令 vs 実測)。
+
+    指令は機体適用値 tlm_*_ref_deg を優先する(Position モードでは PC は
+    角度指令を送らず機上 XY PID が目標姿勢を算出するため、PC 送信列
+    roll_ref_deg は常に 0 — LOG_STRUCTURE.md 参照)。tlm 列の無い旧ログ
+    (v1〜v3)のみ PC 送信列へフォールバックする。
+    """
+    if not (log.has("tlm_roll_ref_deg") or log.has("roll_ref_deg")
+            or log.has("tlm_roll_deg")):
         return None
     t = log.t
     df = log.df
     fig, axes = new_fig(2, 1, figsize=(12.0, 8.0), sharex=True)
 
-    for ax, axis_label, ref_col, meas_col, meas_color in (
-        (axes[0], "Roll", "roll_ref_deg", "tlm_roll_deg", COLORS["meas_roll"]),
-        (axes[1], "Pitch", "pitch_ref_deg", "tlm_pitch_deg", COLORS["meas_pitch"]),
+    def _ref_col(axis: str) -> tuple[str, str]:
+        tlm = f"tlm_{axis}_ref_deg"
+        if log.has(tlm):
+            return tlm, "指令(機体適用)"
+        return f"{axis}_ref_deg", "指令(PC送信)"
+
+    roll_ref, roll_ref_label = _ref_col("roll")
+    pitch_ref, pitch_ref_label = _ref_col("pitch")
+    for ax, axis_label, ref_col, ref_label, meas_col, meas_color in (
+        (axes[0], "Roll", roll_ref, roll_ref_label,
+         "tlm_roll_deg", COLORS["meas_roll"]),
+        (axes[1], "Pitch", pitch_ref, pitch_ref_label,
+         "tlm_pitch_deg", COLORS["meas_pitch"]),
     ):
         if log.has(ref_col):
             ax.plot(t, df[ref_col], color="#666666", linewidth=1.0, alpha=0.8,
-                    label=f"{axis_label} 指令")
+                    label=f"{axis_label} {ref_label}")
         if log.has(meas_col):
             ax.plot(t, df[meas_col], color=meas_color, linewidth=1.0, alpha=0.9,
                     label=f"{axis_label} 実測(AHRS)")
