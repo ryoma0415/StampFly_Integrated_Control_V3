@@ -50,7 +50,7 @@
   "motion_yaw": {
     "lpf_cutoff_hz": 2.0,
     "hp_window_s": 2.0,
-    "window_s": 8.0,
+    "window_s": 12.0,
     "delay_s": 0.09,
     "j_min": 9.0,
     "warmup_s": 0.5
@@ -60,6 +60,21 @@
     "radius_max_m": 1.5,
     "period_min_s": 3.0,
     "period_max_s": 120.0,
-    "center_abs_max_m": 2.0
+    "center_abs_max_m": 2.0,
+    "shuttle_amplitude_min_m": 0.05,
+    "shuttle_amplitude_max_m": 0.5,
+    "speed_max_mps": 0.5,
+    "excursion_abs_max_m": 0.5,
+    "sequences": {
+      "ekf2_eval_v1": [
+        {"type": "hover", "duration_s": 10},
+        {"type": "circle", "radius_m": 0.35, "period_s": 12, "laps": 2, "clockwise": false},
+        {"type": "hover", "duration_s": 5},
+        {"type": "shuttle", "axis_deg": 0, "amplitude_m": 0.35, "period_s": 6, "cycles": 3},
+        {"type": "shuttle", "axis_deg": 90, "amplitude_m": 0.35, "period_s": 6, "cycles": 3},
+        {"type": "yaw", "targets_deg": [90, 0, -90, 0], "rate_dps": 30, "hold_s": 10},
+        {"type": "hover", "duration_s": 10}
+      ]
+    }
   }
 }

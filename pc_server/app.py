@@ -9,7 +9,9 @@
   (GET=状態、POST {"action": ...}=操作。core 層の戻り値 dict をそのまま返す)
 - WebSocket /ws: UI コマンド受付 + 20Hz 状態配信 + 即時 event/log 配信
   (v2 コマンド: set_mode "experiment" / experiment_activate / set_yaw_control /
-   circle_start / circle_stop / motor_start / motor_set / motor_stop /
+   circle_start / circle_stop / shuttle_start / shuttle_stop /
+   traj_sequence_start / traj_sequence_stop /
+   motor_start / motor_set / motor_stop /
    exp_record_start / exp_record_stop、
    setpoint メッセージの yaw_deg、yaw メッセージ)
 
@@ -523,6 +525,26 @@ async def _handle_command(message: dict) -> None:
             bool(message.get("face_tangent", False)))
     elif action == "circle_stop":
         await asyncio.to_thread(session.circle_stop)
+    elif action == "shuttle_start":
+        await asyncio.to_thread(
+            session.shuttle_start,
+            float(message.get("center_x", 0.0)),
+            float(message.get("center_y", 0.0)),
+            float(message.get("axis_deg", 0.0)),
+            float(message.get("amplitude_m", 0.0)),
+            float(message.get("period_s", 0.0)),
+            int(message.get("cycles", 0)),
+            float(message.get("alt_m", 0.0)))
+    elif action == "shuttle_stop":
+        await asyncio.to_thread(session.shuttle_stop)
+    elif action == "traj_sequence_start":
+        await asyncio.to_thread(
+            session.traj_sequence_start,
+            str(message.get("name", "")),
+            float(message.get("alt_m", 0.0)),
+            int(message.get("start_index", 0)))
+    elif action == "traj_sequence_stop":
+        await asyncio.to_thread(session.traj_sequence_stop)
     elif action == "motor_start":
         await asyncio.to_thread(session.motor_start,
                                 float(message.get("duty", 0.0)),

@@ -77,6 +77,16 @@ YAW_ALIGN_MODES = (YAW_ALIGN_ARM, YAW_ALIGN_ABSOLUTE)
 
 # アーム相対アンカー取得の中央値窓 [s](構造定数。グリッチ耐性)
 _YAW_ANCHOR_WINDOW_S = 0.5
+# 地上ローリング再ラッチの整合ガード: 窓内 diff の円周中央値からの最大絶対
+# 偏差(スプレッド)がこの値以上の間は再ラッチを凍結する。鏡映フレーム
+# (yaw_true 符号誤り)では手回し中に diff が 2ψ̇ で流れてスプレッドが跳ね、
+# アンカーが凍結 → イノベーション増大が P1-2 インターロックに見える
+# (検出力の回復)。正常フレームの手回しは diff 一定でローリング継続、
+# 地上のゆっくりした機体ヨードリフト(EKF1 縮退 1.5°/s 級)も 0.5s 窓の
+# スプレッドは 1° 未満のため追従が続く(22:38 stale 対策は維持)
+_YAW_ANCHOR_SPREAD_MAX_RAD = 10.0 * DEG_TO_RAD
+_YAW_ANCHOR_SPREAD_WARN_S = 2.0
+_YAW_ANCHOR_SPREAD_WARN_COOLDOWN_S = 10.0
 
 # プリフライト・インターロック(P1-2。FLIGHT_ANALYSIS_20260731.md §7-B-2):
 # yaw_ref_source ≠ off のとき「ekf2_status bit1(fused)=1 ∧ |innov| < 10°」
@@ -374,6 +384,9 @@ class SessionManager:
         # ラッチもそこで行う(self._lock 保護)
         self._yaw_anchor_window: deque = deque()
         self._yaw_prev_drone_state: Optional[int] = None   # アーム遷移検出用
+        # スプレッドガード(地上ローリングの整合検査)の計時状態
+        self._yaw_anchor_spread_since: Optional[float] = None
+        self._yaw_anchor_spread_warn_t = -1.0e9
         # 連続性フィルタの再整列カウント(警告発報の既読値)
         self._yaw_realign_seen = 0
         # プリフライト・インターロック(P1-2): fused=1 ∧ |innov|<10° の
@@ -444,6 +457,7 @@ class SessionManager:
             self._yaw_anchor_info = None
             self._yaw_anchor_window.clear()
             self._yaw_prev_drone_state = None
+            self._yaw_anchor_spread_since = None
             self._yaw_align_ok_since = None   # インターロック計時も仕切り直す
 
         # リレーへ ESP-NOW ピア設定(各1.0s 待ち、初回+最大3回再送=最大4回。
@@ -1196,7 +1210,7 @@ class SessionManager:
         return _json_safe(status)
 
     # ------------------------------------------------------------------
-    # v2: 円軌道モード(Position タブ)
+    # v2: 軌道モード(円・シャトル・評価シーケンス、Position タブ)
     # ------------------------------------------------------------------
 
     @_ui_command
@@ -1225,6 +1239,78 @@ class SessionManager:
     def circle_stop(self) -> None:
         self.position.stop_circle()
         self.info("円軌道停止: 現在目標でホバリングに復帰します")
+
+    @_ui_command
+    def shuttle_start(self, center_x: float, center_y: float, axis_deg: float,
+                      amplitude_m: float, period_s: float, cycles: int,
+                      alt_m: float) -> bool:
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_POSITION:
+            self.warn("往復軌道は Position モードでのみ使用できます")
+            return False
+        ok, error = self.position.start_shuttle(
+            center_x, center_y, axis_deg, amplitude_m, period_s, cycles,
+            alt_m, now=self._clock())
+        if not ok:
+            self.warn(f"往復軌道を開始できません: {error}")
+            return False
+        cycles_text = "連続" if cycles == 0 else f"{cycles}サイクル"
+        self.info(f"往復軌道開始: 中心=({center_x:.2f}, {center_y:.2f}) "
+                  f"軸={axis_deg:.0f}° 振幅={amplitude_m:.2f}m "
+                  f"周期={period_s:.1f}s {cycles_text} 高度={alt_m:.2f}m")
+        return True
+
+    @_ui_command
+    def shuttle_stop(self) -> None:
+        self.position.stop_trajectory()
+        self.info("往復軌道停止: 現在目標でホバリングに復帰します")
+
+    @_ui_command
+    def traj_sequence_start(self, name: str, alt_m: float,
+                            start_index: int = 0) -> bool:
+        """評価シーケンス(スクリプト軌道)の開始。
+
+        プリセットは control.json trajectory.sequences から引く。
+        start_index は 0 始まり(UI の「このセグメントから開始」)。
+        検証(全セグメントの事前ガード・yaw 制御 ON 要件)は
+        PositionController.start_sequence が行う。
+        """
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_POSITION:
+            self.warn("評価シーケンスは Position モードでのみ使用できます")
+            return False
+        sequences = self.control_config.get("trajectory", {}).get(
+            "sequences", {})
+        segments = sequences.get(name)
+        if not isinstance(segments, list) or not segments:
+            self.warn(f"評価シーケンスのプリセットがありません: {name!r}")
+            return False
+        ok, error = self.position.start_sequence(
+            name, segments, alt_m, start_index=start_index, now=self._clock())
+        if not ok:
+            self.warn(f"評価シーケンスを開始できません: {error}")
+            return False
+        count = len(segments)
+        self.info(f"評価シーケンス開始: {name}(セグメント {start_index + 1}"
+                  f"/{count} から・高度={alt_m:.2f}m)")
+        # ログ中なら定義と開始時刻を meta.json サイドカーへ恒久記録する
+        # (CSV 列スキーマは不変 — 進行は traj_mode 列と snapshot で追える)
+        if self.logger.active:
+            self.logger.update_metadata({"trajectory_sequence": {
+                "name": name,
+                "alt_m": alt_m,
+                "start_index": start_index,
+                "segments": segments,
+                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }})
+        return True
+
+    @_ui_command
+    def traj_sequence_stop(self) -> None:
+        self.position.stop_trajectory()
+        self.info("評価シーケンス停止: 現在目標でホバリングに復帰します")
 
     # ------------------------------------------------------------------
     # 複数機同時制御(Multi タブ)
@@ -1611,6 +1697,7 @@ class SessionManager:
             self._yaw_anchor_info = None
             self._yaw_anchor_window.clear()
             self._yaw_prev_drone_state = None
+            self._yaw_anchor_spread_since = None
             self._yaw_realign_seen = 0
 
     def _warn_unsupported_wire_frame(self) -> None:
@@ -1889,6 +1976,7 @@ class SessionManager:
             self._yaw_anchor_info = None
             self._yaw_anchor_window.clear()
             self._yaw_prev_drone_state = None
+            self._yaw_anchor_spread_since = None
             self._yaw_align_ok_since = None
         self.position.set_control_active(False)
         self.info(message)
@@ -1993,9 +2081,6 @@ class SessionManager:
             self._warn_unsupported_wire_frame()
         else:
             err_y *= wire_sign
-        # 移動ベースヨー(契約 §3.2): ソースに関わらず毎 tick 更新・記録する
-        # (切替前の妥当性検証と、切替時の即応のため)
-        motion_wire, motion_est = self._update_motion_yaw(meta, wire_sign)
 
         # MoCap 実測ヨー基準(P0-1 改修): 連続性フィルタ後の yaw_true
         # (パネル較正 yaw_sign/yaw_offset 適用済み = 表示列と同一値)を
@@ -2013,12 +2098,19 @@ class SessionManager:
         anchor = self._update_yaw_anchor(
             yaw_true if mocap_yaw_ok else None, now)
 
-        # ヨー基準ソース選択(契約 §3.1)。mocap は yaw_true(arm 整列時は
-        # +anchor)、motion は推定 valid 時のみ bit3+bit4(低信頼)、
-        # off/invalid は bit3 を落とす(ファームの EKF2 はコースト)
         with self._lock:
             yaw_ref_source = self._yaw_ref_source
             yaw_ref_align = self._yaw_ref_align
+
+        # 移動ベースヨー(契約 §3.2): ソースに関わらず毎 tick 更新・記録する
+        # (切替前の妥当性検証と、切替時の即応のため)。整列(align/anchor)は
+        # mocap ソースと同一規則を適用する(2026-08-03 改修 — 下記参照)。
+        motion_obs, motion_est = self._update_motion_yaw(
+            meta, anchor, yaw_ref_align)
+
+        # ヨー基準ソース選択(契約 §3.1)。mocap は yaw_true(arm 整列時は
+        # +anchor)、motion は推定 valid かつ整列成立時のみ bit3+bit4
+        # (低信頼)、off/invalid は bit3 を落とす(ファームの EKF2 はコースト)
         yaw_obs: Optional[float] = None
         low_trust = False
         if yaw_ref_source == YAW_REF_MOCAP:
@@ -2029,7 +2121,7 @@ class SessionManager:
                     # arm 整列: アンカー未ラッチの間は bit3 を落とす
                     yaw_obs = wrap_pi(yaw_true + anchor)
         elif yaw_ref_source == YAW_REF_MOTION:
-            yaw_obs = motion_wire
+            yaw_obs = motion_obs
             low_trust = True
         flags = proto.CmdPosErr.FLAG_ALT_REF_VALID
         if yaw_ctrl_on:
@@ -2068,25 +2160,34 @@ class SessionManager:
             row["yaw_ref_sent_rad"] = pos_err.mocap_yaw
             row["yaw_ref_valid"] = bool(
                 flags & proto.CmdPosErr.FLAG_MOCAP_YAW_VALID)
-            row["motion_yaw_rad"] = motion_wire
+            row["motion_yaw_rad"] = motion_obs
             row["motion_yaw_J"] = motion_est["j"]
             self.logger.log_row(row)
 
-    def _update_motion_yaw(self, meta: dict,
-                           wire_sign: Optional[float]
-                           ) -> tuple[Optional[float], dict]:
-        """移動ベースヨー推定器を1 tick 進め、ワイヤ規約の推定値を返す。
+    def _update_motion_yaw(self, meta: dict, anchor: Optional[float],
+                           yaw_ref_align: str) -> tuple[Optional[float], dict]:
+        """移動ベースヨー推定器を1 tick 進め、送信規約の推定値を返す。
 
         入力: フィルタ済み MoCap 位置(制御座標系)+最新テレメトリ
-        roll/pitch(遅延補償は推定器内部で行う — PoC 実証 ≈90ms)。
+        roll/pitch/r(ヨーレート r は derotation 用。25Hz サンプルホールド
+        で可。位置経路遅延の補償は推定器内部で行う — PoC 実証 ≈90ms)。
         位置無効・MoCap 途絶・テレメトリ非新鮮の tick はギャップとして
         扱う(推定器がフィルタ連鎖をリセットし、窓は自然期限切れ)。
 
-        戻り値: (ワイヤ規約の移動ベースヨー [rad] または None, estimate dict)。
-        規約変換: 推定器出力 ψ̂ は PoC 規約(ψ̂ ≈ -yaw_true)。
-        yaw_true = yaw_sign*heading + offset の逆写像で heading 相当へ戻し、
-        mocap ソースと同じワイヤ変換(× machine_wire_y_sign)を適用する —
-        ソース切替でファームが見る値の規約が変わらないことを保証する。
+        戻り値: (送信規約の移動ベースヨー [rad] または None, estimate dict)。
+        規約変換(2026-08-03 改修): 推定器出力 ψ̂ は PoC 規約
+        (ψ̂ ≈ -yaw_true)なので -ψ̂ で yaw_true 系へ戻し、mocap ソースと
+        **同一の整列規則**を適用する —
+        - arm(既定): wrap(yaw_true_motion + anchor)。アンカー未ラッチは
+          None(bit3 落とし = ファームはコースト)
+        - absolute: yaw_true_motion をそのまま
+        ソース切替でファームが見るフレームが変わらないことを保証する。
+        旧実装の heading×wire_sign 経路(パネル較正 yaw_offset の逆写像)は
+        P0-1 のアーム相対アンカーを通らず、18:20 故障モードの定数オフセット
+        基準(実測 ≈−90° → EKF2 30° ゲート全棄却 → 融合停止ラッチ)が
+        motion 切替時に構造的に再発するため廃止(2026-08-03 実ログ検証:
+        旧経路の送信値は機体制御フレームに対し −95.5°±2.3° / −62.7°±6.7°
+        でゲート内 0%)。
         """
         filtered = meta.get("filtered_pos")
         with self._lock:
@@ -2100,22 +2201,30 @@ class SessionManager:
                      and tlm_fresh)
         if sample_ok:
             self.motion_yaw.add_sample(float(filtered[0]), float(filtered[1]),
-                                       tlm.roll, tlm.pitch)
+                                       tlm.roll, tlm.pitch,
+                                       yaw_rate_rad_s=tlm.r)
         else:
             self.motion_yaw.add_gap()
         est = self.motion_yaw.estimate()
 
-        motion_wire: Optional[float] = None
-        if est["yaw_rad"] is not None and wire_sign is not None:
-            yaw_sign, yaw_offset = self.mocap.attitude_yaw_convention
+        motion_obs: Optional[float] = None
+        # 未対応マッピング(machine_wire_y_sign=None)では送らない: PoC 規約
+        # ψ̂≈−yaw_true は対応マッピング(レガシー鏡映・右手系)でのみ実証
+        # されており、軸入替等の未対応フレームでは LS モデル自体が未検証の
+        # ため(レビュー指摘 — XY 制御の無効化と同じ判定基準)
+        if (est["yaw_rad"] is not None
+                and self.mocap.machine_wire_y_sign is not None):
             yaw_true_motion = -est["yaw_rad"]           # PoC 規約 → yaw_true
-            heading_motion = yaw_sign * (yaw_true_motion - yaw_offset)
-            motion_wire = wrap_pi(heading_motion * wire_sign)
-        snap = {"yaw_wire_rad": motion_wire, "j": est["j"],
-                "valid": bool(est["valid"]) and motion_wire is not None}
+            if yaw_ref_align == YAW_ALIGN_ABSOLUTE:
+                motion_obs = wrap_pi(yaw_true_motion)
+            elif anchor is not None:
+                motion_obs = wrap_pi(yaw_true_motion + anchor)
+            # arm 整列でアンカー未ラッチの間は None のまま(bit3 落とし)
+        snap = {"yaw_wire_rad": motion_obs, "j": est["j"],
+                "valid": bool(est["valid"]) and motion_obs is not None}
         with self._lock:
             self._motion_yaw_snap = snap
-        return motion_wire, est
+        return motion_obs, est
 
     def _update_yaw_anchor(self, yaw_true: Optional[float],
                            now: float) -> Optional[float]:
@@ -2125,12 +2234,23 @@ class SessionManager:
         毎 tick、最新テレメトリ(新鮮時)との差
         diff = wrap(yaw_est_rad − yaw_true) を 0.5s 窓に蓄える。
 
-        ラッチ規則:
+        ラッチ規則(2026-08-03 改修 — 地上ローリング化):
         - アーム遷移(機体 state が地上 → 飛行)を検出したら窓の円周
-          中央値で取り直す(1フライト1回。sent がアーム時の機体ヨーへ
-          一致する = 7/31 故障モードの構造的封じ)。
-        - アンカー未保持で地上かつ窓に標本があれば暫定ラッチ(離陸前から
-          基準を供給し、プリフライトの fused=1 チェックを可能にする)。
+          中央値で取り直し、以後**飛行中は凍結**する(1フライト1回。
+          sent がアーム時の機体ヨーへ一致する = 7/31 故障モードの
+          構造的封じ)。
+        - **地上では毎 tick 窓中央値で再ラッチし続ける(ローリング)**:
+          前フライト・前セッションの stale アンカーが地上待機中の機体ヨー
+          ドリフト(EKF1 で最大 −90°/min 実測)から乖離し、アーム再ラッチで
+          基準が段差ジャンプ → EKF2 が段差を b_g へ誤吸収して恒常 innov
+          プラトー化する事故(22:38 実測: 段差 −8.46° → 飛行 RMS 2.03°、
+          21:15 でも +8.4° 段差)への対策。地上で基準を機体フレームへ
+          追従させ続ければアーム時の段差は構造的に生じない。
+          「未ラッチ扱い(bit3 落とし)」案は地上融合を止めてしまい、
+          プリフライト fused チェックと est_mode=2 の離陸インターロックを
+          壊すため不採用。
+          ローリング中のログ・meta.json 書込みは初回ラッチとアーム遷移のみ
+          (毎 tick のスパム防止。値の更新自体は毎 tick 反映される)。
         Returns: 現在のアンカー(未ラッチなら None)。
         """
         with self._lock:
@@ -2145,6 +2265,7 @@ class SessionManager:
 
         latched: Optional[dict] = None
         arm_transition_missed = False
+        spread_warn = False
         with self._lock:
             window = self._yaw_anchor_window
             if diff is not None:
@@ -2157,27 +2278,54 @@ class SessionManager:
                               and tlm.state in _IN_FLIGHT_STATES)
             if arm_transition and not window:
                 # アーム瞬間に基準が無効(グリッチ棄却中など): 直前の
-                # (地上暫定)アンカーを維持する。無ければ bit3 は落ちた
-                # まま = ファームはコースト(悪化しない)
+                # (地上ローリング)アンカーを維持する。無ければ bit3 は
+                # 落ちたまま = ファームはコースト(悪化しない)
                 arm_transition_missed = True
-            elif arm_transition or (self._yaw_anchor_rad is None
-                                    and tlm.state in _ON_GROUND_STATES
+            elif arm_transition or (tlm.state in _ON_GROUND_STATES
                                     and window):
+                first_latch = self._yaw_anchor_rad is None
                 anchor = _circular_median([d for _, d in window])
-                self._yaw_anchor_rad = anchor
-                latched = {
-                    "anchor_rad": anchor,
-                    "latched": "arm" if arm_transition else "ground",
-                    "samples": len(window),
-                    "yaw_est_rad": tlm.yaw_est_rad,
-                }
-                self._yaw_anchor_info = latched
+                spread = max(abs(wrap_pi(d - anchor)) for _, d in window)
+                if arm_transition or spread < _YAW_ANCHOR_SPREAD_MAX_RAD:
+                    # アーム遷移は無条件ラッチ(中央値がロバスト)。地上は
+                    # 窓が整合しているときのみローリング再ラッチする
+                    self._yaw_anchor_rad = anchor
+                    info = {
+                        "anchor_rad": anchor,
+                        "latched": "arm" if arm_transition else "ground",
+                        "samples": len(window),
+                        "yaw_est_rad": tlm.yaw_est_rad,
+                    }
+                    self._yaw_anchor_info = info
+                    self._yaw_anchor_spread_since = None
+                    # 通知はアーム遷移と初回地上ラッチのみ(ローリングは静粛)
+                    if arm_transition or first_latch:
+                        latched = info
+                else:
+                    # スプレッド過大: yaw_est と yaw_true の整合が不安定
+                    # (鏡映フレームの手回し・MoCap グリッチ等)。再ラッチを
+                    # 凍結して直前アンカーを維持し、イノベーション増大を
+                    # プリフライト・インターロック(P1-2)に見せる。
+                    # 持続時は警告(クールダウン付き)で運用者に知らせる
+                    if self._yaw_anchor_spread_since is None:
+                        self._yaw_anchor_spread_since = now
+                    elif ((now - self._yaw_anchor_spread_since
+                           >= _YAW_ANCHOR_SPREAD_WARN_S)
+                          and (now - self._yaw_anchor_spread_warn_t
+                               >= _YAW_ANCHOR_SPREAD_WARN_COOLDOWN_S)):
+                        self._yaw_anchor_spread_warn_t = now
+                        spread_warn = True
             anchor_now = self._yaw_anchor_rad
+        if spread_warn:
+            self.warn("MoCap ヨーと機体ヨーの整合が不安定です(ヨーアンカー"
+                      "の地上追従を一時停止中)。フレーム不整合の疑い — "
+                      "プリフライト確認(手回しでのヨー一致)を実施して"
+                      "ください")
         if arm_transition_missed:
             self.warn("アーム時のヨーアンカー再取得に失敗(MoCap 基準が"
                       "無効)。直前のアンカーを維持します")
         elif latched is not None:
-            kind = "アーム" if latched["latched"] == "arm" else "地上暫定"
+            kind = "アーム" if latched["latched"] == "arm" else "地上追従"
             self.info(f"ヨーアンカーをラッチ({kind}): "
                       f"{latched['anchor_rad'] * RAD_TO_DEG:+.1f}°"
                       f"(標本 {latched['samples']})")

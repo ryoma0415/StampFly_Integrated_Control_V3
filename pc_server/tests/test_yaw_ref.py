@@ -8,9 +8,13 @@
   - absolute: sent = yaw_true(較正オフセット方式)
   棄却中(mocap_flip bit1)・途絶中・アンカー未ラッチは bit3 を落とす
 - off: bit3 を立てない(mocap_yaw=0)
-- motion: 推定 valid 時 bit3+bit4(低信頼)、invalid 時 bit3 を落とす。
-  送信値は PoC 規約 ψ̂ → yaw_true → heading 相当 → ワイヤ規約の変換
-  (session._update_motion_yaw)を経る(P0-1 対象外・従来どおり)
+- motion: 推定 valid かつ整列成立時 bit3+bit4(低信頼)、invalid 時 bit3 を
+  落とす。送信値は PoC 規約 ψ̂ → yaw_true_motion=−ψ̂ → mocap ソースと
+  同一の整列(arm: +anchor / absolute: そのまま)を適用する(2026-08-03
+  改修。旧 heading×wire_sign 経路は P0-1 アンカーを通らず 18:20 型の
+  定数オフセット基準が再発するため廃止)
+- アンカーは地上ではローリング再ラッチ(毎 tick 窓中央値)、アーム遷移で
+  凍結(2026-08-03 改修 — 22:38 の stale anchor 段差 → b_g 誤吸収対策)
 - v6 ロガー: yaw_ref_source / yaw_ref_sent_rad / yaw_ref_valid /
   motion_yaw_rad / motion_yaw_J 列が行に載る。meta.json に yaw_ref
   (align・anchor)が記録され、アーム遷移の再ラッチで追記更新される
@@ -129,11 +133,39 @@ class TestYawRefSource:
         assert not (pe.flags & proto.CmdPosErr.FLAG_YAW_REF_LOW_TRUST)
         assert pe.mocap_yaw == 0.0
 
-    def test_motion_source_sets_bit3_and_bit4(self, session_factory):
-        session, transport, _clock = session_factory()
+    def test_motion_source_sets_bit3_and_bit4_with_arm_anchor(
+            self, session_factory):
+        """motion + arm 整列: sent = wrap(-ψ̂ + anchor)(mocap と同一整列)。
+
+        2026-08-03 改修の中核: 旧 heading×wire_sign 経路(P0-1 アンカーを
+        通らない)は、実ログ検証で機体制御フレームに対し ≈−90° の定数
+        オフセットとなり EKF2 30° ゲート内 0%(→ 全棄却ラッチ)だった。
+        """
+        session, transport, clock = session_factory()
         _connect_quiet(session, transport)
         assert session.set_yaw_ref_source(YAW_REF_MOTION)["ok"]
         psi_poc = -0.8   # PoC 規約(ψ̂ ≈ -yaw_true)
+        _force_motion_estimate(session, psi_poc)
+        # 地上でアンカーをラッチ(yaw_est=0.5, yaw_true=1.62 → −1.12)
+        _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.5)
+
+        session._emit_setpoint(0.0, 0.0, 0.3, _position_meta())
+
+        pe = _sent_pos_errs(transport)[0]
+        assert pe.flags & proto.CmdPosErr.FLAG_MOCAP_YAW_VALID
+        assert pe.flags & proto.CmdPosErr.FLAG_YAW_REF_LOW_TRUST
+        anchor = wrap_pi(0.5 - 1.62)
+        expected = wrap_pi(-psi_poc + anchor)
+        assert pe.mocap_yaw == pytest.approx(expected, abs=1e-6)
+
+    def test_motion_source_absolute_align_sends_yaw_true_motion(
+            self, session_factory):
+        """motion + absolute 整列: sent = -ψ̂(較正オフセット方式と同格)。"""
+        session, transport, _clock = session_factory()
+        _connect_quiet(session, transport)
+        assert session.set_yaw_ref_source(YAW_REF_MOTION)["ok"]
+        assert session.set_yaw_ref_align(YAW_ALIGN_ABSOLUTE)["ok"]
+        psi_poc = -0.8
         _force_motion_estimate(session, psi_poc)
 
         session._emit_setpoint(0.0, 0.0, 0.3, _position_meta())
@@ -141,17 +173,50 @@ class TestYawRefSource:
         pe = _sent_pos_errs(transport)[0]
         assert pe.flags & proto.CmdPosErr.FLAG_MOCAP_YAW_VALID
         assert pe.flags & proto.CmdPosErr.FLAG_YAW_REF_LOW_TRUST
-        # 規約変換: yaw_true = -ψ̂ → heading = yaw_sign*(yaw_true - offset)
-        # → ワイヤ = heading * machine_wire_y_sign(従来どおり)
-        yaw_sign, yaw_offset = session.mocap.attitude_yaw_convention
-        wire_sign = session.mocap.machine_wire_y_sign
-        expected = wrap_pi(yaw_sign * (-psi_poc - yaw_offset) * wire_sign)
-        assert pe.mocap_yaw == pytest.approx(expected)
+        assert pe.mocap_yaw == pytest.approx(wrap_pi(-psi_poc), abs=1e-6)
 
-    def test_motion_source_invalid_clears_bit3(self, session_factory):
+    def test_motion_source_without_anchor_clears_bit3(self, session_factory):
+        """motion + arm 整列でアンカー未ラッチなら bit3 を落とす
+        (誤フレームの推定値を送らない — mocap ソースと同一規則)。"""
         session, transport, _clock = session_factory()
         _connect_quiet(session, transport)
         assert session.set_yaw_ref_source(YAW_REF_MOTION)["ok"]
+        _force_motion_estimate(session, -0.8)   # 推定は valid だが…
+
+        session._emit_setpoint(0.0, 0.0, 0.3, _position_meta())
+
+        pe = _sent_pos_errs(transport)[0]
+        # テレメトリ未受信 → アンカー未ラッチ → bit3 なし
+        assert not (pe.flags & proto.CmdPosErr.FLAG_MOCAP_YAW_VALID)
+        assert pe.mocap_yaw == 0.0
+
+    def test_motion_source_unsupported_mapping_clears_bit3(
+            self, session_factory, monkeypatch):
+        """未対応マッピング(machine_wire_y_sign=None)では motion を送らない。
+
+        PoC 規約 ψ̂≈−yaw_true は対応マッピングでのみ実証されており、軸入替
+        等の未対応フレームでは LS モデル自体が未検証のため(XY 制御の無効化
+        と同じ判定基準)。
+        """
+        session, transport, clock = session_factory()
+        _connect_quiet(session, transport)
+        assert session.set_yaw_ref_source(YAW_REF_MOTION)["ok"]
+        _force_motion_estimate(session, -0.8)
+        _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.5)
+        monkeypatch.setattr(type(session.mocap), "machine_wire_y_sign",
+                            property(lambda self: None))
+
+        session._emit_setpoint(0.0, 0.0, 0.3, _position_meta())
+
+        pe = _sent_pos_errs(transport)[0]
+        assert not (pe.flags & proto.CmdPosErr.FLAG_MOCAP_YAW_VALID)
+        assert pe.mocap_yaw == 0.0
+
+    def test_motion_source_invalid_clears_bit3(self, session_factory):
+        session, transport, clock = session_factory()
+        _connect_quiet(session, transport)
+        assert session.set_yaw_ref_source(YAW_REF_MOTION)["ok"]
+        _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.5)
         _force_motion_estimate(session, None, j=1.0, valid=False)
 
         session._emit_setpoint(0.0, 0.0, 0.3, _position_meta())
@@ -176,10 +241,11 @@ class TestYawRefSource:
         assert session.yaw_ref_status()["align"] == YAW_ALIGN_ARM
 
     def test_snapshot_carries_yaw_ref(self, session_factory):
-        session, transport, _clock = session_factory()
+        session, transport, clock = session_factory()
         _connect_quiet(session, transport)
         assert session.set_yaw_ref_source(YAW_REF_MOTION)["ok"]
         _force_motion_estimate(session, -0.8)
+        _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.5)
         session._emit_setpoint(0.0, 0.0, 0.3, _position_meta())
 
         snapshot = session.get_state_snapshot()
@@ -310,6 +376,130 @@ class TestYawAlignArm:
         pe = _sent_pos_errs(transport)[-1]
         assert not (pe.flags & proto.CmdPosErr.FLAG_MOCAP_YAW_VALID)
 
+    def test_stale_anchor_rolls_on_ground_without_arm_step(
+            self, session_factory):
+        """(e) 22:38 故障モード対策: 地上ローリング再ラッチ。
+
+        前フライトでラッチしたアンカーは、着陸後の地上待機中に機体ヨーが
+        ドリフトすると stale になり、次のアーム再ラッチで基準が段差
+        ジャンプする(22:38 実測 −8.46° → EKF2 の b_g 誤吸収 → 飛行
+        RMS 2.03°)。地上ではアンカーが機体ヨーへ追従(ローリング)し、
+        アーム時に段差が生じないことを検証する。
+        """
+        session, transport, clock = session_factory()
+        _connect_quiet(session, transport)
+        # フライト1: 地上ラッチ → アーム(anchor = 0.5 − 1.3 = −0.8)
+        _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.5)
+        session._emit_setpoint(0.0, 0.0, 0.3,
+                               _position_meta(mocap_yaw_true_rad=1.3))
+        clock.advance(0.02)
+        _set_tlm(session, clock, proto.FlightState.TAKEOFF, yaw_est_rad=0.5)
+        session._emit_setpoint(0.0, 0.0, 0.3,
+                               _position_meta(mocap_yaw_true_rad=1.3))
+        # 着陸 → 地上待機中に機体ヨーが 0.5 → 0.35 へドリフト(EKF1
+        # 縮退相当)。0.5s 窓が新値で満ちるまでホールドする
+        for _ in range(35):
+            clock.advance(0.02)
+            _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.35)
+            session._emit_setpoint(0.0, 0.0, 0.3,
+                                   _position_meta(mocap_yaw_true_rad=1.3))
+        pe_ground = _sent_pos_errs(transport)[-1]
+        # 地上ローリング: sent は現在の機体ヨーへ追従(stale の 0.5 でなく)
+        assert pe_ground.mocap_yaw == pytest.approx(0.35, abs=1e-6)
+        assert session.yaw_ref_status()["anchor_latched"] == "ground"
+        # フライト2 アーム: 再ラッチしても基準に段差が生じない
+        clock.advance(0.02)
+        _set_tlm(session, clock, proto.FlightState.TAKEOFF, yaw_est_rad=0.35)
+        session._emit_setpoint(0.0, 0.0, 0.3,
+                               _position_meta(mocap_yaw_true_rad=1.3))
+        pe_arm = _sent_pos_errs(transport)[-1]
+        assert abs(wrap_pi(pe_arm.mocap_yaw - pe_ground.mocap_yaw)) < 1e-6
+        assert session.yaw_ref_status()["anchor_latched"] == "arm"
+
+    def _drain_log_lines(self, session):
+        lines = []
+        while not session.events.empty():
+            event = session.events.get_nowait()
+            if event.get("type") == "log":
+                lines.append(event.get("line", ""))
+        return lines
+
+    def test_ground_rolling_freezes_on_inconsistent_frames(
+            self, session_factory):
+        """(f) スプレッドガード: 鏡映フレーム模擬(yaw_true が逆方向に流れ
+        diff が 2ψ̇ でスイープ)では地上ローリングが凍結し、直前アンカーを
+        維持して警告を出す(プリフライトの手回し検査の検出力を回復)。"""
+        session, transport, clock = session_factory()
+        _connect_quiet(session, transport)
+        # 静止で地上ラッチ(anchor = 0.5 − 1.0 = −0.5)
+        for _ in range(30):
+            clock.advance(0.02)
+            _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.5)
+            session._emit_setpoint(0.0, 0.0, 0.3,
+                                   _position_meta(mocap_yaw_true_rad=1.0))
+        self._drain_log_lines(session)
+        # 手回し模擬: 機体ヨー +60°/s、鏡映 yaw_true は −60°/s(3s)
+        rate = math.radians(60.0)
+        yaw_est, yaw_true = 0.5, 1.0
+        for _ in range(150):
+            clock.advance(0.02)
+            yaw_est += rate * 0.02
+            yaw_true -= rate * 0.02
+            _set_tlm(session, clock, proto.FlightState.WAIT,
+                     yaw_est_rad=wrap_pi(yaw_est))
+            session._emit_setpoint(0.0, 0.0, 0.3, _position_meta(
+                mocap_yaw_true_rad=wrap_pi(yaw_true)))
+        # アンカーは回転前の値で凍結(追従していれば大きく動いている)
+        status = session.yaw_ref_status()
+        assert status["anchor_deg"] == pytest.approx(
+            math.degrees(-0.5), abs=3.0)
+        # 2s 継続で整合不安定の警告
+        assert any("整合が不安定" in line
+                   for line in self._drain_log_lines(session))
+
+    def test_ground_rolling_continues_during_consistent_rotation(
+            self, session_factory):
+        """(g) 正常フレームの手回し(yaw_est と yaw_true が同期変化)は
+        diff 一定 → スプレッド小のためローリング継続・警告なし。"""
+        session, transport, clock = session_factory()
+        _connect_quiet(session, transport)
+        rate = math.radians(60.0)
+        yaw_est, yaw_true = 0.5, 1.0
+        for _ in range(150):
+            clock.advance(0.02)
+            yaw_est += rate * 0.02
+            yaw_true += rate * 0.02
+            _set_tlm(session, clock, proto.FlightState.WAIT,
+                     yaw_est_rad=wrap_pi(yaw_est))
+            session._emit_setpoint(0.0, 0.0, 0.3, _position_meta(
+                mocap_yaw_true_rad=wrap_pi(yaw_true)))
+        status = session.yaw_ref_status()
+        assert status["anchor_latched"] == "ground"
+        assert status["anchor_deg"] == pytest.approx(
+            math.degrees(-0.5), abs=1.0)
+        assert not any("整合が不安定" in line
+                       for line in self._drain_log_lines(session))
+
+    def test_ground_rolling_tracks_slow_drift(self, session_factory):
+        """(h) 緩慢な機体ヨードリフト(1.5°/s = EKF1 縮退級)は 0.5s 窓の
+        スプレッドが閾値未満のため追従が継続する(22:38 対策の維持)。"""
+        session, transport, clock = session_factory()
+        _connect_quiet(session, transport)
+        yaw_est = 0.5
+        drift = math.radians(1.5)
+        for _ in range(150):   # 3s で −4.5° … +4.5°分ドリフト
+            clock.advance(0.02)
+            yaw_est += drift * 0.02
+            _set_tlm(session, clock, proto.FlightState.WAIT,
+                     yaw_est_rad=yaw_est)
+            session._emit_setpoint(0.0, 0.0, 0.3,
+                                   _position_meta(mocap_yaw_true_rad=1.0))
+        pe = _sent_pos_errs(transport)[-1]
+        # sent は現在の機体ヨーへ追従(0.5s 窓中央値の遅れ ≈ 0.4° 以内)
+        assert abs(wrap_pi(pe.mocap_yaw - yaw_est)) < math.radians(1.0)
+        assert not any("整合が不安定" in line
+                       for line in self._drain_log_lines(session))
+
     def test_realign_count_increase_warns(self, session_factory):
         """連続性フィルタの再整列カウント増加が警告ログになる。"""
         session, transport, clock = session_factory()
@@ -331,10 +521,11 @@ class TestV6LogColumns:
     def test_pos_err_row_contains_yaw_ref_columns(self, session_factory,
                                                   tmp_path):
         """v6 ロガー: CMD_POS_ERR 行に PC 側ヨー基準/移動ベースヨー列が載る。"""
-        session, transport, _clock = session_factory()
+        session, transport, clock = session_factory()
         _connect_quiet(session, transport)
         assert session.set_yaw_ref_source(YAW_REF_MOTION)["ok"]
         _force_motion_estimate(session, -0.8, j=25.0)
+        _set_tlm(session, clock, proto.FlightState.WAIT, yaw_est_rad=0.5)
         session.logger._logs_dir = tmp_path
         path = session.logger.start("position",
                                     metadata=session._log_metadata())

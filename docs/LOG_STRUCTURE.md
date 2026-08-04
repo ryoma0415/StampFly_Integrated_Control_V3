@@ -212,8 +212,8 @@ OFF 時の psi_pid 毎 tick リセット等)。有効区間は `tlm_ctrl_flags`
 | --- | --- | --- | --- |
 | `mocap_yaw_deg` | float | deg | MoCap リジッドボディのヨー真値(mocap.py の yaw_rad を deg 換算。比較用)。 |
 | `mocap_heading_deg` | float | deg | MoCap 実測の制御座標系ヨー(リジッドボディ前方軸の方位)。CMD_POS_ERR の mocap_yaw 欄(機上ヨー回転補償)に使った値で、機体推定ヨー(`tlm_yaw_est_rad`)とのフレーム整合検証に使う。heading 未取得時は空欄。 |
-| `traj_mode` | int | - | 軌道モード: hover=0 / circle=1。 |
-| `traj_phase_rad` | float | rad | 円軌道の現在位相(±π)。**hover 時は空欄**。MoCap 途絶中は位相凍結のため直近値のまま。 |
+| `traj_mode` | int | - | 軌道モード: hover=0 / circle=1 / **shuttle(直線往復)=2(2026-08-03 追加)**。評価シーケンス(スクリプト軌道)実行中は専用値を持たず、**現セグメントの基礎モードを報告する**(hover/yaw セグメント=0、circle セグメント=1、shuttle セグメント=2)。ログ記録中に開始したシーケンスの定義・開始時刻は `*.meta.json` の `trajectory_sequence` に恒久記録される。 |
+| `traj_phase_rad` | float | rad | 軌道(circle/shuttle)の現在位相(±π)。**hover 時は空欄**。MoCap 途絶中は位相凍結のため直近値のまま。 |
 
 ### 12. フィルタ状態(10列、出所: meta。Posture では空)
 
@@ -281,7 +281,7 @@ CMD_POS_ERR の `mocap_yaw`(外部ヨー基準)欄の供給状態と、PC 側で
 | `yaw_ref_source` | string | - | ヨー基準ソース(`off` / `mocap` / `motion`。行単位 — 飛行中の切替も追える)。 |
 | `yaw_ref_sent_rad` | float | rad | CMD_POS_ERR の `mocap_yaw` 欄に実際に送った値(ワイヤ規約)。bit3=0 のときは 0。**【改訂 2026-07-31 P0-1】** mocap ソースの送信値は `heading×wire_sign`(較正が乗らない旧経路 — 7/31 の基準鏡像化事故の原因)から、**連続性フィルタ後の正解ヨー(`mocap_yaw_true_deg` と同一情報源)+整列方式**へ変更: `align=arm`(既定)は `wrap(yaw_true + anchor)`(anchor はアーム遷移時に機体ヨー `tlm_yaw_est_rad` へ整列 — 値は meta.json の `yaw_ref.anchor` に記録)、`align=absolute` は `yaw_true` そのまま。連続性棄却中・MoCap 途絶中・アンカー未ラッチ時は bit3=0。 |
 | `yaw_ref_valid` | 0/1 | - | flags bit3(FLAG_MOCAP_YAW_VALID)を立てて送信したか。 |
-| `motion_yaw_rad` | float | rad | 移動ベースヨー推定(ワイヤ規約変換済み — `yaw_ref_sent_rad` と直接比較可能)。ソースが mocap の間も常時記録する(切替前の妥当性検証用)。推定 invalid(励振不足)時は空。 |
+| `motion_yaw_rad` | float | rad | 移動ベースヨー推定(**送信規約** — `yaw_ref_sent_rad` と直接比較可能)。ソースが mocap の間も常時記録する(切替前の妥当性検証用)。**【改訂 2026-08-03】規約変更**: 旧実装は旧ワイヤ規約(heading×wire_sign — 較正・アンカーが乗らない経路)を記録していたが、mocap ソースと同一の整列適用後の値へ変更(`align=arm`(既定)は `wrap(−ψ̂ + anchor)`、`align=absolute` は `wrap(−ψ̂)`。ψ̂ は推定器出力、MAG_AUTOTUNE_DESIGN.md §3 改訂注記)。推定 invalid(励振不足)時に加え、**arm 整列でアンカー未ラッチの間も空**。8/3 以前のログの本列は旧ワイヤ規約である点に注意。 |
 | `motion_yaw_J` | float | (m/s²)²·samples | Fisher情報 Σ\|u_B\|²(8s 窓)。ゲート閾値は `control.json` の `motion_yaw.j_min`。 |
 
 ## TLM_CTRL スナップショットの注意(25Hz)

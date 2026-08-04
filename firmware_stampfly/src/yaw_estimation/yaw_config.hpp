@@ -181,11 +181,15 @@ static const float FF_EKF_ANCHOR_PSI0_FRESH_S = 1.0f;
 // 専用の「追加」定数のみ(V2契約: 既存定数の変更禁止・追加は可)。
 
 // [§2.1-1] ヨー擬似観測の観測ノイズ R_ψ: 通常 (2°)² / 基準ヨー低信頼
-// (CMD_POS_ERR flags bit4 = FLAG_YAW_REF_LOW_TRUST) 時 (6°)²
+// (CMD_POS_ERR flags bit4 = FLAG_YAW_REF_LOW_TRUST) 時 (10°)²
+// 【改訂 2026-08-03】low_trust を (6°)²→(10°)² へ。根拠: motion_yaw v2
+// (derotation+速度回帰項) の実ログ5本オフライン A/B 検証で valid 時
+// 実測 RMS 9.0°/p95 14.9°(J≥3 の全ビンで RMS 9〜13°)— (6°)² は過信。
+// 実飛行(円軌道励振)での再較正までの暫定値。
 static const float FF_EKF2_R_PSI_RAD2 =
     (2.0f * DEG_TO_RAD) * (2.0f * DEG_TO_RAD);
 static const float FF_EKF2_R_PSI_LOW_TRUST_RAD2 =
-    (6.0f * DEG_TO_RAD) * (6.0f * DEG_TO_RAD);
+    (10.0f * DEG_TO_RAD) * (10.0f * DEG_TO_RAD);
 // [§2.1-1] ヨー観測イノベーションゲート: |y| > 30° は棄却+連続棄却カウンタ
 static const float FF_EKF2_YAW_GATE_RAD = 30.0f * DEG_TO_RAD;
 // [§2.1-1] 連続棄却がこの回数 (N≥25) に達したら融合停止ラッチ

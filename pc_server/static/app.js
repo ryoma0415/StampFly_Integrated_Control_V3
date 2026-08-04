@@ -44,12 +44,15 @@ const UI = {
                                 //  XY 位置ループが制御座標系固定のため大ヨー保持は位置保持を劣化させる)
 };
 
-/* 円軌道パラメータの既定制限(/api/config 取得失敗時のフォールバック。
-   正は control.json trajectory 節 — サーバ側が必ず再検証する) */
+/* 軌道パラメータ(円・シャトル)の既定制限(/api/config 取得失敗時の
+   フォールバック。正は control.json trajectory 節 — サーバ側が必ず再検証する) */
 const TRAJ_FALLBACK = {
   radius_min_m: 0.05, radius_max_m: 1.5,
   period_min_s: 3.0, period_max_s: 120.0,
   center_abs_max_m: 2.0,
+  shuttle_amplitude_min_m: 0.05, shuttle_amplitude_max_m: 0.5,
+  speed_max_mps: 0.5,
+  excursion_abs_max_m: 0.5,
 };
 
 /* MAC未設定プロファイルのプルダウン表示サフィックス */
@@ -139,6 +142,18 @@ const els = {
   circlePeriod: $("circlePeriod"), circleDir: $("circleDir"), circleAlt: $("circleAlt"),
   circleFaceTangent: $("circleFaceTangent"),
   btnCircleStart: $("btnCircleStart"), btnCircleStop: $("btnCircleStop"),
+  shuttleParams: $("shuttleParams"),
+  shuttleAxisMode: $("shuttleAxisMode"), shuttleAxisDeg: $("shuttleAxisDeg"),
+  shuttleCx: $("shuttleCx"), shuttleCy: $("shuttleCy"), shuttleAmp: $("shuttleAmp"),
+  shuttlePeriod: $("shuttlePeriod"), shuttleCycles: $("shuttleCycles"),
+  shuttleAlt: $("shuttleAlt"),
+  btnShuttleStart: $("btnShuttleStart"), btnShuttleStop: $("btnShuttleStop"),
+  // v2: 評価シーケンス(スクリプト軌道)
+  sequenceParams: $("sequenceParams"),
+  seqPresetSelect: $("seqPresetSelect"), seqAlt: $("seqAlt"),
+  seqStartIndex: $("seqStartIndex"), seqSegList: $("seqSegList"),
+  seqTotal: $("seqTotal"), seqProgress: $("seqProgress"),
+  btnTrajSeqStart: $("btnTrajSeqStart"), btnTrajSeqStop: $("btnTrajSeqStop"),
   // v2: Experiment タブ
   expActiveBadge: $("expActiveBadge"), btnExpActivate: $("btnExpActivate"),
   fixtureCheck: $("fixtureCheck"), dutyButtons: $("dutyButtons"),
@@ -255,6 +270,7 @@ let calprofStatus = null;          // /api/calprofile の状態
 let accel6Status = null;           // /api/accel6 の状態
 let cal3dStatus = null;            // /api/cal3d の状態(fit/saved を含む)
 let trajLimits = { ...TRAJ_FALLBACK };  // /api/config の trajectory 節
+let trajSequences = {};            // /api/config の trajectory.sequences(評価シーケンス)
 
 const now = () => performance.now();
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -479,8 +495,8 @@ async function fetchAirframes() {
   }
 }
 
-/* /api/config から円軌道パラメータ制限を取り込み、入力欄の min/max に反映
-   (正はサーバ側 control.json — ここは操作性のための表示制約のみ) */
+/* /api/config から軌道(円・シャトル)パラメータ制限を取り込み、入力欄の
+   min/max に反映(正はサーバ側 control.json — ここは操作性のための表示制約のみ) */
 async function fetchConfigLimits() {
   const body = await apiGet("/api/config");
   const traj = body && body.control && body.control.trajectory;
@@ -494,6 +510,197 @@ async function fetchConfigLimits() {
   els.circleCx.max = String(trajLimits.center_abs_max_m);
   els.circleCy.min = String(-trajLimits.center_abs_max_m);
   els.circleCy.max = String(trajLimits.center_abs_max_m);
+  // シャトル: 振幅は専用キー、周期は circle と共通、中心は可動域(端点
+  // center±A·e が ±excursion 内)の表示制約として ±excursion を使う
+  els.shuttleAmp.min = String(trajLimits.shuttle_amplitude_min_m);
+  els.shuttleAmp.max = String(trajLimits.shuttle_amplitude_max_m);
+  els.shuttlePeriod.min = String(trajLimits.period_min_s);
+  els.shuttlePeriod.max = String(trajLimits.period_max_s);
+  els.shuttleCx.min = String(-trajLimits.excursion_abs_max_m);
+  els.shuttleCx.max = String(trajLimits.excursion_abs_max_m);
+  els.shuttleCy.min = String(-trajLimits.excursion_abs_max_m);
+  els.shuttleCy.max = String(trajLimits.excursion_abs_max_m);
+  // 評価シーケンスのプリセット(trajectory.sequences)→ 選択肢+一覧を構築
+  trajSequences = (traj.sequences && typeof traj.sequences === "object")
+    ? traj.sequences : {};
+  renderSeqPresets();
+}
+
+/* ===================== 評価シーケンス(スクリプト軌道) ===================== */
+/* プリセットは control.json trajectory.sequences(サーバが正)。ここでは
+   一覧表示・時間見積り・開始インデックス選択のみを担う。 */
+
+const SEQ_TYPE_JP = { hover: "ホバリング", circle: "円軌道", shuttle: "往復", yaw: "ヨー回頭" };
+
+/* サーバ側 PositionController._segment_estimate_s と同じ静的見積り
+   (shuttle は中心合流を仮定し端点停止まで +T/4、yaw は開始ヨー 0° を仮定) */
+function seqSegmentEstimateS(seg) {
+  if (seg.type === "hover") return seg.duration_s || 0;
+  if (seg.type === "circle") return (seg.laps || 0) * (seg.period_s || 0);
+  if (seg.type === "shuttle") return ((seg.cycles || 0) + 0.25) * (seg.period_s || 0);
+  if (seg.type === "yaw") {
+    let prev = 0;
+    let total = 0;
+    for (const tgt of (seg.targets_deg || [])) {
+      const delta = ((tgt - prev + 180) % 360 + 360) % 360 - 180;  // 最短経路
+      total += Math.abs(delta) / (seg.rate_dps || 1) + (seg.hold_s || 0);
+      prev = tgt;
+    }
+    return total;
+  }
+  return 0;
+}
+
+/* サーバ側 _sequence_transit_estimates と同じセグメント間トランジット
+   (合流点まで 0.25 m/s の等速直線)見積り。開始位置は開始時まで不明の
+   ため目標既定 (0,0) を仮定する(「約」表示の前提。実行中の残り秒は
+   サーバ側 snapshot が正)。 */
+const SEQ_TRANSIT_EPS_M = 0.05;
+const SEQ_TRANSIT_SPEED_MPS = 0.25;
+function seqTransitEstimatesS(segs, startIdx) {
+  let px = 0;
+  let py = 0;
+  const out = segs.map(() => 0);
+  for (let i = startIdx; i < segs.length; i++) {
+    const seg = segs[i];
+    if (seg.type === "circle") {
+      const cx = seg.center_x || 0;
+      const cy = seg.center_y || 0;
+      const r = seg.radius_m || 0;
+      const norm = Math.hypot(px - cx, py - cy);
+      const mx = norm > 0 ? cx + r * (px - cx) / norm : cx + r;  // 縮退: 位相0
+      const my = norm > 0 ? cy + r * (py - cy) / norm : cy;
+      const dist = Math.hypot(mx - px, my - py);
+      if (dist > SEQ_TRANSIT_EPS_M) out[i] = dist / SEQ_TRANSIT_SPEED_MPS;
+      px = mx; py = my;                  // laps·2π 後は合流点へ戻る
+    } else if (seg.type === "shuttle") {
+      const cx = seg.center_x || 0;
+      const cy = seg.center_y || 0;
+      const amp = seg.amplitude_m || 0;
+      const th = (seg.axis_deg || 0) * Math.PI / 180;
+      const ex = Math.cos(th);
+      const ey = Math.sin(th);
+      const s = Math.max(-amp, Math.min(amp, (px - cx) * ex + (py - cy) * ey));
+      const mx = cx + s * ex;
+      const my = cy + s * ey;
+      const dist = Math.hypot(mx - px, my - py);
+      if (dist > SEQ_TRANSIT_EPS_M) out[i] = dist / SEQ_TRANSIT_SPEED_MPS;
+      // 終端は停止極値の端点(サーバ _shuttle_stop_phase と同じ規則)
+      const base = Math.asin(amp > 0 ? s / amp : 0) + (seg.cycles || 0) * 2 * Math.PI;
+      const k = Math.ceil((base - Math.PI / 2) / Math.PI - 1e-9);
+      const sEnd = amp * Math.sin(Math.PI / 2 + k * Math.PI);
+      px = cx + sEnd * ex; py = cy + sEnd * ey;
+    }
+    // hover/yaw: 現在点を保持(トランジット不要)
+  }
+  return out;
+}
+
+function seqSegmentLabel(seg) {
+  if (seg.type === "hover") return `ホバリング ${seg.duration_s}s`;
+  if (seg.type === "circle") {
+    return `円軌道 R${seg.radius_m}m T${seg.period_s}s ${seg.laps}周` +
+      (seg.clockwise ? " CW" : " CCW");
+  }
+  if (seg.type === "shuttle") {
+    return `往復 軸${seg.axis_deg}° A${seg.amplitude_m}m ` +
+      `T${seg.period_s}s ${seg.cycles}往復`;
+  }
+  if (seg.type === "yaw") {
+    const targets = (seg.targets_deg || [])
+      .map((v) => (v > 0 ? "+" : "") + v).join("→");
+    return `ヨー回頭 ${targets}°(${seg.rate_dps}°/s・保持${seg.hold_s}s)`;
+  }
+  return String(seg.type || "?");
+}
+
+function seqSelectedSegments() {
+  return trajSequences[els.seqPresetSelect.value] || [];
+}
+
+function renderSeqPresets() {
+  const names = Object.keys(trajSequences);
+  const prev = els.seqPresetSelect.value;
+  els.seqPresetSelect.innerHTML = "";
+  for (const name of names) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    els.seqPresetSelect.appendChild(opt);
+  }
+  if (names.includes(prev)) els.seqPresetSelect.value = prev;
+  renderSeqList();
+}
+
+/* セグメント一覧(タイプ・パラメータ・見積り秒)+開始インデックス+合計。
+   バッテリ配慮のため「このセグメントから開始」より前は淡色(skipped)表示 */
+function renderSeqList() {
+  const segs = seqSelectedSegments();
+  const prevIdx = parseInt(els.seqStartIndex.value, 10) || 0;
+  els.seqStartIndex.innerHTML = "";
+  segs.forEach((seg, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = `${i + 1}: ${SEQ_TYPE_JP[seg.type] || seg.type}`;
+    els.seqStartIndex.appendChild(opt);
+  });
+  const startIdx = segs.length
+    ? Math.min(Math.max(prevIdx, 0), segs.length - 1) : 0;
+  if (segs.length) els.seqStartIndex.value = String(startIdx);
+  els.seqSegList.innerHTML = "";
+  let total = 0;
+  // 合計にはセグメント間トランジット(合流点への等速移動)分も含める
+  const transits = seqTransitEstimatesS(segs, startIdx);
+  segs.forEach((seg, i) => {
+    const est = seqSegmentEstimateS(seg);
+    if (i >= startIdx) total += est + transits[i];
+    const row = document.createElement("div");
+    row.className = "seq-seg-row" + (i < startIdx ? " skipped" : "");
+    const no = document.createElement("span");
+    no.className = "seq-seg-no mono";
+    no.textContent = String(i + 1);
+    const label = document.createElement("span");
+    label.className = "seq-seg-label";
+    label.textContent = seqSegmentLabel(seg);
+    const estEl = document.createElement("span");
+    estEl.className = "seq-seg-est mono";
+    estEl.textContent = `${est.toFixed(0)}s`;
+    row.append(no, label, estEl);
+    els.seqSegList.appendChild(row);
+  });
+  els.seqTotal.textContent = segs.length
+    ? `合計見積り: 約${Math.round(total)}s(セグメント${startIdx + 1}〜${segs.length})`
+    : "プリセットがありません(control.json trajectory.sequences)";
+}
+
+/* 実行中の進行表示(n/N・現セグメント種別・残り秒)+一覧ハイライト */
+function updateSeqProgress(traj) {
+  if (!traj) {
+    els.seqProgress.classList.add("hidden");
+    for (const row of els.seqSegList.children) row.classList.remove("running");
+    return;
+  }
+  const segType = SEQ_TYPE_JP[traj.seg_type] || traj.seg_type || "--";
+  // トランジット(合流点への等速移動)中は「移動中」を明示する
+  const phaseLabel = traj.transit ? `${segType}へ移動中` : segType;
+  els.seqProgress.textContent =
+    `実行中: ${traj.name} ${traj.seg_index + 1}/${traj.seg_count}(${phaseLabel})` +
+    ` 残り セグメント${Math.ceil(traj.seg_remaining_s)}s /` +
+    ` 全体${Math.ceil(traj.remaining_s)}s`;
+  els.seqProgress.classList.remove("hidden");
+  // 表示中プリセットが実行中のものと同じときのみ行ハイライトを追従
+  const highlight = els.seqPresetSelect.value === traj.name;
+  Array.from(els.seqSegList.children).forEach((row, i) => {
+    row.classList.toggle("running", highlight && i === traj.seg_index);
+  });
+  // yaw セグメントが自動操作するヨー目標をスライダ表示へ同期する
+  // (input イベントは発火させない = サーバへ送り返さない)。シーケンス
+  // 停止後はスライダが最終ヨー目標を指し、次回操作時のジャンプが消える
+  if (typeof traj.target_yaw_rad === "number") {
+    const deg = traj.target_yaw_rad * 180 / Math.PI;
+    els.yawSlider.value = deg.toFixed(1);
+    els.yawValue.textContent = fmtDeg(deg);
+  }
 }
 
 /* ===================== 機体プロファイル編集 ===================== */
@@ -802,25 +1009,48 @@ function renderSession() {
   els.btnYawCenter.disabled = !yawSliderEnable;
   els.ffQuickBlock.classList.toggle("hidden", !els.yawCtrlToggle.checked);
 
-  // 円軌道の状態表示+ボタン活性(サーバ側 trajectory が正)
+  // 軌道(円・シャトル・評価シーケンス)の状態表示+ボタン活性(サーバ側 trajectory が正)
   const traj = s.trajectory;
   const circleRunning = !!(traj && traj.mode === "circle");
-  if (circleRunning) {
+  const shuttleRunning = !!(traj && traj.mode === "shuttle");
+  const sequenceRunning = !!(traj && traj.mode === "sequence");
+  const trajRunning = circleRunning || shuttleRunning || sequenceRunning;
+  if (trajRunning) {
     const phaseDeg = typeof traj.phase_rad === "number"
       ? (traj.phase_rad * 180 / Math.PI).toFixed(0) : "--";
-    els.trajStatus.textContent = `円軌道 実行中 φ=${phaseDeg}°`;
+    if (circleRunning) {
+      els.trajStatus.textContent = `円軌道 実行中 φ=${phaseDeg}°`;
+    } else if (shuttleRunning) {
+      const remaining = typeof traj.cycles_remaining === "number"
+        ? ` 残り${traj.cycles_remaining.toFixed(1)}周` : "(連続)";
+      els.trajStatus.textContent = `往復軌道 実行中 φ=${phaseDeg}°${remaining}`;
+    } else {
+      els.trajStatus.textContent =
+        `シーケンス ${traj.seg_index + 1}/${traj.seg_count} ` +
+        `残り${Math.ceil(traj.remaining_s)}s`;
+    }
     els.trajStatus.classList.remove("hidden");
-    // サーバ側で円軌道中なら軌道セレクタを追従させる(直後の操作は抑制)
+    // サーバ側で軌道実行中なら軌道セレクタを追従させる(直後の操作は抑制)
+    const wantMode = circleRunning ? "circle"
+      : shuttleRunning ? "shuttle" : "sequence";
     if (now() - trajTouchedAt > UI.ECHO_SUPPRESS_MS &&
-        els.trajSelect.value !== "circle") {
-      els.trajSelect.value = "circle";
-      els.circleParams.classList.remove("hidden");
+        els.trajSelect.value !== wantMode) {
+      els.trajSelect.value = wantMode;
+      els.circleParams.classList.toggle("hidden", !circleRunning);
+      els.shuttleParams.classList.toggle("hidden", !shuttleRunning);
+      els.sequenceParams.classList.toggle("hidden", !sequenceRunning);
     }
   } else {
     els.trajStatus.classList.add("hidden");
   }
-  els.btnCircleStart.disabled = !(wsOpen && uiMode === "position" && !circleRunning);
+  // 開始ボタンは他方の軌道実行中も無効(軌道は同時に1つ)
+  els.btnCircleStart.disabled = !(wsOpen && uiMode === "position" && !trajRunning);
   els.btnCircleStop.disabled = !circleRunning;
+  els.btnShuttleStart.disabled = !(wsOpen && uiMode === "position" && !trajRunning);
+  els.btnShuttleStop.disabled = !shuttleRunning;
+  els.btnTrajSeqStart.disabled = !(wsOpen && uiMode === "position" && !trajRunning);
+  els.btnTrajSeqStop.disabled = !sequenceRunning;
+  updateSeqProgress(sequenceRunning ? traj : null);
 
   // ヨー基準ソース(磁気オートチューンパネル)。サーバが正、操作直後は抑制
   const yr = s.yaw_ref;
@@ -1177,6 +1407,33 @@ function drawPlot() {
       const px = traj.center_x + traj.radius_m * Math.cos(traj.phase_rad);
       const py = traj.center_y + traj.radius_m * Math.sin(traj.phase_rad);
       const [ppx, ppy] = plotToPx(px, py);
+      plotCtx.fillStyle = cCircle;
+      plotCtx.beginPath(); plotCtx.arc(ppx, ppy, 3.5, 0, Math.PI * 2); plotCtx.fill();
+    }
+  }
+  // v2: 目標シャトル軌道(直線往復)の重畳描画(円軌道と同パターン)
+  if (traj && traj.mode === "shuttle" &&
+      typeof traj.center_x === "number" && typeof traj.amplitude_m === "number" &&
+      typeof traj.axis_deg === "number") {
+    const th = traj.axis_deg * Math.PI / 180;
+    const exA = Math.cos(th) * traj.amplitude_m;
+    const eyA = Math.sin(th) * traj.amplitude_m;
+    const [e1x, e1y] = plotToPx(traj.center_x + exA, traj.center_y + eyA);
+    const [e2x, e2y] = plotToPx(traj.center_x - exA, traj.center_y - eyA);
+    plotCtx.strokeStyle = cCircle;
+    plotCtx.lineWidth = 1.5;
+    plotCtx.setLineDash([5, 4]);
+    plotCtx.beginPath(); plotCtx.moveTo(e1x, e1y); plotCtx.lineTo(e2x, e2y); plotCtx.stroke();
+    plotCtx.setLineDash([]);
+    // 中心マーカー
+    const [scx, scy] = plotToPx(traj.center_x, traj.center_y);
+    plotCtx.beginPath(); plotCtx.moveTo(scx - 4, scy); plotCtx.lineTo(scx + 4, scy); plotCtx.stroke();
+    plotCtx.beginPath(); plotCtx.moveTo(scx, scy - 4); plotCtx.lineTo(scx, scy + 4); plotCtx.stroke();
+    // 現在位相の点(target = center + A·sin(phase)·e)
+    if (typeof traj.phase_rad === "number") {
+      const sPh = Math.sin(traj.phase_rad);
+      const [ppx, ppy] = plotToPx(traj.center_x + exA * sPh,
+                                  traj.center_y + eyA * sPh);
       plotCtx.fillStyle = cCircle;
       plotCtx.beginPath(); plotCtx.arc(ppx, ppy, 3.5, 0, Math.PI * 2); plotCtx.fill();
     }
@@ -3273,10 +3530,12 @@ function wireEvents() {
     onTargetChanged();
   });
 
-  // v2: 軌道セレクタ+円軌道開始/停止
+  // v2: 軌道セレクタ+円/シャトル/評価シーケンス開始/停止
   els.trajSelect.addEventListener("change", () => {
     trajTouchedAt = now();
     els.circleParams.classList.toggle("hidden", els.trajSelect.value !== "circle");
+    els.shuttleParams.classList.toggle("hidden", els.trajSelect.value !== "shuttle");
+    els.sequenceParams.classList.toggle("hidden", els.trajSelect.value !== "sequence");
   });
   els.btnCircleStart.addEventListener("click", () => {
     const radius = clamp(parseFloat(els.circleR.value) || 0,
@@ -3301,6 +3560,63 @@ function wireEvents() {
   els.btnCircleStop.addEventListener("click", () => {
     sendCommand("circle_stop");
     appendConsole("ui", "円軌道停止要求(現在目標でホバ復帰)");
+  });
+  // シャトル: 方向は X軸/Y軸/角度指定(角度入力は角度指定時のみ有効)
+  els.shuttleAxisMode.addEventListener("change", () => {
+    const mode = els.shuttleAxisMode.value;
+    els.shuttleAxisDeg.disabled = mode !== "custom";
+    if (mode === "x") els.shuttleAxisDeg.value = "0";
+    else if (mode === "y") els.shuttleAxisDeg.value = "90";
+  });
+  els.btnShuttleStart.addEventListener("click", () => {
+    const axisDeg = els.shuttleAxisMode.value === "x" ? 0
+      : els.shuttleAxisMode.value === "y" ? 90
+      : (parseFloat(els.shuttleAxisDeg.value) || 0);
+    const amp = clamp(parseFloat(els.shuttleAmp.value) || 0,
+                      trajLimits.shuttle_amplitude_min_m,
+                      trajLimits.shuttle_amplitude_max_m);
+    const period = clamp(parseFloat(els.shuttlePeriod.value) || 0,
+                         trajLimits.period_min_s, trajLimits.period_max_s);
+    const cx = clamp(parseFloat(els.shuttleCx.value) || 0,
+                     -trajLimits.excursion_abs_max_m,
+                     trajLimits.excursion_abs_max_m);
+    const cy = clamp(parseFloat(els.shuttleCy.value) || 0,
+                     -trajLimits.excursion_abs_max_m,
+                     trajLimits.excursion_abs_max_m);
+    const cycles = Math.max(0, Math.round(parseFloat(els.shuttleCycles.value) || 0));
+    const alt = clamp(parseFloat(els.shuttleAlt.value) || UI.ALT_MIN_M,
+                      UI.ALT_MIN_M, UI.ALT_MAX_M);
+    sendCommand("shuttle_start", {
+      center_x: cx, center_y: cy, axis_deg: axisDeg, amplitude_m: amp,
+      period_s: period, cycles: cycles, alt_m: alt,
+    });
+    appendConsole("ui",
+      `往復軌道開始要求: 中心(${cx.toFixed(2)}, ${cy.toFixed(2)}) 軸${axisDeg.toFixed(0)}° ` +
+      `A=${amp.toFixed(2)}m 周期${period.toFixed(0)}s ` +
+      `${cycles === 0 ? "連続" : cycles + "サイクル"} 高度${alt.toFixed(2)}m`);
+  });
+  els.btnShuttleStop.addEventListener("click", () => {
+    sendCommand("shuttle_stop");
+    appendConsole("ui", "往復軌道停止要求(現在目標でホバ復帰)");
+  });
+  // 評価シーケンス: プリセット選択+開始インデックス+開始/停止
+  els.seqPresetSelect.addEventListener("change", renderSeqList);
+  els.seqStartIndex.addEventListener("change", renderSeqList);
+  els.btnTrajSeqStart.addEventListener("click", () => {
+    const name = els.seqPresetSelect.value;
+    if (!name) return;
+    const alt = clamp(parseFloat(els.seqAlt.value) || UI.ALT_MIN_M,
+                      UI.ALT_MIN_M, UI.ALT_MAX_M);
+    const startIndex = Math.max(0, parseInt(els.seqStartIndex.value, 10) || 0);
+    sendCommand("traj_sequence_start",
+                { name: name, alt_m: alt, start_index: startIndex });
+    appendConsole("ui",
+      `評価シーケンス開始要求: ${name} セグメント${startIndex + 1}から ` +
+      `高度${alt.toFixed(2)}m`);
+  });
+  els.btnTrajSeqStop.addEventListener("click", () => {
+    sendCommand("traj_sequence_stop");
+    appendConsole("ui", "評価シーケンス停止要求(現在目標でホバ復帰)");
   });
 
   // ログ保存トグル
@@ -3750,6 +4066,7 @@ function init() {
   wireEvents();
   fetchPorts();
   fetchAirframes();
+  renderSeqPresets();   // /api/config 取得前・失敗時も空状態メッセージを表示
   fetchConfigLimits();
   fetchFfStatus();
   // FF 適用状態(適用中バナー)は低頻度ポーリングで同期する

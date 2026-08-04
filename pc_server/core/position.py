@@ -6,11 +6,14 @@
 - 50Hz 送信スレッドは誤差と整形済み alt/yaw を meta に載せて emit する
   (session 層が CMD_POS_ERR に組み立てて送信・ログする)。roll/pitch の
   角度指令は機体側 XY PID が計算するため、この層では生成・整形しない。
-- v2 軌道モード: hover(固定目標)/ circle(円軌道)。円軌道は 50Hz 送信
+- v2 軌道モード: hover(固定目標)/ circle(円軌道)/ shuttle(直線往復)/
+  sequence(評価シーケンス: hover/circle/shuttle/yaw セグメントの定型メニューを
+  1操作で流すスクリプト軌道。各セグメントは既存の生成ロジックへ委譲する)。
+  軌道中は 50Hz 送信
   ループ内で目標 (x, y) を時間更新する(旧 OptiTrack版 NatNet_PID_Controller の
   circling_controller.py の軌道生成を参考。当該フォルダは削除済み)。
   開始時は現在位置から円周
-  最近傍点に位相を合わせ、滑らかに合流する。
+  最近傍点(shuttle は軸への射影点)に位相を合わせ、滑らかに合流する。
 - v2 ヨー指令: UI のヨー角スライダ(±180°)+「進行方向を向く」オプション
   (円軌道中かつヨー角制御 ON のとき yaw_ref を接線方向に追従)。
 - MoCap の yaw_rad はログ列 mocap_yaw_deg として meta に載せる。CMD_POS_ERR の
@@ -35,7 +38,7 @@ from __future__ import annotations
 
 import threading
 import time
-from math import atan2, cos, pi, sin
+from math import asin, atan2, ceil, cos, hypot, pi, sin
 from typing import Callable, Optional
 
 from .filter import PositionFilter
@@ -49,6 +52,16 @@ MS_PER_S = 1000.0
 # 軌道モード(ログ列 traj_mode の値。LOG_STRUCTURE v2 契約)
 TRAJ_MODE_HOVER = 0
 TRAJ_MODE_CIRCLE = 1
+TRAJ_MODE_SHUTTLE = 2
+
+# 評価シーケンスのセグメント遷移トランジット: 次セグメントの合流点が現在
+# 目標からこの距離を超えて離れている場合、等速直線で目標を運ぶ小フェーズを
+# 自動挿入する(レビュー指摘: 幾何によっては遷移で 0.25〜0.35m 級の目標
+# 段差が出て、EKF2 評価飛行に計画外のステップ応答が混入した)。
+# トランジット中の meta traj_mode は 0(hover)、凍結機構はシーケンス
+# 時計と共通。
+_SEQ_TRANSIT_EPS_M = 0.05
+_SEQ_TRANSIT_SPEED_MPS = 0.25
 
 
 class PositionController:
@@ -70,6 +83,9 @@ class PositionController:
         # 接線ヨー追従の実現可能性判定に使う(start_circle のガード)
         self._yaw_slew_rad_per_s: float = (
             server_config["clamps"]["yaw_slew_rate_deg_per_s"] * DEG_TO_RAD)
+        # yaw セグメントの目標角ガード(SetpointShaper.shape_yaw と同じ制限)
+        self._max_yaw_rad: float = (
+            server_config["clamps"]["max_yaw_deg"] * DEG_TO_RAD)
         self._shaper = SetpointShaper(server_config["clamps"])
         self._emit = emit
         self._clock = clock
@@ -86,6 +102,11 @@ class PositionController:
         self._traj_period_min: float = traj_cfg["period_min_s"]
         self._traj_period_max: float = traj_cfg["period_max_s"]
         self._traj_center_abs_max: float = traj_cfg["center_abs_max_m"]
+        # シャトル(直線往復)のガード
+        self._shuttle_amp_min: float = traj_cfg["shuttle_amplitude_min_m"]
+        self._shuttle_amp_max: float = traj_cfg["shuttle_amplitude_max_m"]
+        self._traj_speed_max: float = traj_cfg["speed_max_mps"]
+        self._traj_excursion_abs_max: float = traj_cfg["excursion_abs_max_m"]
         self._lock = threading.Lock()
         # position_filter は NatNet スレッド・50Hz 送信スレッド・
         # UI(executor)/supervisor スレッドから触られる共有状態のため、
@@ -129,10 +150,19 @@ class PositionController:
         self._yaw_ctrl_on = False
         self._last_yaw_output = 0.0
 
-        # v2: 円軌道状態(None = hover)。dict キー:
-        # center(x,y) / radius / period_s / clockwise / alt / face_tangent /
-        # phase0(合流点の位相 rad) / t0(開始時刻) /
-        # frozen_at(MoCap 途絶による位相凍結の開始時刻。None = 凍結なし)
+        # v2: 軌道状態(None = hover)。共通キー:
+        # kind("circle"/"shuttle"/"sequence") / alt / t0(開始時刻) /
+        # frozen_at(MoCap 途絶による位相凍結の開始時刻。None = 凍結なし)。
+        # circle/shuttle 共通: center(x,y) / period_s /
+        # phase0(合流点の位相 rad)。
+        # circle 固有: radius / clockwise / face_tangent。
+        # shuttle 固有: axis_deg / axis_e(軸単位ベクトル) / amplitude /
+        # cycles / phase_stop(自動停止位相。None = 連続) /
+        # phase_abs(直近の非ラップ位相。残りサイクル計算用)。
+        # sequence 固有: name / segments(正規化済み定義) / est_s(見積り秒)
+        # / start_index / seg_index / seg_state(現セグメントのランタイム状態。
+        # None = 未入場) / seg_elapsed_base(現セグメント開始時点の
+        # シーケンス経過秒)。シーケンス時計は t0/frozen_at で途絶凍結される
         self._traj: Optional[dict] = None
         self._traj_phase: Optional[float] = None
 
@@ -177,8 +207,96 @@ class PositionController:
             return (self._last_yaw_output, self._yaw_ctrl_on)
 
     # ------------------------------------------------------------------
-    # v2: 円軌道モード
+    # v2: 軌道モード(circle / shuttle)
     # ------------------------------------------------------------------
+
+    def _merge_position(self, now: float,
+                        traj_name: str) -> tuple[Optional[tuple[float, float]],
+                                                 Optional[str]]:
+        """軌道開始時の合流基準位置(フィルタ済み優先)を返す。
+
+        鮮度・有効性・取得可否のガードを共通適用する(circle/shuttle 同一
+        基準)。戻り値は ((px, py), None) または (None, 日本語エラー)。
+        """
+        with self._lock:
+            filter_result = self._last_filter_result
+            pose = self._last_pose
+            pose_t = self._last_pose_t
+            data_valid = self._last_data_valid
+        # 鮮度ガード(session.start と同じ基準値): 途絶中の古い位置から
+        # 合流位相を決めると「現在位置から滑らかに合流」(契約 §3.3)が
+        # 成立せず、復帰時に目標が実位置から離れた点へジャンプするため拒否。
+        age = None if pose_t is None else (now - pose_t)
+        if age is None or age > self._dropout_level_s:
+            return None, f"MoCap データが新鮮でないため{traj_name}を開始できません"
+        # 有効性ガード(session.start と同じ): 無効中のフィルタ位置は
+        # 凍結/外挿されたゴーストのため、そこから合流位相を決めない
+        if not data_valid:
+            return None, (f"MoCap 位置データが無効のため{traj_name}を開始"
+                          "できません(トラッキング状態を確認してください)")
+        if filter_result is not None:
+            px, py, _ = filter_result["filtered_position"]
+        elif pose is not None:
+            px, py = pose["x"], pose["y"]
+        else:
+            return None, f"MoCap 位置が取得できないため{traj_name}を開始できません"
+        return (px, py), None
+
+    # --- パラメータ検証(start_circle/start_shuttle と評価シーケンスが共用) ---
+
+    def _circle_params_error(self, center_x: float, center_y: float,
+                             radius_m: float, period_s: float) -> Optional[str]:
+        """円軌道パラメータの範囲検証。不合格なら日本語メッセージを返す。"""
+        if not (self._traj_radius_min <= radius_m <= self._traj_radius_max):
+            return (f"半径は {self._traj_radius_min}–"
+                    f"{self._traj_radius_max} m で指定してください")
+        if not (self._traj_period_min <= period_s <= self._traj_period_max):
+            return (f"周期は {self._traj_period_min}–"
+                    f"{self._traj_period_max} s で指定してください")
+        # 閉区間形式(not (lo <= v <= hi))は NaN も拒否する(abs 比較は
+        # NaN を素通しし、NaN 目標 → クランプ飽和誤差の送信に至るため)
+        max_c = self._traj_center_abs_max
+        if not (-max_c <= center_x <= max_c and -max_c <= center_y <= max_c):
+            return (f"中心座標は ±{max_c} m 以内で"
+                    "指定してください")
+        return None
+
+    def _shuttle_params_error(self, center_x: float, center_y: float,
+                              axis_deg: float, amplitude_m: float,
+                              period_s: float) -> Optional[str]:
+        """シャトル軌道パラメータの範囲検証(cycles は呼び出し元が検証)。"""
+        if not (self._shuttle_amp_min <= amplitude_m <= self._shuttle_amp_max):
+            return (f"振幅は {self._shuttle_amp_min}–"
+                    f"{self._shuttle_amp_max} m で指定してください")
+        if not (self._traj_period_min <= period_s <= self._traj_period_max):
+            return (f"周期は {self._traj_period_min}–"
+                    f"{self._traj_period_max} s で指定してください")
+        # 最大速度ガード: v_max = A·ω = 2πA/T(正弦往復の中点速度)
+        v_max = TWO_PI * amplitude_m / period_s
+        if v_max > self._traj_speed_max:
+            return (f"最大速度 2πA/T = {v_max:.2f} m/s が上限 "
+                    f"{self._traj_speed_max} m/s を超えます。"
+                    "振幅を小さくするか周期を長くしてください")
+        # 可動域ガード: 両端点 center ± A·e が正方形範囲に収まること
+        # (中心は端点の中点なので、このガードが中心範囲も内包する)
+        # 閉区間形式は NaN(center/axis_deg 経由の伝播含む)も拒否する
+        max_e = self._traj_excursion_abs_max
+        theta = axis_deg * DEG_TO_RAD
+        ex, ey = cos(theta), sin(theta)
+        for sgn in (1.0, -1.0):
+            end_x = center_x + sgn * amplitude_m * ex
+            end_y = center_y + sgn * amplitude_m * ey
+            if not (-max_e <= end_x <= max_e and -max_e <= end_y <= max_e):
+                return (f"往復の端点が ±{max_e} m"
+                        " の範囲を超えます。中心・振幅・軸方位を"
+                        "見直してください")
+        return None
+
+    def _alt_error(self, alt_m: float) -> Optional[str]:
+        alt_lo, alt_hi = self._shaper.alt_limits
+        if not (alt_lo <= alt_m <= alt_hi):
+            return f"高度は {alt_lo}–{alt_hi} m で指定してください"
+        return None
 
     def start_circle(self, center_x: float, center_y: float, radius_m: float,
                      period_s: float, clockwise: bool, alt_m: float,
@@ -191,16 +309,10 @@ class PositionController:
         """
         if now is None:
             now = self._clock()
-        if not (self._traj_radius_min <= radius_m <= self._traj_radius_max):
-            return False, (f"半径は {self._traj_radius_min}–"
-                           f"{self._traj_radius_max} m で指定してください")
-        if not (self._traj_period_min <= period_s <= self._traj_period_max):
-            return False, (f"周期は {self._traj_period_min}–"
-                           f"{self._traj_period_max} s で指定してください")
-        if (abs(center_x) > self._traj_center_abs_max
-                or abs(center_y) > self._traj_center_abs_max):
-            return False, (f"中心座標は ±{self._traj_center_abs_max} m 以内で"
-                           "指定してください")
+        error = self._circle_params_error(center_x, center_y, radius_m,
+                                          period_s)
+        if error is not None:
+            return False, error
         if face_tangent:
             # 接線ヨー目標は 360°/period_s で回転する。整形スルーレート
             # (yaw_slew_rate_deg_per_s)を超える周期を許すと、整形済み
@@ -213,39 +325,22 @@ class PositionController:
                     "ヨースルーレート上限を超えないよう周期を "
                     f"{min_period_s:.1f} s 以上にしてください")
 
-        # 現在位置(フィルタ済み優先)→ 円周最近傍点の位相。位置が未取得の
-        # 場合は開始を拒否する(合流点を決められないため)。
-        with self._lock:
-            filter_result = self._last_filter_result
-            pose = self._last_pose
-            pose_t = self._last_pose_t
-            data_valid = self._last_data_valid
-            alt_lo, alt_hi = self._shaper.alt_limits
-        if not (alt_lo <= alt_m <= alt_hi):
-            return False, f"高度は {alt_lo}–{alt_hi} m で指定してください"
-        # 鮮度ガード(session.start と同じ基準値): 途絶中の古い位置から
-        # 合流位相を決めると「現在位置から滑らかに合流」(契約 §3.3)が
-        # 成立せず、復帰時に目標が実位置から離れた点へジャンプするため拒否。
-        age = None if pose_t is None else (now - pose_t)
-        if age is None or age > self._dropout_level_s:
-            return False, "MoCap データが新鮮でないため円軌道を開始できません"
-        # 有効性ガード(session.start と同じ): 無効中のフィルタ位置は
-        # 凍結/外挿されたゴーストのため、そこから合流位相を決めない
-        if not data_valid:
-            return False, ("MoCap 位置データが無効のため円軌道を開始できません"
-                           "(トラッキング状態を確認してください)")
-        if filter_result is not None:
-            px, py, _ = filter_result["filtered_position"]
-        elif pose is not None:
-            px, py = pose["x"], pose["y"]
-        else:
-            return False, "MoCap 位置が取得できないため円軌道を開始できません"
+        error = self._alt_error(alt_m)
+        if error is not None:
+            return False, error
+        # 現在位置(フィルタ済み優先)→ 円周最近傍点の位相。位置が未取得・
+        # 途絶・無効の場合は開始を拒否する(合流点を決められないため)。
+        merge, error = self._merge_position(now, "円軌道")
+        if merge is None:
+            return False, error
+        px, py = merge
 
         dx, dy = px - center_x, py - center_y
         # 機体が中心に一致している縮退ケースは位相 0 から開始する
         phase0 = atan2(dy, dx) if (dx != 0.0 or dy != 0.0) else 0.0
         with self._lock:
             self._traj = {
+                "kind": "circle",
                 "center": (center_x, center_y),
                 "radius": radius_m,
                 "period_s": period_s,
@@ -260,8 +355,522 @@ class PositionController:
             self._traj_phase = wrap_pi(phase0)
         return True, None
 
-    def stop_circle(self) -> None:
-        """円軌道を停止し、現在の軌道目標でホバリングに復帰する。
+    def start_shuttle(self, center_x: float, center_y: float, axis_deg: float,
+                      amplitude_m: float, period_s: float, cycles: int,
+                      alt_m: float,
+                      now: Optional[float] = None) -> tuple[bool, Optional[str]]:
+        """直線往復(シャトル)軌道を開始する。
+
+        目標は target = center + A·sin(phase)·e(θ)、e=(cosθ, sinθ)。
+        現在位置を軸へ射影した点に位相を合わせて滑らかに合流する
+        (円の最近傍位相合流と同思想)。cycles=0 は連続(手動 stop)、
+        >0 は経過位相が cycles·2π に達した後、次の極値(速度ゼロ点)で
+        自動停止し、その端点をホールドして hover に復帰する。
+        戻り値は (ok, error)。error は UI 表示用の日本語メッセージ。
+        """
+        if now is None:
+            now = self._clock()
+        error = self._shuttle_params_error(center_x, center_y, axis_deg,
+                                           amplitude_m, period_s)
+        if error is not None:
+            return False, error
+        if cycles < 0:
+            return False, "サイクル数は 0 以上で指定してください(0 = 連続)"
+        error = self._alt_error(alt_m)
+        if error is not None:
+            return False, error
+        merge, error = self._merge_position(now, "往復軌道")
+        if merge is None:
+            return False, error
+        px, py = merge
+        theta = axis_deg * DEG_TO_RAD
+        ex, ey = cos(theta), sin(theta)
+
+        # 合流: 現在位置を軸へ射影 s=clamp((p−center)·e, −A, A) →
+        # phase0 = asin(s/A) ∈ [−π/2, π/2]。開始時の目標が射影点と一致し、
+        # 現在位置から滑らかに合流する
+        s = (px - center_x) * ex + (py - center_y) * ey
+        s = max(-amplitude_m, min(amplitude_m, s))
+        phase0 = asin(s / amplitude_m)
+        phase_stop: Optional[float] = None
+        if cycles > 0:
+            phase_stop = self._shuttle_stop_phase(phase0, cycles)
+        with self._lock:
+            self._traj = {
+                "kind": "shuttle",
+                "center": (center_x, center_y),
+                "axis_deg": axis_deg,
+                "axis_e": (ex, ey),
+                "amplitude": amplitude_m,
+                "period_s": period_s,
+                "cycles": int(cycles),
+                "alt": alt_m,
+                "phase0": phase0,
+                "phase_stop": phase_stop,
+                "phase_abs": phase0,
+                "t0": now,
+                # MoCap 途絶による位相凍結の開始時刻(None = 凍結なし)
+                "frozen_at": None,
+            }
+            self._traj_phase = wrap_pi(phase0)
+        return True, None
+
+    @staticmethod
+    def _shuttle_stop_phase(phase0: float, cycles: int) -> float:
+        """経過位相 cycles·2π 以降で最初の極値(phase ≡ π/2 mod π、速度ゼロ点)。
+
+        基点が極値ちょうどなら同点で止まる(start_shuttle と評価シーケンスの
+        shuttle セグメントが共用)。
+        """
+        base = phase0 + cycles * TWO_PI
+        k = ceil((base - pi / 2.0) / pi - 1e-9)
+        return pi / 2.0 + k * pi
+
+    # ------------------------------------------------------------------
+    # v2: 評価シーケンス(スクリプト軌道。hover/circle/shuttle/yaw セグメント)
+    # ------------------------------------------------------------------
+
+    def _yaw_segment_error(self, seg: dict) -> Optional[str]:
+        """yaw セグメント(その場回頭)の検証。不合格なら日本語メッセージ。"""
+        targets = seg.get("targets_deg")
+        if not isinstance(targets, (list, tuple)) or not targets:
+            return "targets_deg にヨー目標角のリストを指定してください"
+        # 数値検査は閉区間形式(not (lo <= v <= hi))で NaN も拒否する
+        max_yaw_deg = self._max_yaw_rad * RAD_TO_DEG
+        for value in targets:
+            if (not isinstance(value, (int, float))
+                    or not (-max_yaw_deg - 1e-9
+                            <= float(value) <= max_yaw_deg + 1e-9)):
+                return (f"ヨー目標角は ±{max_yaw_deg:.0f}° 以内の数値で"
+                        "指定してください")
+        # ランプレートは SetpointShaper のヨースルーレート以下でなければ
+        # 整形が追従できず、指令ランプが実効レートと乖離する
+        rate = seg.get("rate_dps")
+        slew_dps = self._yaw_slew_rad_per_s * RAD_TO_DEG
+        if (not isinstance(rate, (int, float))
+                or not (0.0 < float(rate) <= slew_dps + 1e-9)):
+            return (f"ヨーレートは 0 より大きく {slew_dps:.0f}°/s"
+                    "(ヨースルーレート上限)以下で指定してください")
+        hold_s = seg.get("hold_s", 0.0)
+        if not isinstance(hold_s, (int, float)) or not (float(hold_s) >= 0.0):
+            return "ホールド時間は 0 以上の秒数で指定してください"
+        return None
+
+    def _segment_error(self, seg: dict) -> Optional[str]:
+        """1 セグメント定義の検証(既存 circle/shuttle ガードへ委譲)。"""
+        seg_type = seg.get("type")
+        if seg_type == "hover":
+            duration = seg.get("duration_s")
+            if (not isinstance(duration, (int, float))
+                    or not (float(duration) > 0.0)):
+                return "duration_s は正の秒数で指定してください"
+            return None
+        if seg_type == "circle":
+            laps = seg.get("laps")
+            if not isinstance(laps, int) or laps < 1:
+                return "周回数(laps)は 1 以上の整数で指定してください"
+            cx = float(seg.get("center_x", 0.0))
+            cy = float(seg.get("center_y", 0.0))
+            radius = float(seg.get("radius_m", 0.0))
+            period = float(seg.get("period_s", 0.0))
+            error = self._circle_params_error(cx, cy, radius, period)
+            if error is not None:
+                return error
+            # シーケンスの想定エンベロープは shuttle と同じ速度・可動域
+            # 制限を circle にも課す(単発 start_circle の制限値は既存
+            # 挙動のまま。レビュー指摘: circle 経由で ±0.5m/0.5m/s を
+            # 迂回できた)。閉区間形式は NaN も拒否する
+            v_max = TWO_PI * radius / period if period > 0.0 else float("inf")
+            if not (v_max <= self._traj_speed_max):
+                return (f"周速 2πR/T = {v_max:.2f} m/s が上限 "
+                        f"{self._traj_speed_max} m/s を超えます。"
+                        "半径を小さくするか周期を長くしてください")
+            max_e = self._traj_excursion_abs_max
+            if not (abs(cx) + radius <= max_e and abs(cy) + radius <= max_e):
+                return (f"円の到達範囲(|中心|+半径)が ±{max_e} m を"
+                        "超えます。中心・半径を見直してください")
+            return None
+        if seg_type == "shuttle":
+            cycles = seg.get("cycles")
+            if not isinstance(cycles, int) or cycles < 1:
+                return ("サイクル数は 1 以上の整数で指定してください"
+                        "(シーケンスでは連続往復は使えません)")
+            return self._shuttle_params_error(
+                float(seg.get("center_x", 0.0)), float(seg.get("center_y", 0.0)),
+                float(seg.get("axis_deg", 0.0)),
+                float(seg.get("amplitude_m", 0.0)),
+                float(seg.get("period_s", 0.0)))
+        if seg_type == "yaw":
+            return self._yaw_segment_error(seg)
+        return f"不明なセグメント型です: {seg_type!r}"
+
+    @staticmethod
+    def _segment_estimate_s(seg: dict) -> float:
+        """セグメント所要時間の静的見積り(UI 表示・残り時間表示用)。
+
+        実所要は合流位相・開始ヨーに依存して前後する: shuttle は合流位相 0
+        (中心合流)を仮定して端点停止までの +T/4 を上乗せし、yaw は開始
+        ヨー 0 を仮定する。
+        """
+        seg_type = seg.get("type")
+        if seg_type == "hover":
+            return float(seg["duration_s"])
+        if seg_type == "circle":
+            return float(seg["laps"]) * float(seg["period_s"])
+        if seg_type == "shuttle":
+            return (float(seg["cycles"]) + 0.25) * float(seg["period_s"])
+        # yaw: ランプ(最短経路)+ホールドの合計
+        prev = 0.0
+        total = 0.0
+        rate = float(seg["rate_dps"]) * DEG_TO_RAD
+        hold_s = float(seg.get("hold_s", 0.0))
+        for tgt_deg in seg["targets_deg"]:
+            tgt = wrap_pi(float(tgt_deg) * DEG_TO_RAD)
+            total += abs(wrap_pi(tgt - prev)) / rate + hold_s
+            prev = tgt
+        return total
+
+    def _sequence_transit_estimates(self, segments: list, start_index: int,
+                                    start_xy: tuple[float, float]) -> list:
+        """各セグメント入場前トランジットの静的見積り秒(残り時間表示用)。
+
+        開始位置からの位置連鎖で決定的に求まる: hover/yaw は現在点を保持、
+        circle は合流点(最近傍円周点)で入場し laps·2π 後に同点へ戻る、
+        shuttle は軸射影点で入場し停止極値の端点で終わる
+        (_shuttle_stop_phase と同じ規則)。start_index より前は 0。
+        """
+        px, py = start_xy
+        result = [0.0] * len(segments)
+        for i in range(start_index, len(segments)):
+            seg = segments[i]
+            seg_type = seg.get("type")
+            if seg_type == "circle":
+                cx = float(seg.get("center_x", 0.0))
+                cy = float(seg.get("center_y", 0.0))
+                radius = float(seg["radius_m"])
+                dx, dy = px - cx, py - cy
+                norm = hypot(dx, dy)
+                if norm > 0.0:
+                    mx, my = cx + radius * dx / norm, cy + radius * dy / norm
+                else:
+                    mx, my = cx + radius, cy   # 縮退: 位相 0 の円周点
+                dist = hypot(mx - px, my - py)
+                if dist > _SEQ_TRANSIT_EPS_M:
+                    result[i] = dist / _SEQ_TRANSIT_SPEED_MPS
+                px, py = mx, my               # laps·2π 後は合流点へ戻る
+            elif seg_type == "shuttle":
+                cx = float(seg.get("center_x", 0.0))
+                cy = float(seg.get("center_y", 0.0))
+                amplitude = float(seg["amplitude_m"])
+                theta = float(seg["axis_deg"]) * DEG_TO_RAD
+                ex, ey = cos(theta), sin(theta)
+                s = max(-amplitude, min(amplitude,
+                                        (px - cx) * ex + (py - cy) * ey))
+                mx, my = cx + s * ex, cy + s * ey
+                dist = hypot(mx - px, my - py)
+                if dist > _SEQ_TRANSIT_EPS_M:
+                    result[i] = dist / _SEQ_TRANSIT_SPEED_MPS
+                phase_stop = self._shuttle_stop_phase(asin(s / amplitude),
+                                                      int(seg["cycles"]))
+                s_end = amplitude * sin(phase_stop)
+                px, py = cx + s_end * ex, cy + s_end * ey
+            # hover/yaw: 現在点を保持(トランジット不要)
+        return result
+
+    def start_sequence(self, name: str, segments: list, alt_m: float,
+                       start_index: int = 0,
+                       now: Optional[float] = None) -> tuple[bool, Optional[str]]:
+        """評価シーケンス(スクリプト軌道)を開始する。
+
+        全セグメントを既存ガードで事前検証し、不合格ならどのセグメントが
+        不合格かを日本語で返す。開始時は現在位置へ目標をスナップし、
+        先頭セグメント(start_index)はそこから既存の合流ロジック
+        (circle: 円周最近傍点 / shuttle: 軸への射影点)で滑らかに合流する。
+        yaw セグメントを含む実行区間はヨー角制御 ON が前提(OFF だと
+        ファームが yaw_ref を消費せず、盲目的なランプになるため開始拒否)。
+        戻り値は (ok, error)。
+        """
+        if now is None:
+            now = self._clock()
+        if not isinstance(segments, list) or not segments:
+            return False, "セグメントが定義されていません"
+        if not (0 <= int(start_index) < len(segments)):
+            return False, (f"開始セグメントは 1–{len(segments)} の範囲で"
+                           "指定してください")
+        start_index = int(start_index)
+        normalized: list[dict] = []
+        for i, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                return False, f"セグメント{i + 1}: 定義が不正です"
+            error = self._segment_error(seg)
+            if error is not None:
+                return False, (f"セグメント{i + 1}"
+                               f"({seg.get('type', '?')}): {error}")
+            normalized.append(dict(seg))
+        error = self._alt_error(alt_m)
+        if error is not None:
+            return False, error
+        with self._lock:
+            yaw_ctrl_on = self._yaw_ctrl_on
+        if (any(seg.get("type") == "yaw"
+                for seg in normalized[start_index:]) and not yaw_ctrl_on):
+            return False, ("yaw セグメントを含むシーケンスはヨー角制御 ON の"
+                           "ときのみ開始できます")
+        merge, error = self._merge_position(now, "評価シーケンス")
+        if merge is None:
+            return False, error
+        px, py = merge
+        est_s = [self._segment_estimate_s(seg) for seg in normalized]
+        # 残り時間表示用: セグメント間トランジットの静的見積り(開始位置
+        # からの位置連鎖で決定的に求まる)
+        transit_s = self._sequence_transit_estimates(normalized, start_index,
+                                                     (px, py))
+        with self._lock:
+            # 開始位置へ目標をスナップし、先頭セグメントはここから合流する
+            # (hover は現在位置ホールド、circle/shuttle は既存合流則)
+            self._target = (px, py, alt_m)
+            self._traj = {
+                "kind": "sequence",
+                "name": str(name),
+                "alt": alt_m,
+                "segments": normalized,
+                "est_s": est_s,
+                "transit_s": transit_s,
+                "start_index": start_index,
+                "seg_index": start_index,
+                "seg_state": None,        # step() が現在目標/ヨーから遅延入場
+                "seg_elapsed_base": 0.0,
+                "t0": now,
+                # MoCap 途絶によるシーケンス時計凍結の開始時刻(None = 凍結なし)
+                "frozen_at": None,
+            }
+            self._traj_phase = None
+        return True, None
+
+    def _segment_enter_locked(self, seg: dict, alt_m: float) -> dict:
+        """セグメント入場: 現在目標・現在ヨーから合流するランタイム状態を作る。
+
+        呼び出し元が self._lock を保持していること。合流則は単発の
+        start_circle/start_shuttle と同じ(circle: 目標の方位角に位相合わせ、
+        shuttle: 目標の軸射影に位相合わせ)だが、基準は「現在目標」
+        (直前セグメントの終端)を使い、遷移を決定的にする。
+        """
+        tx, ty, _ = self._target
+        seg_type = seg["type"]
+        if seg_type == "hover":
+            return {"type": "hover", "duration": float(seg["duration_s"]),
+                    "hold": (tx, ty), "alt": alt_m}
+        if seg_type == "circle":
+            cx = float(seg.get("center_x", 0.0))
+            cy = float(seg.get("center_y", 0.0))
+            period_s = float(seg["period_s"])
+            dx, dy = tx - cx, ty - cy
+            # 目標が中心に一致している縮退ケースは位相 0 から開始する
+            phase0 = atan2(dy, dx) if (dx != 0.0 or dy != 0.0) else 0.0
+            return {"type": "circle",
+                    "duration": float(seg["laps"]) * period_s,
+                    "center": (cx, cy), "radius": float(seg["radius_m"]),
+                    "omega": TWO_PI / period_s,
+                    "sign": -1.0 if seg.get("clockwise") else 1.0,
+                    "phase0": phase0, "alt": alt_m}
+        if seg_type == "shuttle":
+            cx = float(seg.get("center_x", 0.0))
+            cy = float(seg.get("center_y", 0.0))
+            amplitude = float(seg["amplitude_m"])
+            omega = TWO_PI / float(seg["period_s"])
+            theta = float(seg["axis_deg"]) * DEG_TO_RAD
+            ex, ey = cos(theta), sin(theta)
+            s = (tx - cx) * ex + (ty - cy) * ey
+            s = max(-amplitude, min(amplitude, s))
+            phase0 = asin(s / amplitude)
+            phase_stop = self._shuttle_stop_phase(phase0, int(seg["cycles"]))
+            return {"type": "shuttle",
+                    "duration": (phase_stop - phase0) / omega,
+                    "center": (cx, cy), "axis_e": (ex, ey),
+                    "amplitude": amplitude, "omega": omega,
+                    "phase0": phase0, "phase_stop": phase_stop, "alt": alt_m}
+        # yaw: 現在の整形済みヨー出力からランプ(最短経路)+ホールドの
+        # 区間列を作る。位置は現在目標をホールドする
+        legs: list[dict] = []
+        prev = self._last_yaw_output
+        rate = float(seg["rate_dps"]) * DEG_TO_RAD
+        hold_s = float(seg.get("hold_s", 0.0))
+        duration = 0.0
+        for tgt_deg in seg["targets_deg"]:
+            tgt = wrap_pi(float(tgt_deg) * DEG_TO_RAD)
+            delta = wrap_pi(tgt - prev)
+            ramp_s = abs(delta) / rate
+            legs.append({"y0": prev, "y1": tgt, "delta": delta,
+                         "ramp_s": ramp_s, "hold_s": hold_s})
+            duration += ramp_s + hold_s
+            prev = tgt
+        return {"type": "yaw", "duration": duration, "hold": (tx, ty),
+                "legs": legs, "alt": alt_m}
+
+    @staticmethod
+    def _segment_entry_point(state: dict) -> Optional[tuple[float, float]]:
+        """セグメント入場時(tau=0)の目標点。hover/yaw は現在目標保持のため
+        None(トランジット不要)。"""
+        if state["type"] == "circle":
+            cx, cy = state["center"]
+            return (cx + state["radius"] * cos(state["phase0"]),
+                    cy + state["radius"] * sin(state["phase0"]))
+        if state["type"] == "shuttle":
+            cx, cy = state["center"]
+            ex, ey = state["axis_e"]
+            s = state["amplitude"] * sin(state["phase0"])
+            return (cx + s * ex, cy + s * ey)
+        return None
+
+    def _segment_enter_with_transit_locked(self, seg: dict,
+                                           alt_m: float) -> dict:
+        """セグメント入場(必要ならトランジット小フェーズを前置する)。
+
+        呼び出し元が self._lock を保持していること。合流点(circle: phase0
+        の円周点 / shuttle: 軸射影点)が現在目標から _SEQ_TRANSIT_EPS_M を
+        超えて離れている場合、_SEQ_TRANSIT_SPEED_MPS の等速直線で目標を
+        合流点まで運ぶ transit 状態を挿入する。合流位相は現在目標(トラン
+        ジット開始前)基準で先に確定しているため、トランジット終端 =
+        セグメント入場点で幾何が厳密に接続する。
+        """
+        state = self._segment_enter_locked(seg, alt_m)
+        entry = self._segment_entry_point(state)
+        if entry is None:
+            return state
+        tx, ty, _ = self._target
+        dist = hypot(entry[0] - tx, entry[1] - ty)
+        if dist <= _SEQ_TRANSIT_EPS_M:
+            return state
+        return {"type": "transit", "from": (tx, ty), "to": entry,
+                "duration": dist / _SEQ_TRANSIT_SPEED_MPS,
+                "alt": alt_m, "next": state}
+
+    def _segment_update_locked(self, state: dict,
+                               tau: float) -> tuple[int, Optional[float]]:
+        """セグメント経過 tau 秒時点の目標を反映し (traj_mode, 位相) を返す。
+
+        呼び出し元が self._lock を保持していること。生成式は単発軌道の
+        step() 内実装と同一(circle: center+R·e^{jφ} / shuttle:
+        center+A·sin(φ)·e)。yaw はランプ+ホールドの区分線形で
+        _target_yaw を自動操作する(基礎モードは hover 扱い)。
+        transit は from→to の等速直線補間(基礎モードは hover 扱い)。
+        """
+        alt = state["alt"]
+        if state["type"] == "transit":
+            fx, fy = state["from"]
+            gx, gy = state["to"]
+            frac = (min(1.0, tau / state["duration"])
+                    if state["duration"] > 0.0 else 1.0)
+            self._target = (fx + (gx - fx) * frac, fy + (gy - fy) * frac, alt)
+            return TRAJ_MODE_HOVER, None
+        if state["type"] == "circle":
+            phase = state["phase0"] + state["sign"] * state["omega"] * tau
+            cx, cy = state["center"]
+            radius = state["radius"]
+            self._target = (cx + radius * cos(phase),
+                            cy + radius * sin(phase), alt)
+            return TRAJ_MODE_CIRCLE, wrap_pi(phase)
+        if state["type"] == "shuttle":
+            phase = min(state["phase0"] + state["omega"] * tau,
+                        state["phase_stop"])
+            cx, cy = state["center"]
+            ex, ey = state["axis_e"]
+            s = state["amplitude"] * sin(phase)
+            self._target = (cx + s * ex, cy + s * ey, alt)
+            return TRAJ_MODE_SHUTTLE, wrap_pi(phase)
+        if state["type"] == "yaw":
+            tau_leg = tau
+            yaw = state["legs"][-1]["y1"] if state["legs"] else None
+            for leg in state["legs"]:
+                leg_total = leg["ramp_s"] + leg["hold_s"]
+                if tau_leg < leg_total:
+                    if tau_leg < leg["ramp_s"]:
+                        frac = tau_leg / leg["ramp_s"]
+                        yaw = wrap_pi(leg["y0"] + leg["delta"] * frac)
+                    else:
+                        yaw = leg["y1"]
+                    break
+                tau_leg -= leg_total
+            if yaw is not None:
+                self._target_yaw = yaw
+        hx, hy = state["hold"]
+        self._target = (hx, hy, alt)
+        return TRAJ_MODE_HOVER, None
+
+    def _segment_finish_locked(self, state: dict) -> None:
+        """セグメント終端の厳密な状態を確定する(次セグメントの合流基準)。
+
+        呼び出し元が self._lock を保持していること。circle は laps·2π 後
+        = 入場点、shuttle は端点(速度ゼロ点)、yaw は最終目標角、
+        transit は合流点(=次状態の入場点)。
+        """
+        alt = state["alt"]
+        if state["type"] == "transit":
+            gx, gy = state["to"]
+            self._target = (gx, gy, alt)
+            return
+        if state["type"] == "circle":
+            phase = (state["phase0"]
+                     + state["sign"] * state["omega"] * state["duration"])
+            cx, cy = state["center"]
+            radius = state["radius"]
+            self._target = (cx + radius * cos(phase),
+                            cy + radius * sin(phase), alt)
+            return
+        if state["type"] == "shuttle":
+            cx, cy = state["center"]
+            ex, ey = state["axis_e"]
+            s = state["amplitude"] * sin(state["phase_stop"])
+            self._target = (cx + s * ex, cy + s * ey, alt)
+            return
+        if state["type"] == "yaw" and state["legs"]:
+            self._target_yaw = state["legs"][-1]["y1"]
+        hx, hy = state["hold"]
+        self._target = (hx, hy, alt)
+
+    def _sequence_step_locked(self, traj: dict,
+                              t_eff: float) -> tuple[int, Optional[float]]:
+        """シーケンス時計 t_eff でのセグメント進行+目標更新。
+
+        呼び出し元が self._lock を保持していること。消化済みセグメントは
+        厳密な終端状態で確定してから次セグメントへ入場する(遷移の目標
+        連続性は各セグメントの合流則が担保)。全セグメント消化で軌道を
+        外し、最終目標でのホバ復帰になる。戻り値は (traj_mode, 位相)。
+        """
+        elapsed = t_eff - traj["t0"]
+        while True:
+            segments = traj["segments"]
+            index = traj["seg_index"]
+            if index >= len(segments):
+                # 完了: 最終目標でホバ復帰(stop_trajectory と同じ形)
+                self._traj = None
+                self._traj_phase = None
+                return TRAJ_MODE_HOVER, None
+            state = traj["seg_state"]
+            if state is None:
+                state = self._segment_enter_with_transit_locked(
+                    segments[index], traj["alt"])
+                traj["seg_state"] = state
+            tau = elapsed - traj["seg_elapsed_base"]
+            if tau >= state["duration"]:
+                self._segment_finish_locked(state)
+                traj["seg_elapsed_base"] += state["duration"]
+                if state["type"] == "transit":
+                    # トランジット完了 → 同一セグメントの本体へ入場
+                    # (合流位相はトランジット開始前の目標基準で確定済み)
+                    traj["seg_state"] = state["next"]
+                else:
+                    traj["seg_index"] = index + 1
+                    traj["seg_state"] = None
+                continue
+            break
+        traj_mode, traj_phase = self._segment_update_locked(state, tau)
+        self._traj_phase = traj_phase
+        return traj_mode, traj_phase
+
+    def stop_trajectory(self) -> None:
+        """軌道(circle/shuttle/sequence)を停止し、現在の軌道目標でホバに
+        復帰する。
 
         目標 (self._target) は step() が軌道値で毎周期更新しているため、
         軌道を外すだけで「現在目標へのホバ復帰」になる。
@@ -270,24 +879,106 @@ class PositionController:
             self._traj = None
             self._traj_phase = None
 
+    def stop_circle(self) -> None:
+        """円軌道の停止(既存 API 互換。実体は stop_trajectory)。"""
+        self.stop_trajectory()
+
     def trajectory_snapshot(self) -> dict:
-        """WebSocket 配信用の軌道状態(UI 単位系)。"""
+        """WebSocket 配信用の軌道状態(UI 単位系)。
+
+        50Hz step スレッドが _traj の可変キー(位相・セグメント状態・凍結
+        時刻など)を self._lock 下で更新するため、読み側もロックを保持した
+        まま組み立てる(規約: スレッド共有状態は lock で保護。以前は参照
+        取得のみロック内で、可変キーの読みが競合し得た)。
+        """
         with self._lock:
             traj = self._traj
             phase = self._traj_phase
-        if traj is None:
-            return {"mode": "hover"}
-        return {
-            "mode": "circle",
-            "center_x": traj["center"][0],
-            "center_y": traj["center"][1],
-            "radius_m": traj["radius"],
-            "period_s": traj["period_s"],
-            "clockwise": traj["clockwise"],
-            "alt_m": traj["alt"],
-            "face_tangent": traj["face_tangent"],
-            "phase_rad": phase,
-        }
+            if traj is None:
+                return {"mode": "hover"}
+            if traj.get("kind") == "sequence":
+                # シーケンス進行(名前・セグメント番号・残り秒)。残りは現
+                # セグメントのランタイム所要+以降セグメントの静的見積り
+                # (トランジット分込み — 2026-08-03)。
+                # 途絶凍結中はシーケンス時計(frozen_at)基準で残りも凍結する
+                now = self._clock()
+                t_eff = (traj["frozen_at"] if traj["frozen_at"] is not None
+                         else now)
+                elapsed = max(0.0, t_eff - traj["t0"])
+                segments = traj["segments"]
+                count = len(segments)
+                index = min(traj["seg_index"], count)
+                state = traj["seg_state"]
+                transit_s = traj.get("transit_s") or [0.0] * count
+                in_transit = state is not None and state["type"] == "transit"
+                if index >= count:
+                    seg_type = None
+                    seg_remaining = 0.0
+                else:
+                    seg_type = segments[index].get("type")
+                    if state is not None:
+                        seg_remaining = max(
+                            0.0, state["duration"]
+                            - (elapsed - traj["seg_elapsed_base"]))
+                        if in_transit:
+                            # トランジット中はセグメント本体の所要も残りに
+                            # 数える(表示が一瞬 0 近くへ落ちるのを防ぐ)
+                            seg_remaining += state["next"]["duration"]
+                    else:
+                        # 未入場(開始直後の step 前)は見積りで代用
+                        # (入場前トランジットの見積り込み)
+                        seg_remaining = transit_s[index] + traj["est_s"][index]
+                remaining = seg_remaining + sum(
+                    est + tr for est, tr in zip(traj["est_s"][index + 1:],
+                                                transit_s[index + 1:]))
+                return {
+                    "mode": "sequence",
+                    "name": traj["name"],
+                    "seg_index": index,
+                    "seg_count": count,
+                    "seg_type": seg_type,
+                    "transit": in_transit,
+                    "start_index": traj["start_index"],
+                    "alt_m": traj["alt"],
+                    "elapsed_s": elapsed,
+                    "seg_remaining_s": seg_remaining,
+                    "remaining_s": remaining,
+                    "phase_rad": phase,
+                    # yaw セグメントが自動操作するヨー目標。UI がシーケンス
+                    # 実行中のスライダ表示同期に使う(操作イベントは発火
+                    # させない — 停止後のスライダ乖離ジャンプ対策)
+                    "target_yaw_rad": self._target_yaw,
+                }
+            if traj.get("kind") == "shuttle":
+                cycles = traj["cycles"]
+                if cycles > 0:
+                    elapsed = (traj["phase_abs"] - traj["phase0"]) / TWO_PI
+                    cycles_remaining = max(0.0, cycles - elapsed)
+                else:
+                    cycles_remaining = None   # 連続(手動 stop)
+                return {
+                    "mode": "shuttle",
+                    "center_x": traj["center"][0],
+                    "center_y": traj["center"][1],
+                    "axis_deg": traj["axis_deg"],
+                    "amplitude_m": traj["amplitude"],
+                    "period_s": traj["period_s"],
+                    "cycles": cycles,
+                    "alt_m": traj["alt"],
+                    "phase_rad": phase,
+                    "cycles_remaining": cycles_remaining,
+                }
+            return {
+                "mode": "circle",
+                "center_x": traj["center"][0],
+                "center_y": traj["center"][1],
+                "radius_m": traj["radius"],
+                "period_s": traj["period_s"],
+                "clockwise": traj["clockwise"],
+                "alt_m": traj["alt"],
+                "face_tangent": traj["face_tangent"],
+                "phase_rad": phase,
+            }
 
     def set_control_active(self, active: bool) -> None:
         """XY 閉ループの有効/無効を切り替える(CMD_POS_ERR bit2 に反映)。"""
@@ -466,8 +1157,9 @@ class PositionController:
 
     def step(self, now: float) -> None:
         """1周期ぶんの軌道更新+途絶判定+整形+送信(テストから直接呼べる)。"""
-        # --- 軌道更新(circle 中は目標 (x, y, z) を時間更新する) ---
+        # --- 軌道更新(circle/shuttle/sequence 中は目標を時間更新する) ---
         traj_phase: Optional[float] = None
+        traj_mode = TRAJ_MODE_HOVER
         yaw_tangent: Optional[float] = None
         with self._lock:
             pose_t = self._last_pose_t
@@ -481,7 +1173,21 @@ class PositionController:
                 # 無効中は on_mocap_pose が指令を水平固定しており、目標だけ
                 # 周回させる意味がない)。
                 # 復帰時は t0 を凍結時間ぶん前送りして位相を連続に保つ。
-                if dropped or not self._last_data_valid:
+                # このロジックは circle/shuttle/sequence 共通(シーケンスは
+                # 時計 t0 ごと凍結され、セグメント進行・yaw ランプも止まる)。
+                freeze = dropped or not self._last_data_valid
+                if not freeze and traj.get("kind") == "sequence":
+                    # yaw セグメント実行中にヨー角制御が OFF の間も凍結する:
+                    # OFF だと step() が yaw_ref を送らずファームはランプを
+                    # 見ない(盲目ランプ)ため、ON 復帰時に整形ヨーが進んだ
+                    # ランプ位置へ追従して計画外の回頭が起きる(レビュー
+                    # 指摘)。ON 復帰で t0 前送り再開(連続)
+                    segs = traj["segments"]
+                    idx = traj["seg_index"]
+                    if (idx < len(segs) and segs[idx].get("type") == "yaw"
+                            and not self._yaw_ctrl_on):
+                        freeze = True
+                if freeze:
                     if traj["frozen_at"] is None:
                         traj["frozen_at"] = now
                     t_eff = traj["frozen_at"]
@@ -490,25 +1196,57 @@ class PositionController:
                         traj["t0"] += now - traj["frozen_at"]
                         traj["frozen_at"] = None
                     t_eff = now
-                omega = TWO_PI / traj["period_s"]
-                # 回転方向: CCW = 位相増加(制御座標系の数学正方向)、CW = 減少
-                sign = -1.0 if traj["clockwise"] else 1.0
-                phase = traj["phase0"] + sign * omega * (t_eff - traj["t0"])
-                cx, cy = traj["center"]
-                radius = traj["radius"]
-                self._target = (cx + radius * cos(phase),
-                                cy + radius * sin(phase),
-                                traj["alt"])
-                traj_phase = wrap_pi(phase)
-                self._traj_phase = traj_phase
-                if traj["face_tangent"]:
-                    # 接線方向(速度ベクトルの向き)= 位相 + 回転方向×90°。
-                    # これは制御座標系の方位角なので、機体ヨー規約へ
-                    # _yaw_azimuth_wire_sign で変換して指令にする
-                    # (レガシーフレームでは +1 = 従来と同一)
-                    yaw_tangent = wrap_pi(
-                        self._yaw_azimuth_wire_sign
-                        * (phase + sign * (pi / 2.0)))
+                # kind 欠落は circle 扱い(既存テストの直接構築 dict 互換)
+                if traj.get("kind") == "sequence":
+                    # 評価シーケンス: 現セグメントを hover/circle/shuttle/yaw
+                    # の生成ロジックへ委譲する(時計はシーケンス共通 t_eff)
+                    traj_mode, traj_phase = self._sequence_step_locked(
+                        traj, t_eff)
+                elif traj.get("kind") == "shuttle":
+                    omega = TWO_PI / traj["period_s"]
+                    # 直線往復: target = center + A·sin(phase)·e。位相は常に増加
+                    phase = traj["phase0"] + omega * (t_eff - traj["t0"])
+                    stop_phase = traj["phase_stop"]
+                    stopping = stop_phase is not None and phase >= stop_phase
+                    if stopping:
+                        # 指定サイクル消化後の最初の極値(速度ゼロ点)で停止。
+                        # 位相を極値に丸めて端点を正確にホールドする
+                        phase = stop_phase
+                    traj["phase_abs"] = phase
+                    cx, cy = traj["center"]
+                    ex, ey = traj["axis_e"]
+                    s = traj["amplitude"] * sin(phase)
+                    self._target = (cx + s * ex, cy + s * ey, traj["alt"])
+                    if stopping:
+                        # 自動停止: 端点目標のまま hover に復帰する
+                        self._traj = None
+                        self._traj_phase = None
+                    else:
+                        traj_phase = wrap_pi(phase)
+                        self._traj_phase = traj_phase
+                        traj_mode = TRAJ_MODE_SHUTTLE
+                else:
+                    omega = TWO_PI / traj["period_s"]
+                    # 回転方向: CCW = 位相増加(制御座標系の数学正方向)、
+                    # CW = 減少
+                    sign = -1.0 if traj["clockwise"] else 1.0
+                    phase = traj["phase0"] + sign * omega * (t_eff - traj["t0"])
+                    cx, cy = traj["center"]
+                    radius = traj["radius"]
+                    self._target = (cx + radius * cos(phase),
+                                    cy + radius * sin(phase),
+                                    traj["alt"])
+                    traj_phase = wrap_pi(phase)
+                    self._traj_phase = traj_phase
+                    traj_mode = TRAJ_MODE_CIRCLE
+                    if traj["face_tangent"]:
+                        # 接線方向(速度ベクトルの向き)= 位相 + 回転方向×90°。
+                        # これは制御座標系の方位角なので、機体ヨー規約へ
+                        # _yaw_azimuth_wire_sign で変換して指令にする
+                        # (レガシーフレームでは +1 = 従来と同一)
+                        yaw_tangent = wrap_pi(
+                            self._yaw_azimuth_wire_sign
+                            * (phase + sign * (pi / 2.0)))
             error_x, error_y = self._last_errors
             data_valid = self._last_data_valid
             filter_result = self._last_filter_result
@@ -553,8 +1291,7 @@ class PositionController:
             "frame_dt_ms": None if frame_dt is None else frame_dt * MS_PER_S,
             "yaw_ref_rad": yaw,
             "yaw_ctrl_on": yaw_ctrl_on,
-            "traj_mode": (TRAJ_MODE_CIRCLE if traj_phase is not None
-                          else TRAJ_MODE_HOVER),
+            "traj_mode": traj_mode,
             "traj_phase_rad": traj_phase,
         }
         meta["data_source"] = "rigid_body" if pose is not None else "none"
